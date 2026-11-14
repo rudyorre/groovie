@@ -1,0 +1,21 @@
+[package]
+name = "groovie-core"
+description = "Local-first Govee LAN protocol, discovery, device registry and groups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+if-addrs = "0.13"
+
+[dev-dependencies]
+groovie-sim = { path = "../groovie-sim" }
+tempfile = "3"

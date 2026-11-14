@@ -1,0 +1,106 @@
+//! Public data model shared by the engine, CLI, desktop app and (later) server.
+
+use crate::protocol::Rgb;
+use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
+
+/// Last known state of a light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub on: bool,
+    /// 1..=100
+    pub brightness: u8,
+    pub color: Rgb,
+    /// Colour temperature in Kelvin, or 0 when the light is in RGB mode.
+    pub kelvin: u16,
+}
+
+impl Default for DeviceState {
+    fn default() -> Self {
+        Self { on: false, brightness: 100, color: Rgb::new(255, 255, 255), kelvin: 0 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Device {
+    /// Govee device id (MAC-like, e.g. `1F:80:C5:32:32:36:72:4E`).
+    pub id: String,
+    pub ip: Ipv4Addr,
+    pub sku: String,
+    /// User nickname, or a friendly default derived from the SKU.
+    pub name: String,
+    pub online: bool,
+    /// `None` until the device has answered a status request.
+    pub state: Option<DeviceState>,
+}
+
+/// What to do.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
+pub enum Action {
+    Power(bool),
+    /// For several devices: if any is on, turn all off; otherwise turn all on.
+    Toggle,
+    Brightness(u8),
+    Color(Rgb),
+    Kelvin(u16),
+}
+
+/// Who to do it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "camelCase")]
+pub enum Target {
+    Device(String),
+    Group(String),
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    /// Device ids.
+    pub members: Vec<String>,
+}
+
+/// A saved look: per-device power/brightness/colour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Scene {
+    pub id: String,
+    pub name: String,
+    pub entries: Vec<SceneEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneEntry {
+    pub device: String,
+    pub on: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Rgb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kelvin: Option<u16>,
+}
+
+/// Pushed to subscribers whenever something changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Event {
+    DeviceUpdated { device: Device },
+    /// Groups, scenes or nicknames changed.
+    ConfigChanged,
+}
+
+/// Friendly default name for a SKU. Unknown SKUs fall back to `Govee <SKU>`.
+pub fn friendly_sku_name(sku: &str) -> String {
+    let known = match sku.to_ascii_uppercase().as_str() {
+        "H6076" | "H6072" | "H6079" => "Floor Lamp",
+        "H607C" => "Floor Lamp 2",
+        "H6046" | "H6047" | "H6056" | "H6043" => "Light Bars",
+        "H6008" | "H6009" | "H6010" => "Bulb",
+        "H6052" | "H6051" => "Table Lamp",
+        _ => return format!("Govee {sku}"),
+    };
+    known.to_string()
+}
