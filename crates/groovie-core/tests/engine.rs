@@ -259,7 +259,8 @@ async fn records_network_and_state_logs() {
     assert!(logs.iter().any(|l| l.dir == "tx" && l.addr.starts_with(&bars_ip) && l.message.contains("\"turn\"")));
     assert!(!logs.iter().any(|l| l.dir == "tx" && l.addr.starts_with(&lamp_ip)));
 
-    // Simulate an external controller (e.g. DreamView / mobile app) toggling the lamp.
+    // Wait past the command settle guard, then simulate an external controller toggling the lamp.
+    tokio::time::sleep(Duration::from_millis(90)).await;
     r.sims[0].state.lock().unwrap().on = false;
     r.g.refresh_all().await;
     let g2 = r.g.clone();
@@ -271,5 +272,38 @@ async fn records_network_and_state_logs() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn ignores_mid_fade_status_poll_after_command() {
+    let (net, base) = (10, 41090);
+    let sims = spawn_sims(net, base, 1).await;
+    let mut cfg = config(net, base, 1, None);
+    cfg.refresh_delay = Duration::from_millis(200);
+    let g = Groovie::start(cfg).await.unwrap();
+    let g2 = g.clone();
+    eventually("discovered", || {
+        let g = g2.clone();
+        async move { g.devices().await.first().and_then(|d| d.state).is_some() }
+    })
+    .await;
+
+    let id = sims[0].config.id.clone();
+    g.apply(&Target::Device(id.clone()), Action::Power(true)).await.unwrap();
+    eventually("sim received turn(true)", || async { sims[0].state().on }).await;
+
+    // Simulate slow-fading hardware (like H6072) still reporting `onOff: 0` 30ms after `turn(1)`.
+    sims[0].state.lock().unwrap().on = false;
+    g.refresh_all().await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // Optimistic `on: true` must not be reverted by the mid-fade poll.
+    assert!(g.device(&id).await.unwrap().state.unwrap().on);
+
+    // Once the hardware finishes fading before `refresh_delay` (200ms) fires, state stays `on: true`.
+    sims[0].state.lock().unwrap().on = true;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(g.device(&id).await.unwrap().state.unwrap().on);
+}
+
 
 

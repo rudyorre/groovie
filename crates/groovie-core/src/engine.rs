@@ -63,7 +63,7 @@ impl Default for Config {
             store_path: default_store_path(),
             poll_interval: Duration::from_secs(15),
             rescan_interval: Duration::from_secs(60),
-            refresh_delay: Duration::from_millis(1500),
+            refresh_delay: Duration::from_millis(1800),
         }
     }
 }
@@ -71,6 +71,7 @@ impl Default for Config {
 struct Entry {
     device: Device,
     last_seen: Option<Instant>,
+    last_command: Option<Instant>,
     /// Bumped on every command so stale delayed refreshes can be skipped.
     generation: u64,
 }
@@ -130,6 +131,7 @@ impl Groovie {
                         firmware: None,
                     },
                     last_seen: None,
+                    last_command: None,
                     generation: 0,
                 },
             );
@@ -557,6 +559,25 @@ impl Inner {
         }
     }
 
+    /// Used by the background poll loop: skip devices whose own post-command
+    /// `refresh_delay` check is still pending so we don't query mid-fade.
+    async fn refresh_idle(&self) {
+        let settle = self.cfg.refresh_delay * 2;
+        let mut ips: Vec<Ipv4Addr> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| e.last_command.map(|t| t.elapsed() >= settle).unwrap_or(true))
+            .map(|e| e.device.ip)
+            .collect();
+        ips.sort();
+        ips.dedup();
+        for ip in ips {
+            let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+        }
+    }
+
     async fn send_action(self: &Arc<Self>, id: &str, action: Action) -> Result<()> {
         let cmd = match action {
             Action::Power(on) => Command::Turn(on),
@@ -592,6 +613,7 @@ impl Inner {
                 _ => {}
             }
             e.device.state = Some(s);
+            e.last_command = Some(Instant::now());
             e.generation += 1;
             (e.device.ip, e.generation, e.device.clone())
         };
@@ -646,7 +668,7 @@ impl Inner {
         };
         let fw = format_firmware(&info);
         let mut store = self.store.lock().await;
-        let dev = {
+        let (dev, needs_status) = {
             let mut devices = self.devices.write().await;
             let e = devices.entry(info.device.clone()).or_insert_with(|| {
                 info!(id = %info.device, sku = %info.sku, %ip, "discovered device");
@@ -656,14 +678,16 @@ impl Inner {
                         ip,
                         sku: info.sku.clone(),
                         name: String::new(),
-                        online: true,
+                        online: false,
                         state: None,
                         firmware: None,
                     },
                     last_seen: None,
+                    last_command: None,
                     generation: 0,
                 }
             });
+            let needs_status = !e.device.online || e.device.state.is_none();
             e.device.ip = ip;
             e.device.sku = info.sku.clone();
             e.device.name = display_name(&store, &info.device, &info.sku);
@@ -672,7 +696,7 @@ impl Inner {
             }
             e.device.online = true;
             e.last_seen = Some(Instant::now());
-            e.device.clone()
+            (e.device.clone(), needs_status)
         };
         if store.upsert_known(KnownDevice { id: dev.id.clone(), ip, sku: dev.sku.clone() }) {
             if let Err(e) = store.save() {
@@ -683,7 +707,9 @@ impl Inner {
         let label = Some(format!("{} ({})", dev.name, dev.sku));
         self.log("rx", src.to_string(), label, raw, false).await;
         self.emit(Event::DeviceUpdated { device: dev });
-        let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+        if needs_status {
+            let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+        }
     }
 
     async fn on_status(&self, st: StatusInfo, src: SocketAddr, raw: String) {
@@ -694,6 +720,12 @@ impl Inner {
             color: st.color,
             kelvin: st.color_tem_in_kelvin,
         };
+        let guard = self.cfg.refresh_delay * 3 / 4;
+        enum StatusOutcome {
+            Unknown,
+            Settling(String),
+            Updated { prev: Option<DeviceState>, was_online: bool, dev: Device },
+        }
         let outcome = {
             let mut devices = self.devices.write().await;
             let key = devices
@@ -702,47 +734,62 @@ impl Inner {
                 .max_by_key(|(_, e)| (e.device.online, e.last_seen))
                 .map(|(id, _)| id.clone());
             match key.and_then(|id| devices.get_mut(&id)) {
-                None => None,
+                None => StatusOutcome::Unknown,
                 Some(e) => {
                     let prev = e.device.state;
                     let was_online = e.device.online;
-                    e.device.state = Some(next);
                     e.device.online = true;
                     e.last_seen = Some(Instant::now());
-                    Some((prev, was_online, e.device.clone()))
+                    // Govee lights fade over ~1s and report their old `onOff` if a
+                    // background poll lands right after a command. Ignore contradictory
+                    // status replies until the command's settle window has elapsed.
+                    let in_flight = e.last_command.map(|t| t.elapsed() < guard).unwrap_or(false);
+                    if in_flight && prev.map(|p| !same_logical_state(&p, &next)).unwrap_or(false) {
+                        StatusOutcome::Settling(format!("{} ({})", e.device.name, e.device.sku))
+                    } else {
+                        e.device.state = Some(next);
+                        StatusOutcome::Updated { prev, was_online, dev: e.device.clone() }
+                    }
                 }
             }
         };
-        let Some((prev, was_online, dev)) = outcome else {
-            self.log("rx", src.to_string(), None, raw, false).await;
-            // A device we haven't identified yet: ask who it is.
-            let _ = self.send(Command::Scan, SocketAddr::from((ip, self.cfg.scan_port))).await;
-            return;
-        };
-        let label = Some(format!("{} ({})", dev.name, dev.sku));
-        self.log("rx", src.to_string(), label.clone(), raw, true).await;
-        match prev {
-            None => {
-                self.log("state", ip.to_string(), label, format!("initial state: {}", describe_state(&next)), false)
+        match outcome {
+            StatusOutcome::Unknown => {
+                self.log("rx", src.to_string(), None, raw, false).await;
+                // A device we haven't identified yet: ask who it is.
+                let _ = self.send(Command::Scan, SocketAddr::from((ip, self.cfg.scan_port))).await;
+            }
+            StatusOutcome::Settling(label) => {
+                self.log("rx", src.to_string(), Some(label), format!("{raw} (ignored mid-transition)"), true)
                     .await;
             }
-            Some(p) if !same_logical_state(&p, &next) => {
-                self.log(
-                    "state",
-                    ip.to_string(),
-                    label,
-                    format!("external/reported change: {} -> {}", describe_state(&p), describe_state(&next)),
-                    false,
-                )
-                .await;
+            StatusOutcome::Updated { prev, was_online, dev } => {
+                let label = Some(format!("{} ({})", dev.name, dev.sku));
+                self.log("rx", src.to_string(), label.clone(), raw, true).await;
+                match prev {
+                    None => {
+                        self.log("state", ip.to_string(), label, format!("initial state: {}", describe_state(&next)), false)
+                            .await;
+                    }
+                    Some(p) if !same_logical_state(&p, &next) => {
+                        self.log(
+                            "state",
+                            ip.to_string(),
+                            label,
+                            format!("external/reported change: {} -> {}", describe_state(&p), describe_state(&next)),
+                            false,
+                        )
+                        .await;
+                    }
+                    Some(_) if !was_online => {
+                        self.log("state", ip.to_string(), label, format!("back online: {}", describe_state(&next)), false)
+                            .await;
+                    }
+                    _ => {}
+                }
+                self.emit(Event::DeviceUpdated { device: dev });
             }
-            Some(_) if !was_online => {
-                self.log("state", ip.to_string(), label, format!("back online: {}", describe_state(&next)), false)
-                    .await;
-            }
-            _ => {}
         }
-        self.emit(Event::DeviceUpdated { device: dev });
     }
 
     /// Mark devices offline if they've been silent for a few poll cycles.
@@ -787,7 +834,7 @@ async fn poll_loop(inner: Arc<Inner>) {
     tick.tick().await;
     loop {
         tick.tick().await;
-        inner.refresh_all().await;
+        inner.refresh_idle().await;
         inner.sweep_offline().await;
     }
 }

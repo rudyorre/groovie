@@ -152,7 +152,7 @@
       (d) => `- ${d.name} (${d.sku}) | ip=${d.ip} | id=${d.id} | ${fmtDeviceSummary(d)}${d.firmware ? ` | ${d.firmware}` : ''}`,
     );
     const events = logs.filter((l) => !l.poll).map(fmtLine);
-    const recentRaw = logs.slice(-40).map(fmtLine);
+    const recentRaw = logs.slice(-80).map(fmtLine);
     const report = [
       `Groovie ${version ? `v${version}` : 'demo'} · ${new Date().toISOString()}`,
       `Devices (${devices.length}):`,
