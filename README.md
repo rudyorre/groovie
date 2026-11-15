@@ -1,10 +1,7 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.svg" />
-  <img src="docs/logo-light.svg" height="44" alt="Groovie" />
-</picture>
+<img src="docs/logo-dark.svg#gh-dark-mode-only" height="44" alt="Groovie" />
+<img src="docs/logo-light.svg#gh-light-mode-only" height="44" alt="Groovie" />
 
 <p>
   Local-first Govee light control for Windows, macOS &amp; Linux — desktop tray app + <code>grooviectl</code> CLI.<br />
@@ -23,11 +20,8 @@
   <a href="#development">Development</a>
 </p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/preview-dark.svg" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/preview-light.svg" />
-  <img src="docs/preview-light.svg" width="820" alt="Groovie desktop app showing Floor Lamp in RGB Colour mode and Light Bars in 4000K White mode" />
-</picture>
+<img src="docs/preview-dark.svg#gh-dark-mode-only" width="820" alt="Groovie desktop app showing Floor Lamp in RGB Colour mode and Light Bars in 4000K White mode" />
+<img src="docs/preview-light.svg#gh-light-mode-only" width="820" alt="Groovie desktop app showing Floor Lamp in RGB Colour mode and Light Bars in 4000K White mode" />
 
 </div>
 
