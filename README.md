@@ -37,6 +37,7 @@ grooviectl group create Desk "Light Bars"
 grooviectl scene save Evening
 grooviectl scene apply Evening
 grooviectl add-ip 192.168.1.50            # if discovery can't find a light
+grooviectl config                         # print active groovie.json path (--json for contents)
 ```
 
 Targets can be a light's name, IP or id, a group name, or `all`. Run `grooviectl --help` for everything.
@@ -76,7 +77,7 @@ Releasing: bump `version` in `apps/desktop/src-tauri/tauri.conf.json`, commit, t
 
 Testing without lights (Linux): run `cargo run -p groovie-sim -- --count 3`, then start the CLI or app with `GROOVIE_SCAN_TARGETS=127.0.0.2:4001,127.0.0.3:4001,127.0.0.4:4001`.
 
-Groups, scenes and nicknames are stored in `groovie.json` in your OS config folder (`%APPDATA%\groovie` on Windows, `~/Library/Application Support/groovie` on macOS).
+Groups, scenes and nicknames are stored in `groovie.json` (`%APPDATA%\groovie\groovie.json` on Windows, `~/Library/Application Support/groovie/groovie.json` on macOS, or `~/.config/groovie/groovie.json` — automatically preferred on any OS if present). Symlinks are preserved on save, and you can inspect or repoint the config file from the **Configuration** button in the sidebar footer.
 
 ## Licence
 

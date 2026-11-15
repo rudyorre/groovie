@@ -21,6 +21,13 @@ export type LogEntry = {
   message: string;
   poll: boolean;
 };
+export type ConfigInfo = {
+  path?: string;
+  symlinkTarget?: string;
+  defaultPath?: string;
+  isCustom: boolean;
+  json: string;
+};
 export type Group = { id: string; name: string; members: string[] };
 export type SceneEntry = { device: string; on: boolean; brightness?: number; color?: Rgb; kelvin?: number };
 export type Scene = { id: string; name: string; entries: SceneEntry[] };
@@ -54,6 +61,11 @@ export interface Api {
   listLogs(): Promise<LogEntry[]>;
   clearLogs(): Promise<void>;
   setWindowActive(active: boolean, syncNow: boolean): Promise<void>;
+  getConfigInfo(): Promise<ConfigInfo>;
+  reloadConfig(): Promise<ConfigInfo>;
+  setConfigPath(path: string | null): Promise<ConfigInfo>;
+  openConfigFolder(): Promise<void>;
+  openGithub(): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
   appVersion(): Promise<string>;
   /** Resolves to an available update, or null if up to date. */
@@ -86,6 +98,11 @@ async function tauriApi(): Promise<Api> {
     listLogs: () => invoke('list_logs'),
     clearLogs: () => invoke('clear_logs'),
     setWindowActive: (active, syncNow) => invoke('set_window_active', { active, syncNow }),
+    getConfigInfo: () => invoke('get_config_info'),
+    reloadConfig: () => invoke('reload_config'),
+    setConfigPath: (path) => invoke('set_config_path', { path }),
+    openConfigFolder: () => invoke('open_config_folder'),
+    openGithub: () => invoke('open_github'),
     onEvent(cb) {
       const un = listen<GroovieEvent>('groovie://event', (e) => cb(e.payload));
       return () => void un.then((f) => f());
@@ -220,6 +237,31 @@ function mockApi(): Api {
     listLogs: async () => structuredClone(logs),
     clearLogs: async () => { logs = []; },
     setWindowActive: async () => {},
+    async getConfigInfo() {
+      const nicknames = Object.fromEntries(devices.map((d) => [d.id, d.name]));
+      const known_devices = devices.map((d) => ({ id: d.id, ip: d.ip, sku: d.sku }));
+      return {
+        path: '~/.config/groovie/groovie.json',
+        defaultPath: '~/.config/groovie/groovie.json',
+        isCustom: false,
+        json: JSON.stringify({ version: 1, nicknames, groups, scenes, known_devices }, null, 2),
+      };
+    },
+    async reloadConfig() {
+      return this.getConfigInfo();
+    },
+    async setConfigPath(path) {
+      const base = await this.getConfigInfo();
+      return {
+        ...base,
+        path: path?.trim() || base.defaultPath,
+        isCustom: Boolean(path?.trim()),
+      };
+    },
+    openConfigFolder: async () => {},
+    openGithub: async () => {
+      window.open('https://github.com/rudyorre/groovie', '_blank', 'noopener,noreferrer');
+    },
     onEvent(cb) { subs.add(cb); return () => subs.delete(cb); },
     appVersion: async () => 'demo',
     checkUpdate: async () => null,

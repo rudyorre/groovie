@@ -1,7 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use groovie_core::{Action, Config, Device, Group, Groovie, LogEntry, Scene, Target};
+use groovie_core::{Action, Config, ConfigInfo, Device, Group, Groovie, LogEntry, Scene, Target};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 /// Fast local sync while the window is open; quiet keepalive while hidden in the tray.
 const ACTIVE_POLL: Duration = Duration::from_millis(2500);
 const IDLE_POLL: Duration = Duration::from_secs(45);
+const GITHUB_URL: &str = "https://github.com/rudyorre/groovie";
 
 /// Holds the running engine, or the startup error if UDP port 4002 was busy so
 /// the window can still open and tell the user what's holding it.
@@ -150,6 +151,127 @@ async fn set_window_active(s: State<'_, AppState>, active: bool, sync_now: bool)
     Ok(())
 }
 
+#[tauri::command]
+async fn get_config_info(s: State<'_, AppState>) -> R<ConfigInfo> {
+    match s.0.read().await.clone() {
+        Ok(g) => Ok(g.config_info().await),
+        Err(_) => {
+            let cfg = Config::default().with_env_overrides();
+            let auto_default = groovie_core::store::default_auto_store_path();
+            let is_custom = match (cfg.store_path.as_deref(), auto_default.as_deref()) {
+                (Some(cur), Some(def)) => cur != def,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let raw_json = cfg
+                .store_path
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_else(|| "{\n  \"version\": 1\n}".into());
+            let symlink_target = cfg
+                .store_path
+                .as_deref()
+                .and_then(|p| {
+                    let meta = std::fs::symlink_metadata(p).ok()?;
+                    meta.file_type()
+                        .is_symlink()
+                        .then(|| groovie_core::store::resolve_write_target(p).ok())
+                        .flatten()
+                })
+                .map(|p| p.to_string_lossy().into_owned());
+            Ok(ConfigInfo {
+                path: cfg.store_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                symlink_target,
+                default_path: auto_default.map(|p| p.to_string_lossy().into_owned()),
+                is_custom,
+                json: raw_json,
+            })
+        }
+    }
+}
+
+#[tauri::command]
+async fn reload_config(app: AppHandle, s: State<'_, AppState>) -> R<ConfigInfo> {
+    if s.0.read().await.is_err() {
+        let g = start_engine(&app).await?;
+        let info = g.config_info().await;
+        *s.0.write().await = Ok(g);
+        let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
+        return Ok(info);
+    }
+    engine(&s).await?.reload_config().await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_config_path(app: AppHandle, s: State<'_, AppState>, path: Option<String>) -> R<ConfigInfo> {
+    if s.0.read().await.is_err() {
+        let cleaned = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let target = cleaned.map(groovie_core::store::normalize_user_store_path);
+        groovie_core::store::write_custom_store_path(target.as_deref()).map_err(err)?;
+        let g = start_engine(&app).await?;
+        let info = g.config_info().await;
+        *s.0.write().await = Ok(g);
+        let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
+        return Ok(info);
+    }
+    engine(&s).await?.set_custom_config_path(path.as_deref()).await.map_err(err)
+}
+
+#[tauri::command]
+async fn open_config_folder(s: State<'_, AppState>) -> R<()> {
+    let path = match s.0.read().await.clone() {
+        Ok(g) => g.ensure_config_saved().await.map_err(err)?,
+        Err(_) => Config::default().with_env_overrides().store_path,
+    }
+    .ok_or_else(|| "no config file configured".to_string())?;
+    let resolved = groovie_core::store::resolve_write_target(&path).unwrap_or(path);
+    let dir = resolved
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| "could not determine config directory".to_string())?;
+    std::fs::create_dir_all(dir).map_err(err)?;
+    open_directory(dir)
+}
+
+#[tauri::command]
+fn open_github() -> R<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", GITHUB_URL])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(err)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(GITHUB_URL).spawn().map_err(err)?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(GITHUB_URL).spawn().map_err(err)?;
+    }
+    Ok(())
+}
+
+fn open_directory(dir: &std::path::Path) -> R<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe").arg(dir).spawn().map_err(err)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(dir).spawn().map_err(err)?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(err)?;
+    }
+    Ok(())
+}
+
 fn update_poll_mode(app: &AppHandle, active: bool, force_sync: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -266,6 +388,11 @@ fn main() {
             list_logs,
             clear_logs,
             set_window_active,
+            get_config_info,
+            reload_config,
+            set_config_path,
+            open_config_folder,
+            open_github,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Groovie");

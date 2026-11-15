@@ -57,6 +57,25 @@ pub struct LogEntry {
     pub poll: bool,
 }
 
+/// Active configuration file metadata and serialized contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigInfo {
+    /// Configured `groovie.json` path (`None` when running in-memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Resolved target path when `path` is a symlink (`None` if not symlinked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+    /// Platform default path Groovie would use without a custom override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_path: Option<String>,
+    /// True when the active path differs from the automatic default path.
+    pub is_custom: bool,
+    /// Pretty-printed JSON representation of the current config.
+    pub json: String,
+}
+
 /// What to do.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]

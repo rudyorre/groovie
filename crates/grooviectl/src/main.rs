@@ -57,6 +57,8 @@ enum Cmd {
     /// Manage saved scenes.
     #[command(subcommand)]
     Scene(SceneCmd),
+    /// Show the active `groovie.json` path (or its JSON contents with `--json`).
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -92,12 +94,26 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let g = Groovie::start(Config::default().with_env_overrides())
+    let cfg = Config::default().with_env_overrides();
+    if matches!(cli.cmd, Cmd::Config) {
+        let store = match &cfg.store_path {
+            Some(p) => groovie_core::store::Store::open(p)?,
+            None => groovie_core::store::Store::in_memory(),
+        };
+        if cli.json {
+            println!("{}", store.pretty_json());
+        } else if let Some(p) = store.path() {
+            println!("{}", p.display());
+        }
+        return Ok(());
+    }
+    let g = Groovie::start(cfg)
         .await
         .context("could not start (is UDP port 4002 free?)")?;
     tokio::time::sleep(Duration::from_millis(cli.wait)).await;
 
     match cli.cmd {
+        Cmd::Config => unreachable!(),
         Cmd::List => {
             let devices = g.devices().await;
             if cli.json {

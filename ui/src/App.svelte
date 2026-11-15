@@ -4,6 +4,7 @@
     api,
     isTauri,
     toHex,
+    type ConfigInfo,
     type Device,
     type Group,
     type LogEntry,
@@ -37,6 +38,12 @@
   let hidePolls = $state(true);
   let copied = $state(false);
   let logBox = $state<HTMLElement | null>(null);
+  let configOpen = $state(false);
+  let configInfo = $state<ConfigInfo | null>(null);
+  let editingPath = $state(false);
+  let pathDraft = $state('');
+  let copiedPath = $state(false);
+  let copiedConfig = $state(false);
 
   const group = $derived(groups.find((g) => g.id === view));
   const shown = $derived(group ? devices.filter((d) => group.members.includes(d.id)) : devices);
@@ -98,6 +105,9 @@
           else devices = [...devices, e.device].sort((x, y) => x.name.localeCompare(y.name));
         } else if (e.type === 'configChanged') {
           reload();
+          if (configOpen) {
+            a.getConfigInfo().then((info) => (configInfo = info)).catch(() => {});
+          }
         } else if (e.type === 'logged' && logsOpen) {
           logs = [...logs.slice(-499), e.entry];
         }
@@ -132,6 +142,74 @@
   async function clearLogEntries() {
     await run((a) => a.clearLogs());
     logs = [];
+  }
+
+  async function openConfig() {
+    configOpen = true;
+    editingPath = false;
+    copiedPath = false;
+    copiedConfig = false;
+    const info = await run((a) => a.getConfigInfo());
+    if (info) {
+      configInfo = info;
+      pathDraft = info.path ?? '';
+    }
+  }
+
+  async function copyConfigPath() {
+    if (!configInfo?.path) return;
+    try {
+      await navigator.clipboard.writeText(configInfo.path);
+      copiedPath = true;
+      setTimeout(() => (copiedPath = false), 2000);
+    } catch (e) {
+      showToast(`Could not copy: ${e}`);
+    }
+  }
+
+  async function copyConfigJson() {
+    if (!configInfo) return;
+    try {
+      await navigator.clipboard.writeText(configInfo.json);
+      copiedConfig = true;
+      setTimeout(() => (copiedConfig = false), 2000);
+    } catch (e) {
+      showToast(`Could not copy: ${e}`);
+    }
+  }
+
+  async function reloadConfigFromDisk() {
+    const info = await run((a) => a.reloadConfig());
+    if (info) {
+      configInfo = info;
+      pathDraft = info.path ?? '';
+      await reload();
+      showToast('Reloaded configuration from disk');
+    }
+  }
+
+  async function saveCustomPath() {
+    const next = pathDraft.trim();
+    if (!next) return;
+    const info = await run((a) => a.setConfigPath(next));
+    if (info) {
+      configInfo = info;
+      pathDraft = info.path ?? '';
+      editingPath = false;
+      await reload();
+      showToast('Updated config file location');
+    }
+  }
+
+  async function resetConfigPath() {
+    const info = await run((a) => a.setConfigPath(null));
+    if (info) {
+      configInfo = info;
+      pathDraft = info.path ?? '';
+      editingPath = false;
+      await reload();
+      showToast('Restored default config location');
+    }
   }
 
   function fmtTime(tsMs: number) {
@@ -297,10 +375,32 @@
         </button>
       {/if}
       <div class="foot-row">
-        <span class="version">{isTauri ? `v${version}` : 'Demo mode'}</span>
-        <button class="ghost foot-btn" title="Activity & network log" onclick={openLogs}>
-          <Icon name="terminal" size={13} /> Logs
+        <button
+          class="ghost version-link"
+          title="View Groovie on GitHub"
+          onclick={() => run((a) => a.openGithub())}
+        >
+          <span>{isTauri ? `v${version}` : 'Demo'}</span>
+          <Icon name="external" size={11} />
         </button>
+        <div class="foot-tools">
+          <button
+            class="ghost foot-icon"
+            title="Configuration (groovie.json)"
+            aria-label="Configuration"
+            onclick={openConfig}
+          >
+            <Icon name="sliders" size={14} />
+          </button>
+          <button
+            class="ghost foot-icon"
+            title="Activity & network log"
+            aria-label="Activity & network log"
+            onclick={openLogs}
+          >
+            <Icon name="terminal" size={14} />
+          </button>
+        </div>
       </div>
     </footer>
   </aside>
@@ -403,6 +503,90 @@
   </div>
 {/if}
 
+{#if configOpen}
+  <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (configOpen = false)}>
+    <div class="dialog config-dialog" role="dialog" aria-modal="true" aria-label="Configuration">
+      <div class="log-head">
+        <h2>Configuration</h2>
+        <button type="button" class="ghost icon-btn" title="Close" onclick={() => (configOpen = false)}>
+          <Icon name="x" size={16} />
+        </button>
+      </div>
+
+      <p class="dialog-text">
+        Nicknames, groups, and scenes live in a plain JSON file. Symlink it or point Groovie at your dotfiles repo — external edits reload automatically.
+      </p>
+
+      <div class="path-card">
+        <div class="path-meta">
+          <span class="path-label">{configInfo?.isCustom ? 'Custom path' : 'Config file'}</span>
+          <div class="path-btns">
+            {#if configInfo?.path}
+              <button type="button" class="ghost sm-btn" onclick={copyConfigPath}>
+                <Icon name={copiedPath ? 'check' : 'copy'} size={13} />
+                {copiedPath ? 'Copied' : 'Copy path'}
+              </button>
+            {/if}
+            {#if isTauri && configInfo?.path}
+              <button type="button" class="ghost sm-btn" onclick={() => run((a) => a.openConfigFolder())}>
+                <Icon name="folder" size={13} /> Open folder
+              </button>
+            {/if}
+            <button
+              type="button"
+              class="ghost sm-btn"
+              onclick={() => {
+                editingPath = !editingPath;
+                pathDraft = configInfo?.path ?? '';
+              }}
+            >
+              <Icon name="pencil" size={13} /> {editingPath ? 'Close' : 'Change…'}
+            </button>
+          </div>
+        </div>
+
+        <code class="path-value">{configInfo?.path ?? 'In-memory'}</code>
+        {#if configInfo?.symlinkTarget}
+          <div class="symlink-note">→ <code>{configInfo.symlinkTarget}</code></div>
+        {/if}
+
+        {#if editingPath}
+          <form class="path-form" onsubmit={(e) => { e.preventDefault(); saveCustomPath(); }}>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="field mono-field"
+              bind:value={pathDraft}
+              placeholder="~/dotfiles/groovie/groovie.json"
+              autofocus
+            />
+            <div class="path-form-foot">
+              <span class="path-hint">Existing files are loaded; new paths are seeded with your current config.</span>
+              <span class="spacer"></span>
+              {#if configInfo?.isCustom}
+                <button type="button" class="ghost sm-btn" onclick={resetConfigPath}>Use default</button>
+              {/if}
+              <button type="submit" class="primary sm-btn" disabled={!pathDraft.trim()}>Save path</button>
+            </div>
+          </form>
+        {/if}
+      </div>
+
+      <pre class="config-box">{configInfo?.json ?? ''}</pre>
+
+      <div class="dialog-actions log-foot">
+        <button type="button" class="ghost" onclick={reloadConfigFromDisk}>
+          <Icon name="refresh" size={14} /> Reload from disk
+        </button>
+        <span class="spacer"></span>
+        <button type="button" class="primary" onclick={copyConfigJson}>
+          <Icon name={copiedConfig ? 'check' : 'copy'} size={14} />
+          {copiedConfig ? 'Copied' : 'Copy JSON'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if logsOpen}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (logsOpen = false)}>
     <div class="dialog log-dialog" role="dialog" aria-modal="true" aria-label="Activity & network log">
@@ -461,7 +645,15 @@
   </div>
 {/if}
 
-<svelte:window onkeydown={(e) => e.key === 'Escape' && logsOpen && (logsOpen = false)} />
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== 'Escape') return;
+    if (logsOpen) logsOpen = false;
+    else if (configOpen) configOpen = false;
+    else if (editing) editing = null;
+    else if (addingLight) addingLight = false;
+  }}
+/>
 
 {#if toast}
   <div class="toast" role="status">{toast}</div>
@@ -523,10 +715,27 @@
   .scene:hover .del, .scene .del:focus-visible { opacity: 1; }
   nav form { padding: 2px 0 4px; }
 
-  footer { display: flex; flex-direction: column; gap: 8px; padding: 10px 6px 0 10px; }
-  .foot-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .foot-btn { height: 26px; padding: 0 8px; font-size: 12px; border-radius: 6px; color: var(--text-3); }
-  .version { font-size: 12px; color: var(--text-3); }
+  footer { display: flex; flex-direction: column; gap: 8px; padding: 10px 4px 0 3px; }
+  .foot-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .version-link {
+    height: 26px;
+    padding: 0 7px;
+    gap: 3px;
+    font-size: 12px;
+    border-radius: 6px;
+    color: var(--text-3);
+  }
+  .version-link :global(svg) { opacity: 0.55; transition: opacity 0.12s, transform 0.12s; }
+  .version-link:hover :global(svg) { opacity: 1; transform: translate(1px, -1px); }
+  .foot-tools { display: flex; align-items: center; gap: 2px; }
+  .foot-icon {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    justify-content: center;
+    border-radius: 6px;
+    color: var(--text-3);
+  }
   .update {
     justify-content: center;
     background: var(--accent);
@@ -600,6 +809,57 @@
   .check small { color: var(--text-3); font-size: 12px; }
   .dialog-actions { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
   .spacer { flex: 1; }
+
+  .config-dialog { width: min(640px, 94vw); max-height: 86vh; }
+  .path-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+  }
+  .path-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .path-label { font-size: 11.5px; font-weight: 550; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.04em; }
+  .path-btns { display: flex; align-items: center; gap: 2px; margin-right: -4px; }
+  .sm-btn { height: 25px; padding: 0 8px; font-size: 12px; border-radius: 6px; }
+  .path-value {
+    font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    color: var(--text);
+    word-break: break-all;
+  }
+  .symlink-note { font-size: 11.5px; color: var(--text-3); word-break: break-all; }
+  .symlink-note code { font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace; color: var(--text-2); }
+  .path-form {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding-top: 8px;
+    margin-top: 2px;
+    border-top: 1px solid var(--border);
+  }
+  .mono-field {
+    font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    background: var(--surface);
+  }
+  .path-form-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .path-hint { font-size: 11.5px; color: var(--text-3); }
+  .config-box {
+    margin: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 10px 12px;
+    max-height: min(300px, 40vh);
+    overflow: auto;
+    font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
 
   .log-dialog { width: min(760px, 94vw); max-height: 86vh; }
   .log-head { display: flex; align-items: center; justify-content: space-between; margin: -2px -4px 0 0; }

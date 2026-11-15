@@ -352,5 +352,42 @@ async fn syncs_external_changes_and_adapts_poll_interval() {
     .await;
 }
 
+#[tokio::test]
+async fn reloads_external_dotfiles_edits_and_switches_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let initial_path = dir.path().join("app/groovie.json");
+    let dotfiles_path = dir.path().join("dotfiles/groovie.json");
+
+    let (net, base) = (12, 41110);
+    let sims = spawn_sims(net, base, 1).await;
+    let id = sims[0].config.id.clone();
+    let g = Groovie::start(config(net, base, 1, Some(initial_path))).await.unwrap();
+    let g2 = g.clone();
+    eventually("discovered", || {
+        let g = g2.clone();
+        async move { g.devices().await.len() == 1 }
+    })
+    .await;
+
+    g.rename_device(&id, "Desk Lamp").await.unwrap();
+    g.create_group("Office", vec![id.clone()]).await.unwrap();
+
+    // Pointing at a brand-new dotfiles path copies current config there.
+    let info = g.switch_store_path(dotfiles_path.clone()).await.unwrap();
+    assert_eq!(info.path.as_deref(), dotfiles_path.to_str());
+    assert!(dotfiles_path.is_file());
+    assert!(info.json.contains("Desk Lamp"));
+
+    // Simulate `git pull` / editor modifying `dotfiles/groovie.json` externally.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let edited = info.json.replace("Desk Lamp", "Studio Lamp").replace("Office", "Studio");
+    std::fs::write(&dotfiles_path, edited).unwrap();
+
+    // Focusing the window (`sync_now`) picks up the dotfile edit immediately.
+    g.sync_now().await;
+    assert_eq!(g.device(&id).await.unwrap().name, "Studio Lamp");
+    assert_eq!(g.groups().await[0].name, "Studio");
+}
+
 
 

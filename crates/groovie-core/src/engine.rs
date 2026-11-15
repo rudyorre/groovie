@@ -3,7 +3,10 @@
 
 use crate::model::*;
 use crate::protocol::*;
-use crate::store::{default_store_path, KnownDevice, Store};
+use crate::store::{
+    default_auto_store_path, default_store_path, normalize_user_store_path, write_custom_store_path,
+    KnownDevice, Store,
+};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -195,9 +198,10 @@ impl Groovie {
         })
     }
 
-    /// Immediately poll idle devices unless a refresh already ran within the
-    /// last 400 ms (debounces rapid focus / visibility / tray events).
+    /// Immediately check for external `groovie.json` edits and poll idle devices
+    /// unless a refresh already ran within the last 400 ms.
     pub async fn sync_now(&self) {
+        self.inner.reload_store_if_changed().await;
         let recent = self
             .inner
             .last_refresh
@@ -464,6 +468,52 @@ impl Groovie {
         Ok(())
     }
 
+    // ---- config file -----------------------------------------------------
+
+    /// Return the active `groovie.json` path metadata and formatted JSON.
+    pub async fn config_info(&self) -> ConfigInfo {
+        self.inner.reload_store_if_changed().await;
+        let store = self.inner.store.lock().await;
+        build_config_info(&store)
+    }
+
+    /// Re-read `groovie.json` from disk and reconcile device nicknames/groups/scenes.
+    pub async fn reload_config(&self) -> Result<ConfigInfo> {
+        let mut store = self.inner.store.lock().await;
+        store.reload()?;
+        self.inner.apply_store_to_devices(&store).await;
+        Ok(build_config_info(&store))
+    }
+
+    /// Switch the engine's config file to `path` (adopting existing JSON if
+    /// `path` exists, or seeding `path` with the current config otherwise).
+    pub async fn switch_store_path(&self, path: PathBuf) -> Result<ConfigInfo> {
+        let mut store = self.inner.store.lock().await;
+        store.set_path(path)?;
+        self.inner.apply_store_to_devices(&store).await;
+        Ok(build_config_info(&store))
+    }
+
+    /// Set or clear a persistent custom `groovie.json` location for dotfiles.
+    pub async fn set_custom_config_path(&self, custom: Option<&str>) -> Result<ConfigInfo> {
+        let cleaned = custom.map(str::trim).filter(|s| !s.is_empty());
+        let target = match cleaned {
+            Some(raw) => normalize_user_store_path(raw),
+            None => default_auto_store_path()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not determine default config path"))?,
+        };
+        let info = self.switch_store_path(target.clone()).await?;
+        write_custom_store_path(cleaned.map(|_| target.as_path()))?;
+        Ok(info)
+    }
+
+    /// Ensure `groovie.json` exists on disk and return its path.
+    pub async fn ensure_config_saved(&self) -> Result<Option<PathBuf>> {
+        let mut store = self.inner.store.lock().await;
+        store.ensure_saved()?;
+        Ok(store.path().map(PathBuf::from))
+    }
+
     // ---- diagnostic logs -------------------------------------------------
 
     pub async fn logs(&self) -> Vec<LogEntry> {
@@ -472,6 +522,22 @@ impl Groovie {
 
     pub async fn clear_logs(&self) {
         self.inner.logs.lock().await.clear();
+    }
+}
+
+fn build_config_info(store: &Store) -> ConfigInfo {
+    let auto_default = default_auto_store_path();
+    let is_custom = match (store.path(), auto_default.as_deref()) {
+        (Some(cur), Some(def)) => cur != def,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    ConfigInfo {
+        path: store.path().map(|p| p.to_string_lossy().into_owned()),
+        symlink_target: store.symlink_target().map(|p| p.to_string_lossy().into_owned()),
+        default_path: auto_default.map(|p| p.to_string_lossy().into_owned()),
+        is_custom,
+        json: store.pretty_json(),
     }
 }
 
@@ -538,6 +604,59 @@ impl Inner {
         drop(store);
         self.emit(Event::ConfigChanged);
         Ok(())
+    }
+
+    async fn reload_store_if_changed(&self) {
+        let mut store = self.store.lock().await;
+        match store.reload_if_changed() {
+            Ok(true) => {
+                self.apply_store_to_devices(&store).await;
+            }
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "ignoring unreadable external config file"),
+        }
+    }
+
+    async fn apply_store_to_devices(&self, store: &Store) {
+        let mut updated = Vec::new();
+        {
+            let mut devices = self.devices.write().await;
+            for (id, e) in devices.iter_mut() {
+                let next_name = display_name(store, id, &e.device.sku);
+                if e.device.name != next_name {
+                    e.device.name = next_name;
+                    updated.push(e.device.clone());
+                }
+            }
+            for k in &store.data.known_devices {
+                if !devices.contains_key(&k.id) {
+                    let dev = Device {
+                        id: k.id.clone(),
+                        ip: k.ip,
+                        sku: k.sku.clone(),
+                        name: display_name(store, &k.id, &k.sku),
+                        online: false,
+                        state: None,
+                        firmware: None,
+                    };
+                    updated.push(dev.clone());
+                    devices.insert(
+                        k.id.clone(),
+                        Entry {
+                            device: dev,
+                            last_seen: None,
+                            last_command: None,
+                            missed_polls: 0,
+                            generation: 0,
+                        },
+                    );
+                }
+            }
+        }
+        for device in updated {
+            self.emit(Event::DeviceUpdated { device });
+        }
+        self.emit(Event::ConfigChanged);
     }
 
     async fn send(&self, cmd: Command, to: SocketAddr) -> Result<()> {
