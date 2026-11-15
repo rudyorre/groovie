@@ -16,7 +16,9 @@ Tested device types: H6072 floor lamp, H6056 light bars. Most Wi-Fi Govee lights
 
 ## Download
 
-Installers are built automatically by GitHub Actions. Open the [Actions tab](https://github.com/rudyorre/groovie/actions), click the latest successful **CI** run on `main`, and download **Groovie-Windows** (`.msi` / `-setup.exe`) or **Groovie-macOS** (`.dmg`, works on Apple Silicon and Intel).
+Get the latest installer from [**Releases**](https://github.com/rudyorre/groovie/releases/latest): `Groovie_x.y.z_x64-setup.exe` for Windows, `Groovie_x.y.z_universal.dmg` for macOS (Apple Silicon and Intel).
+
+**Updates are automatic:** when a new version is released, Groovie shows an **Update** button in the sidebar. Click it and the app downloads the update, installs it and restarts.
 
 The builds are not code-signed yet, so:
 - **Windows:** SmartScreen may say "Windows protected your PC". Click **More info → Run anyway**.
@@ -69,6 +71,8 @@ cd apps/desktop && npm install            # also installs ui/ deps
 npm run dev                               # desktop app with hot reload
 npm run build                             # installer in src-tauri/target/release/bundle
 ```
+
+Releasing: bump `version` in `apps/desktop/src-tauri/tauri.conf.json`, commit, then `git tag vX.Y.Z && git push --tags`. The Release workflow builds and publishes signed installers and `latest.json`, which installed apps check for updates. The updater signing key is the `TAURI_SIGNING_PRIVATE_KEY` repository secret; keep a backup, because without it existing installs can't verify new updates.
 
 Testing without lights (Linux): run `cargo run -p groovie-sim -- --count 3`, then start the CLI or app with `GROOVIE_SCAN_TARGETS=127.0.0.2:4001,127.0.0.3:4001,127.0.0.4:4001`.
 

@@ -40,7 +40,12 @@ export interface Api {
   applyScene(id: string): Promise<void>;
   deleteScene(id: string): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
+  appVersion(): Promise<string>;
+  /** Resolves to an available update, or null if up to date. */
+  checkUpdate(): Promise<Update | null>;
 }
+
+export type Update = { version: string; install: () => Promise<void> };
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -66,6 +71,20 @@ async function tauriApi(): Promise<Api> {
     onEvent(cb) {
       const un = listen<GroovieEvent>('groovie://event', (e) => cb(e.payload));
       return () => void un.then((f) => f());
+    },
+    appVersion: async () => (await import('@tauri-apps/api/app')).getVersion(),
+    async checkUpdate() {
+      const { check } = await import('@tauri-apps/plugin-updater');
+      const u = await check();
+      if (!u) return null;
+      return {
+        version: u.version,
+        async install() {
+          await u.downloadAndInstall();
+          const { relaunch } = await import('@tauri-apps/plugin-process');
+          await relaunch();
+        },
+      };
     },
   };
 }
@@ -154,6 +173,8 @@ function mockApi(): Api {
     },
     async deleteScene(id) { scenes = scenes.filter((s) => s.id !== id); config(); },
     onEvent(cb) { subs.add(cb); return () => subs.delete(cb); },
+    appVersion: async () => 'demo',
+    checkUpdate: async () => null,
   };
 }
 

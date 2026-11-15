@@ -1,71 +1,140 @@
+/* Design tokens. Neutral greys + one warm accent (the amber from the logo). */
 :root {
-  --bg: #0f1014;
-  --panel: #181a20;
-  --border: #2a2d36;
-  --hover: #23262e;
-  --text: #e8e9ee;
-  --muted: #8b8f9c;
-  --accent: #a77bff;
+  --bg: #0c0c0d;
+  --sidebar: #101011;
+  --surface: #161618;
+  --surface-2: #1d1d20;
+  --border: #26262a;
+  --hover: #1c1c1f;
+  --active: #232327;
+  --track: #232327;
+  --track-strong: #3a3a40;
+  --text: #ededef;
+  --text-2: #9d9da6;
+  --text-3: #6b6b74;
+  --accent: #ffb020;
+  --focus: #ffb020aa;
   color-scheme: dark;
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   font-size: 14px;
+  line-height: 1.35;
   color: var(--text);
   background: var(--bg);
-  accent-color: var(--accent);
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa;
+    --sidebar: #f3f3f4;
+    --surface: #ffffff;
+    --surface-2: #ffffff;
+    --border: #e4e4e7;
+    --hover: #ebebed;
+    --active: #e4e4e7;
+    --track: #ececef;
+    --track-strong: #d4d4d8;
+    --text: #18181b;
+    --text-2: #5f5f68;
+    --text-3: #8e8e97;
+    color-scheme: light;
+  }
 }
 
 * { box-sizing: border-box; }
 body { margin: 0; }
+::selection { background: #ffb02055; }
 
+/* Buttons */
 button {
   font: inherit;
-  color: inherit;
-  background: var(--hover);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 6px 12px;
+  height: 32px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
 }
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.danger { color: #ff7b7b; }
-button.link { all: unset; cursor: pointer; color: var(--accent); font-size: 13px; }
-button.icon { all: unset; cursor: pointer; width: 22px; text-align: center; border-radius: 6px; color: var(--muted); font-size: 16px; }
-button.icon:hover { background: var(--hover); color: var(--text); }
+button:hover:not(:disabled) { background: var(--hover); }
+button:disabled { opacity: 0.5; cursor: default; }
+button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+button.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+button.ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+button.primary { background: var(--text); border-color: var(--text); color: var(--bg); font-weight: 550; }
+button.primary:hover:not(:disabled) { background: var(--text); opacity: 0.9; }
+button.danger { color: #ff6b6b; }
+button.icon-btn { width: 32px; padding: 0; justify-content: center; }
+.section button.icon-btn, .card button.icon-btn, .scene button.icon-btn { width: 24px; height: 24px; border-radius: 6px; }
 
-input.text {
+/* Text fields */
+.field {
   font: inherit;
   color: inherit;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 7px 10px;
-  width: 100%;
 }
-input[type='color'] { width: 44px; height: 28px; border: 0; padding: 0; background: none; cursor: pointer; }
+.field:focus { outline: none; border-color: var(--focus); }
+input[type='checkbox'] { accent-color: var(--accent); width: 15px; height: 15px; }
 
-/* Toggle switch */
-.switch { position: relative; width: 42px; height: 24px; flex: none; }
-.switch input { opacity: 0; width: 0; height: 0; }
+/* Segmented control */
+.segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  padding: 2px;
+  background: var(--track);
+  border-radius: 8px;
+}
+.segmented button {
+  height: 26px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  justify-content: center;
+  border-radius: 6px;
+  font-size: 12.5px;
+}
+.segmented button:hover:not(:disabled) { background: transparent; color: var(--text); }
+.segmented button.sel { background: var(--surface-2); color: var(--text); box-shadow: 0 1px 2px #0003; }
+
+/* Chips */
+.chip { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 13px; color: var(--text-2); }
+.chip.sel { color: var(--text); border-color: var(--text-3); }
+
+/* Switch */
+.switch { position: relative; width: 38px; height: 22px; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .switch span {
   position: absolute;
   inset: 0;
-  background: var(--border);
-  border-radius: 24px;
-  transition: background 0.2s;
+  background: var(--track-strong);
+  border-radius: 11px;
   cursor: pointer;
+  transition: background 0.18s;
 }
 .switch span::before {
   content: '';
   position: absolute;
   width: 18px;
   height: 18px;
-  left: 3px;
-  top: 3px;
+  left: 2px;
+  top: 2px;
   background: #fff;
   border-radius: 50%;
-  transition: transform 0.2s;
+  box-shadow: 0 1px 2px #0004;
+  transition: transform 0.18s;
 }
 .switch input:checked + span { background: var(--accent); }
-.switch input:checked + span::before { transform: translateX(18px); }
+.switch input:checked + span::before { transform: translateX(16px); }
+.switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
 .switch input:disabled + span { cursor: not-allowed; opacity: 0.5; }

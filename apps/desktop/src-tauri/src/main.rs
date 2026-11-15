@@ -101,6 +101,8 @@ fn all_power(app: &AppHandle, on: bool) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // Start the engine on Tauri's tokio runtime.
             let groovie = tauri::async_runtime::block_on(Groovie::start(Config::default().with_env_overrides()))?;
