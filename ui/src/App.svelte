@@ -71,7 +71,13 @@
 
 <div class="app">
   <aside>
-    <h1>Groovie</h1>
+    <h1>
+      <svg viewBox="0 0 1024 1024" aria-hidden="true">
+        <path d="M768 466.9A260 260 0 1 1 557.1 255.9" fill="none" stroke="currentColor" stroke-width="120" stroke-linecap="round" />
+        <circle cx="695.8" cy="328.2" r="60" fill="#FFB020" />
+      </svg>
+      Groovie
+    </h1>
 
     <nav>
       <button class:active={view === 'all'} onclick={() => (view = 'all')}>All lights</button>
@@ -184,13 +190,15 @@
     overflow-y: auto;
   }
   h1 {
-    font-size: 22px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
     margin: 0 0 8px 8px;
-    background: linear-gradient(90deg, #ff8a3d, #c86bff, #4fc3ff);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
   }
+  h1 svg { width: 22px; height: 22px; }
   nav { display: flex; flex-direction: column; gap: 2px; flex: 1; }
   nav h2 {
     display: flex;
