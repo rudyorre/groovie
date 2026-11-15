@@ -10,6 +10,7 @@
   /** 'all' or a group id */
   let view = $state('all');
   let toast = $state('');
+  let startupError = $state('');
   let version = $state('');
   let update = $state<Update | null>(null);
   let updating = $state(false);
@@ -43,15 +44,27 @@
   }
 
   async function reload() {
-    await run(async (a) => {
+    try {
+      const a = await api;
       [devices, groups, scenes] = await Promise.all([a.listDevices(), a.listGroups(), a.listScenes()]);
-    });
-    if (view !== 'all' && !groups.some((g) => g.id === view)) view = 'all';
+      startupError = '';
+      if (view !== 'all' && !groups.some((g) => g.id === view)) view = 'all';
+    } catch (e) {
+      startupError = String(e);
+    }
   }
 
   onMount(() => {
     reload();
     let off = () => {};
+    let lastUpdateCheck = 0;
+    const maybeCheckUpdate = async () => {
+      if (update || Date.now() - lastUpdateCheck < 60_000) return;
+      lastUpdateCheck = Date.now();
+      const a = await api;
+      update = await a.checkUpdate().catch(() => null);
+    };
+    window.addEventListener('focus', maybeCheckUpdate);
     api.then(async (a) => {
       off = a.onEvent((e) => {
         if (e.type === 'deviceUpdated') {
@@ -61,14 +74,18 @@
         } else reload();
       });
       version = await a.appVersion().catch(() => '');
-      update = await a.checkUpdate().catch(() => null);
+      await maybeCheckUpdate();
     });
-    return () => off();
+    return () => {
+      off();
+      window.removeEventListener('focus', maybeCheckUpdate);
+    };
   });
 
   async function rescan() {
     scanning = true;
     await run((a) => a.discover());
+    if (startupError) await reload();
     setTimeout(() => (scanning = false), 1200);
   }
 
@@ -203,6 +220,16 @@
         </button>
       </div>
     </header>
+
+    {#if startupError}
+      <div class="banner" role="alert">
+        <div>
+          <strong>Could not start local network listener</strong>
+          <p>{startupError}</p>
+        </div>
+        <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+      </div>
+    {/if}
 
     <section class="grid">
       {#each shown as d (d.id)}
@@ -355,6 +382,18 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; align-items: start; }
+  .banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .banner p { margin: 3px 0 0; color: var(--text-2); font-size: 13px; }
   .empty {
     grid-column: 1 / -1;
     max-width: 440px;

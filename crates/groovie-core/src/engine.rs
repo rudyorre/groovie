@@ -656,8 +656,6 @@ async fn rescan_loop(inner: Arc<Inner>) {
 fn bind_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    // Lets the CLI run alongside the desktop app.
-    s.set_reuse_address(true)?;
     s.set_multicast_ttl_v4(2)?;
     s.set_multicast_loop_v4(true)?;
     s.set_nonblocking(true)?;

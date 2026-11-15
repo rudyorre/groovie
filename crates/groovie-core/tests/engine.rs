@@ -221,3 +221,13 @@ async fn add_device_by_ip_without_discovery() {
     .await;
     assert_eq!(g.devices().await[0].id, sims[0].config.id);
 }
+
+#[tokio::test]
+async fn second_instance_on_same_port_fails_cleanly() {
+    let mut cfg = config(8, 41070, 0, None);
+    cfg.scan_targets.clear();
+    let _first = Groovie::start(cfg.clone()).await.unwrap();
+    let err = Groovie::start(cfg).await.err().expect("second bind on same UDP port must fail");
+    assert!(err.to_string().contains("41072"), "unexpected error: {err}");
+}
+

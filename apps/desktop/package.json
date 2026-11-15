@@ -1,7 +1,7 @@
 {
   "name": "groovie-desktop",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "scripts": {
     "postinstall": "npm --prefix ../../ui install",
     "dev": "tauri dev",

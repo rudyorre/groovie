@@ -4,11 +4,14 @@
 use groovie_core::{Action, Config, Device, Group, Groovie, Scene, Target};
 use std::net::Ipv4Addr;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::RwLock;
 
-struct AppState(Groovie);
+/// Holds the running engine, or the startup error if UDP port 4002 was busy so
+/// the window can still open and tell the user what's holding it.
+struct AppState(RwLock<Result<Groovie, String>>);
 
 type R<T> = Result<T, String>;
 
@@ -16,72 +19,102 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-#[tauri::command]
-async fn list_devices(s: State<'_, AppState>) -> R<Vec<Device>> {
-    Ok(s.0.devices().await)
+async fn start_engine(app: &AppHandle) -> R<Groovie> {
+    let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
+    let mut rx = groovie.subscribe();
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let _ = handle.emit("groovie://event", ev);
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    Ok(groovie)
+}
+
+async fn engine(s: &State<'_, AppState>) -> R<Groovie> {
+    s.0.read().await.clone()
 }
 
 #[tauri::command]
-async fn discover(s: State<'_, AppState>) -> R<()> {
-    s.0.discover().await.map_err(err)?;
-    s.0.refresh_all().await;
+async fn list_devices(s: State<'_, AppState>) -> R<Vec<Device>> {
+    Ok(engine(&s).await?.devices().await)
+}
+
+#[tauri::command]
+async fn discover(app: AppHandle, s: State<'_, AppState>) -> R<()> {
+    // If startup failed because the port was busy, Retry comes through here.
+    if s.0.read().await.is_err() {
+        let g = start_engine(&app).await?;
+        *s.0.write().await = Ok(g);
+        let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
+        return Ok(());
+    }
+    let g = engine(&s).await?;
+    g.discover().await.map_err(err)?;
+    g.refresh_all().await;
     Ok(())
 }
 
 #[tauri::command]
 async fn apply(s: State<'_, AppState>, target: Target, action: Action) -> R<()> {
-    s.0.apply(&target, action).await.map_err(err)
+    engine(&s).await?.apply(&target, action).await.map_err(err)
 }
 
 #[tauri::command]
 async fn rename(s: State<'_, AppState>, id: String, name: String) -> R<()> {
-    s.0.rename_device(&id, &name).await.map_err(err)
+    engine(&s).await?.rename_device(&id, &name).await.map_err(err)
 }
 
 #[tauri::command]
 async fn add_ip(s: State<'_, AppState>, ip: String) -> R<()> {
     let ip: Ipv4Addr = ip.trim().parse().map_err(|_| format!("'{ip}' is not an IPv4 address"))?;
-    s.0.add_device_by_ip(ip).await.map_err(err)
+    engine(&s).await?.add_device_by_ip(ip).await.map_err(err)
 }
 
 #[tauri::command]
 async fn list_groups(s: State<'_, AppState>) -> R<Vec<Group>> {
-    Ok(s.0.groups().await)
+    Ok(engine(&s).await?.groups().await)
 }
 
 #[tauri::command]
 async fn create_group(s: State<'_, AppState>, name: String, members: Vec<String>) -> R<Group> {
-    s.0.create_group(&name, members).await.map_err(err)
+    engine(&s).await?.create_group(&name, members).await.map_err(err)
 }
 
 #[tauri::command]
 async fn update_group(s: State<'_, AppState>, group: Group) -> R<()> {
-    s.0.update_group(group).await.map_err(err)
+    engine(&s).await?.update_group(group).await.map_err(err)
 }
 
 #[tauri::command]
 async fn delete_group(s: State<'_, AppState>, id: String) -> R<()> {
-    s.0.delete_group(&id).await.map_err(err)
+    engine(&s).await?.delete_group(&id).await.map_err(err)
 }
 
 #[tauri::command]
 async fn list_scenes(s: State<'_, AppState>) -> R<Vec<Scene>> {
-    Ok(s.0.scenes().await)
+    Ok(engine(&s).await?.scenes().await)
 }
 
 #[tauri::command]
 async fn save_scene(s: State<'_, AppState>, name: String) -> R<Scene> {
-    s.0.save_scene(&name, None).await.map_err(err)
+    engine(&s).await?.save_scene(&name, None).await.map_err(err)
 }
 
 #[tauri::command]
 async fn apply_scene(s: State<'_, AppState>, id: String) -> R<()> {
-    s.0.apply_scene(&id).await.map_err(err)
+    engine(&s).await?.apply_scene(&id).await.map_err(err)
 }
 
 #[tauri::command]
 async fn delete_scene(s: State<'_, AppState>, id: String) -> R<()> {
-    s.0.delete_scene(&id).await.map_err(err)
+    engine(&s).await?.delete_scene(&id).await.map_err(err)
 }
 
 fn show_main(app: &AppHandle) {
@@ -93,51 +126,58 @@ fn show_main(app: &AppHandle) {
 }
 
 fn all_power(app: &AppHandle, on: bool) {
-    let g = app.state::<AppState>().0.clone();
+    let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = g.apply(&Target::All, Action::Power(on)).await;
+        if let Ok(g) = app.state::<AppState>().0.read().await.clone() {
+            let _ = g.apply(&Target::All, Action::Power(on)).await;
+        }
     });
 }
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Must come first: if Groovie is already running in the tray, focus its
+        // window and exit before touching UDP port 4002.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
+        .plugin({
+            let builder = tauri_plugin_updater::Builder::new();
+            builder.build()
+        })
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
-            // Start the engine on Tauri's tokio runtime.
-            let groovie = tauri::async_runtime::block_on(Groovie::start(Config::default().with_env_overrides()))?;
-
-            // Forward engine events to the UI.
-            let mut rx = groovie.subscribe();
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            let _ = handle.emit("groovie://event", ev);
-                        }
-                        Err(RecvError::Lagged(_)) => continue,
-                        Err(RecvError::Closed) => break,
-                    }
-                }
-            });
-            app.manage(AppState(groovie));
+            let initial = tauri::async_runtime::block_on(start_engine(&handle));
+            app.manage(AppState(RwLock::new(initial)));
 
-            // Tray icon for quick on/off.
+            // Tray icon: left-click opens Groovie; right-click opens the menu.
             let on = MenuItem::with_id(app, "on", "All on", true, None::<&str>)?;
             let off = MenuItem::with_id(app, "off", "All off", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Groovie", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&on, &off, &show, &quit])?;
-            let mut tray = TrayIconBuilder::with_id("main").tooltip("Groovie").menu(&menu).on_menu_event(
-                |app, ev| match ev.id.as_ref() {
+            let mut tray = TrayIconBuilder::with_id("main")
+                .tooltip("Groovie")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                })
+                .on_menu_event(|app, ev| match ev.id.as_ref() {
                     "on" => all_power(app, true),
                     "off" => all_power(app, false),
                     "show" => show_main(app),
                     "quit" => app.exit(0),
                     _ => {}
-                },
-            );
+                });
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
