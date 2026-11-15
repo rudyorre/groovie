@@ -1,84 +1,122 @@
-# Groovie Lights
+<div align="center">
 
-**Groovie** is a small, open-source, local-first app for controlling Govee lights. It works with no account and no cloud: it talks to your lights directly over your Wi-Fi using Govee's official **LAN API**.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg" />
+  <img src="docs/logo-light.svg" height="44" alt="Groovie" />
+</picture>
 
-- On/off, brightness, RGB colour, white colour temperature
-- Groups (e.g. "Desk") and saved scenes (e.g. "Evening")
-- Desktop app for Windows and macOS with a tray icon, plus a command-line tool (`grooviectl`)
+<p>
+  Local-first Govee light control for Windows, macOS &amp; Linux — desktop tray app + <code>grooviectl</code> CLI.<br />
+  No account, no cloud, instant two-way LAN sync.
+</p>
 
-> Groovie is an independent project and is not affiliated with or endorsed by Govee.
+<p>
+  <a href="https://github.com/rudyorre/groovie/releases/latest"><b>Download</b></a>
+  &nbsp;·&nbsp;
+  <a href="#setup">Setup</a>
+  &nbsp;·&nbsp;
+  <a href="#command-line">CLI</a>
+  &nbsp;·&nbsp;
+  <a href="#configuration">Configuration</a>
+  &nbsp;·&nbsp;
+  <a href="#development">Development</a>
+</p>
 
-## Before you start: turn on LAN Control
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/preview-dark.svg" />
+  <img src="docs/preview-light.svg" width="820" alt="Groovie desktop app showing Floor Lamp in RGB Colour mode and Light Bars in 4000K White mode" />
+</picture>
 
-Each light must be set up once in the official Govee Home app (so it joins your Wi-Fi). Then, in the Govee app, open the light → **Settings** (gear) → turn on **LAN Control**. Your computer must be on the same network as the lights.
+</div>
 
-Tested device types: H6072 floor lamp, H6056 light bars. Most Wi-Fi Govee lights with a "LAN Control" switch should work.
+<br />
+
+**Groovie** talks directly to Wi-Fi Govee lights over your local network using Govee's official UDP LAN API:
+
+- **Direct control:** power, brightness, RGB colour, and white colour temperature (`2000K–9000K`)
+- **Two-way LAN sync:** changes made in the Govee mobile app sync back automatically without cloud polling
+- **Groups & scenes:** control rooms together (e.g. "Desk") and snapshot saved looks (e.g. "Evening")
+- **Lightweight tray app + CLI:** native Tauri desktop app for Windows, macOS, and Linux, plus `grooviectl` for scripts and keybindings
+
+> Groovie is an independent open-source project and is not affiliated with or endorsed by Govee.
 
 ## Download
 
-Get the latest installer from [**Releases**](https://github.com/rudyorre/groovie/releases/latest): `Groovie_x.y.z_x64-setup.exe` for Windows, `Groovie_x.y.z_universal.dmg` for macOS (Apple Silicon and Intel).
+Grab the latest installer from [**Releases**](https://github.com/rudyorre/groovie/releases/latest):
 
-**Updates are automatic:** when a new version is released, Groovie shows an **Update** button in the sidebar. Click it and the app downloads the update, installs it and restarts.
+- **Windows:** `Groovie_x.y.z_x64-setup.exe` (or `.msi`)
+- **macOS:** `Groovie_x.y.z_universal.dmg` (Apple Silicon & Intel)
+- **Linux:** `Groovie_x.y.z_amd64.AppImage` or `.deb`
 
-The builds are not code-signed yet, so:
-- **Windows:** SmartScreen may say "Windows protected your PC". Click **More info → Run anyway**.
-- **macOS:** if it says the app "is damaged" or can't be opened, drag it to Applications and run `xattr -cr /Applications/Groovie.app` in Terminal once.
-- **Firewall:** allow Groovie on **private** networks when asked. It needs UDP ports 4001–4003 to talk to the lights.
+**In-app updates:** when a new release is published, Groovie shows an **Update** button in the sidebar that downloads, verifies, installs, and relaunches in one click.
+
+Notes on first launch (builds are not OS-notarized yet):
+- **Windows:** if SmartScreen says *"Windows protected your PC"*, click **More info → Run anyway**.
+- **macOS:** if Gatekeeper blocks opening, drag `Groovie.app` to Applications and run `xattr -cr /Applications/Groovie.app` once.
+- **Firewall:** allow Groovie on **private** networks when prompted (UDP ports `4001–4003`).
+
+## Setup
+
+Each light must join your Wi-Fi once in the official Govee Home app. Then open the light in the Govee app → **Settings** (gear) → enable **LAN Control**, and make sure your computer is on the same network.
+
+Tested hardware includes `H6072` (Floor Lamp) and `H6056` (Light Bars); most Wi-Fi Govee lights with a **LAN Control** toggle work out of the box.
 
 ## Command line
 
 ```sh
-grooviectl list                           # find lights
+grooviectl list                           # discover lights and print status
 grooviectl on all
-grooviectl color "Floor Lamp" "#ff8800"
-grooviectl kelvin "Light Bars" 3000
-grooviectl brightness all 40
+grooviectl color "Floor Lamp" "#5e5ce6"
+grooviectl kelvin "Light Bars" 4000
+grooviectl brightness all 80
 grooviectl group create Desk "Light Bars"
 grooviectl scene save Evening
 grooviectl scene apply Evening
-grooviectl add-ip 192.168.1.50            # if discovery can't find a light
+grooviectl add-ip 192.168.1.50            # add a light directly if multicast is blocked
 grooviectl config                         # print active groovie.json path (--json for contents)
 ```
 
-Targets can be a light's name, IP or id, a group name, or `all`. Run `grooviectl --help` for everything.
+Targets accept a light's nickname, IP, or device ID, a group name, or `all`. Run `grooviectl --help` for full usage.
+
+## Configuration
+
+Nicknames, groups, scenes, and known devices are stored in plain, deterministic JSON (`groovie.json`) designed to play nicely with dotfiles:
+
+- **Default locations:** `%APPDATA%\groovie\groovie.json` on Windows, `~/Library/Application Support/groovie/groovie.json` on macOS, and `~/.config/groovie/groovie.json` on Linux.
+- **Cross-OS dotfiles:** if `~/.config/groovie/groovie.json` exists on Windows or macOS, Groovie uses it automatically.
+- **Symlink & custom-path friendly:** atomic saves follow symlinks (`ln -s`, `stow`, `chezmoi`) instead of replacing them, or you can point Groovie at any path from the **Configuration** button in the sidebar footer (or via `GROOVIE_CONFIG=/path/to/groovie.json`). External edits reload automatically when you focus the app.
 
 ## Troubleshooting
 
-- **No lights found:** check LAN Control is on, the computer and lights are on the same Wi-Fi (not a guest network), and the firewall allowed Groovie. Some routers block multicast; use **Add light by IP** (or `grooviectl add-ip`) with the light's IP from your router.
-- **Other Govee apps:** the official Govee Desktop app and SignalRGB also listen on UDP port 4002. Close them while using Groovie.
-- **Debug logs (CLI):** `GROOVIE_LOG=debug grooviectl list`.
+- **No lights found:** confirm **LAN Control** is enabled, your computer and lights are on the same Wi-Fi (not a guest VLAN), and your firewall allows Groovie. If your router blocks multicast, click **+** (**Add light by IP**) or run `grooviectl add-ip <ip>`.
+- **Port 4002 busy:** Govee Desktop and SignalRGB also bind UDP port `4002` — close them while running Groovie.
+- **Packet & state logs:** click the terminal (`>_`) button in the bottom-right of the sidebar to inspect live UDP traffic and state transitions (or run `GROOVIE_LOG=debug grooviectl list` in the terminal).
 
 ## Development
 
-Layout:
-
-| Path | What |
+| Path | Description |
 |---|---|
-| `crates/groovie-core` | Rust library: discovery, device state, commands, groups, scenes, config file |
-| `crates/groovie-sim` | Fake Govee lights over real UDP, for testing without hardware |
-| `crates/grooviectl` | CLI |
-| `ui/` | Svelte 5 + Vite UI (runs in a browser with mock lights via `npm run dev`) |
-| `apps/desktop/` | Tauri 2 desktop app wrapping the UI and the core |
+| `crates/groovie-core` | Rust library: UDP LAN protocol, discovery, state sync, groups, scenes, `groovie.json` store |
+| `crates/groovie-sim` | Simulated Govee LAN lights over real UDP for local testing without hardware |
+| `crates/grooviectl` | Command-line interface |
+| `ui/` | Svelte 5 + Vite frontend (runs standalone in a browser with mock lights via `npm run dev`) |
+| `apps/desktop/` | Tauri 2 desktop shell + system tray + auto-updater |
 
-You need [Rust](https://rustup.rs) and [Node.js](https://nodejs.org) 20+. On Windows also install the "Desktop development with C++" workload from [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (WebView2 is already part of Windows 10/11). See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for details.
+Prerequisites: [Rust](https://rustup.rs), [Node.js](https://nodejs.org) 20+, and platform [Tauri v2 dependencies](https://v2.tauri.app/start/prerequisites/).
 
 ```sh
-cargo test                                # core tests (the end-to-end ones run on Linux)
-cargo run -p grooviectl -- list           # CLI against real lights
+cargo test --workspace                    # unit + simulated UDP integration tests
+cargo run -p grooviectl -- list           # run CLI against local lights
 
-cd ui && npm install && npm run dev       # UI only, with mock lights, in the browser
+cd ui && npm install && npm run dev       # browser UI with mock lights
 
-cd apps/desktop && npm install            # also installs ui/ deps
+cd apps/desktop && npm install            # installs desktop + UI dependencies
 npm run dev                               # desktop app with hot reload
-npm run build                             # installer in src-tauri/target/release/bundle
+npm run build                             # native installer in src-tauri/target/release/bundle
 ```
 
-Releasing: bump `version` in `apps/desktop/src-tauri/tauri.conf.json`, commit, then `git tag vX.Y.Z && git push --tags`. The Release workflow builds and publishes signed installers and `latest.json`, which installed apps check for updates. The updater signing key is the `TAURI_SIGNING_PRIVATE_KEY` repository secret; keep a backup, because without it existing installs can't verify new updates.
+To test without physical lights on Linux, run `cargo run -p groovie-sim -- --count 3` in one terminal and launch Groovie or `grooviectl` with `GROOVIE_SCAN_TARGETS=127.0.0.2:4001,127.0.0.3:4001,127.0.0.4:4001`.
 
-Testing without lights (Linux): run `cargo run -p groovie-sim -- --count 3`, then start the CLI or app with `GROOVIE_SCAN_TARGETS=127.0.0.2:4001,127.0.0.3:4001,127.0.0.4:4001`.
+## License
 
-Groups, scenes and nicknames are stored in `groovie.json` (`%APPDATA%\groovie\groovie.json` on Windows, `~/Library/Application Support/groovie/groovie.json` on macOS, or `~/.config/groovie/groovie.json` — automatically preferred on any OS if present). Symlinks are preserved on save, and you can inspect or repoint the config file from the **Configuration** button in the sidebar footer.
-
-## Licence
-
-Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

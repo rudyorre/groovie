@@ -1,0 +1,167 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 314" width="820" height="314" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <clipPath id="winClip"><rect width="820" height="314" rx="12"/></clipPath>
+    <clipPath id="briClip1"><rect x="222" y="134" width="260" height="30" rx="8"/></clipPath>
+    <clipPath id="briClip2"><rect x="524" y="134" width="260" height="30" rx="8"/></clipPath>
+    <linearGradient id="kelvinGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ff9d3b"/>
+      <stop offset="28%" stop-color="#ffd7a8"/>
+      <stop offset="52%" stop-color="#fff4e8"/>
+      <stop offset="78%" stop-color="#dce8ff"/>
+      <stop offset="100%" stop-color="#b8ceff"/>
+    </linearGradient>
+    <linearGradient id="customWheel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ff453a"/>
+      <stop offset="35%" stop-color="#ffd60a"/>
+      <stop offset="68%" stop-color="#30d158"/>
+      <stop offset="100%" stop-color="#5e5ce6"/>
+    </linearGradient>
+  </defs>
+
+  <g clip-path="url(#winClip)">
+    <rect width="820" height="314" fill="#0c0c0d"/>
+
+    <!-- Sidebar -->
+    <rect width="184" height="314" fill="#101011"/>
+    <line x1="184" y1="0" x2="184" y2="314" stroke="#26262a"/>
+
+    <!-- Brand -->
+    <g transform="translate(18, 17) scale(0.019)">
+      <path d="M768 466.9A260 260 0 1 1 557.1 255.9" fill="none" stroke="#ededef" stroke-width="120" stroke-linecap="round"/>
+      <circle cx="695.8" cy="328.2" r="64" fill="#FFB020"/>
+    </g>
+    <text x="44" y="32" fill="#ededef" font-size="14" font-weight="600" letter-spacing="-0.1">Groovie</text>
+
+    <!-- Nav: All lights -->
+    <rect x="10" y="48" width="164" height="30" rx="7" fill="#232327"/>
+    <g transform="translate(19, 56)" fill="none" stroke="#ededef" stroke-width="1.5">
+      <rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1"/>
+      <rect x="8" y="1.5" width="4.5" height="4.5" rx="1"/>
+      <rect x="1.5" y="8" width="4.5" height="4.5" rx="1"/>
+      <rect x="8" y="8" width="4.5" height="4.5" rx="1"/>
+    </g>
+    <text x="40" y="67.5" fill="#ededef" font-size="12.5">All lights</text>
+    <text x="164" y="67.5" fill="#6b6b74" font-size="11.5" text-anchor="end">2</text>
+
+    <!-- Groups -->
+    <text x="20" y="102" fill="#6b6b74" font-size="11" font-weight="500">Groups</text>
+    <text x="163" y="103" fill="#6b6b74" font-size="13" text-anchor="end">+</text>
+    <path d="M20 116.5a1.2 1.2 0 0 1 1.2-1.2h3.3l1.5 1.5h6.3a1.2 1.2 0 0 1 1.2 1.2v6a1.2 1.2 0 0 1-1.2 1.2H21.2a1.2 1.2 0 0 1-1.2-1.2Z" fill="none" stroke="#9d9da6" stroke-width="1.4"/>
+    <text x="40" y="124.5" fill="#9d9da6" font-size="12.5">Desk</text>
+    <text x="164" y="124.5" fill="#6b6b74" font-size="11.5" text-anchor="end">1</text>
+
+    <!-- Scenes -->
+    <text x="20" y="156" fill="#6b6b74" font-size="11" font-weight="500">Scenes</text>
+    <text x="163" y="157" fill="#6b6b74" font-size="13" text-anchor="end">+</text>
+    <path d="M26.5 168l1.2 3.5 3.5 1.2-3.5 1.2-1.2 3.5-1.2-3.5-3.5-1.2 3.5-1.2Z" fill="none" stroke="#9d9da6" stroke-width="1.3" stroke-linejoin="round"/>
+    <text x="40" y="177.5" fill="#9d9da6" font-size="12.5">Evening</text>
+
+    <!-- Sidebar footer -->
+    <text x="18" y="297" fill="#6b6b74" font-size="11">v0.2.5 ↗</text>
+    <g transform="translate(136, 287)" stroke="#6b6b74" stroke-width="1.4" fill="none" stroke-linecap="round">
+      <path d="M1 3.5h5.5M9.5 3.5h2M1 8.5h2M6 8.5h5.5"/>
+      <circle cx="8" cy="3.5" r="1.3"/>
+      <circle cx="4.5" cy="8.5" r="1.3"/>
+    </g>
+    <g transform="translate(157, 287)" stroke="#6b6b74" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m2 3 3.2 3.2L2 9.4M6.8 9.8h4.5"/>
+    </g>
+
+    <!-- Main Header -->
+    <text x="208" y="36" fill="#ededef" font-size="18" font-weight="600" letter-spacing="-0.2">All lights</text>
+    <text x="208" y="53" fill="#9d9da6" font-size="12">2 lights · 2 on</text>
+
+    <!-- Header action buttons -->
+    <path d="M686 30v10M681 35h10" stroke="#9d9da6" stroke-width="1.5" stroke-linecap="round"/>
+    <g transform="translate(705, 28)" fill="none" stroke="#9d9da6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12.5 7a5.5 5.5 0 1 1-1.6-3.9L12.5 4.5"/>
+      <path d="M12.5 1.5v3h-3"/>
+    </g>
+    <rect x="730" y="21" width="68" height="28" rx="7" fill="#1d1d20" stroke="#26262a"/>
+    <g transform="translate(740, 29)" fill="none" stroke="#ededef" stroke-width="1.4" stroke-linecap="round">
+      <path d="M6 1v4.5"/><path d="M9.4 2.9a4.7 4.7 0 1 1-6.8 0"/>
+    </g>
+    <text x="756" y="39" fill="#ededef" font-size="11.5" font-weight="500">All off</text>
+
+    <!-- Card 1: Floor Lamp (Colour mode - #5e5ce6) -->
+    <rect x="208" y="70" width="288" height="184" rx="13" fill="#161618" stroke="#26262a"/>
+    <rect x="222" y="84" width="36" height="36" rx="9" fill="#5e5ce6"/>
+    <g transform="translate(231, 93)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6.5 2h5l2.5 5.8H4Z"/>
+      <path d="M9 7.8V16M6.5 16h5"/>
+    </g>
+    <text x="268" y="99" fill="#ededef" font-size="13.5" font-weight="600">Floor Lamp</text>
+    <text x="268" y="115" fill="#9d9da6" font-size="11.5">On · 80%</text>
+    <rect x="446" y="92" width="36" height="20" rx="10" fill="#ffb020"/>
+    <circle cx="472" cy="102.6" r="8" fill="#000000" fill-opacity="0.14"/>
+    <circle cx="472" cy="102" r="8" fill="#ffffff"/>
+
+    <rect x="222" y="134" width="260" height="30" rx="8" fill="#232327"/>
+    <g clip-path="url(#briClip1)">
+      <rect x="222" y="134" width="208" height="30" fill="#5e5ce6"/>
+    </g>
+    <g transform="translate(442, 149)" stroke="#9d9da6" stroke-width="1.2" stroke-linecap="round" fill="none">
+      <circle cx="0" cy="0" r="2.2"/>
+      <path d="M0-4.8v1.1M0 3.7v1.1M-4.8 0h1.1M3.7 0h1.1M-3.4-3.4l.8.8M2.6 2.6l.8.8M-3.4 3.4l.8-.8M2.6-2.6l.8-.8"/>
+    </g>
+    <text x="473" y="153" fill="#9d9da6" font-size="11" text-anchor="end">80%</text>
+
+    <rect x="222" y="176" width="260" height="28" rx="8" fill="#232327"/>
+    <rect x="224" y="178" width="127" height="24" rx="6" fill="#1d1d20"/>
+    <text x="287.5" y="194" fill="#ededef" font-size="11.5" font-weight="500" text-anchor="middle">Colour</text>
+    <text x="416.5" y="194" fill="#9d9da6" font-size="11.5" text-anchor="middle">White</text>
+
+    <circle cx="233.0" cy="229" r="9.5" fill="#ff453a"/>
+    <circle cx="262.8" cy="229" r="9.5" fill="#ff9f0a"/>
+    <circle cx="292.6" cy="229" r="9.5" fill="#ffd60a"/>
+    <circle cx="322.4" cy="229" r="9.5" fill="#30d158"/>
+    <circle cx="352.2" cy="229" r="9.5" fill="#64d2ff"/>
+    <circle cx="382.0" cy="229" r="9.5" fill="#0a84ff"/>
+    <circle cx="411.8" cy="229" r="12.5" fill="none" stroke="#ededef" stroke-width="1.75"/>
+    <circle cx="411.8" cy="229" r="9.5" fill="#5e5ce6"/>
+    <circle cx="441.6" cy="229" r="9.5" fill="#ff375f"/>
+    <circle cx="471.4" cy="229" r="9.5" fill="url(#customWheel)"/>
+
+    <!-- Card 2: Light Bars (White mode - 4000K) -->
+    <rect x="510" y="70" width="288" height="222" rx="13" fill="#161618" stroke="#26262a"/>
+    <rect x="524" y="84" width="36" height="36" rx="9" fill="#ffd7a8"/>
+    <g transform="translate(533, 93)" fill="none" stroke="#111111" stroke-width="1.6">
+      <rect x="4" y="2" width="3.2" height="14" rx="1.6"/>
+      <rect x="10.8" y="2" width="3.2" height="14" rx="1.6"/>
+    </g>
+    <text x="570" y="99" fill="#ededef" font-size="13.5" font-weight="600">Light Bars</text>
+    <text x="570" y="115" fill="#9d9da6" font-size="11.5">On · 80%</text>
+    <rect x="748" y="92" width="36" height="20" rx="10" fill="#ffb020"/>
+    <circle cx="774" cy="102.6" r="8" fill="#000000" fill-opacity="0.14"/>
+    <circle cx="774" cy="102" r="8" fill="#ffffff"/>
+
+    <rect x="524" y="134" width="260" height="30" rx="8" fill="#232327"/>
+    <g clip-path="url(#briClip2)">
+      <rect x="524" y="134" width="208" height="30" fill="#ffd7a8"/>
+    </g>
+    <g transform="translate(744, 149)" stroke="#9d9da6" stroke-width="1.2" stroke-linecap="round" fill="none">
+      <circle cx="0" cy="0" r="2.2"/>
+      <path d="M0-4.8v1.1M0 3.7v1.1M-4.8 0h1.1M3.7 0h1.1M-3.4-3.4l.8.8M2.6 2.6l.8.8M-3.4 3.4l.8-.8M2.6-2.6l.8-.8"/>
+    </g>
+    <text x="775" y="153" fill="#9d9da6" font-size="11" text-anchor="end">80%</text>
+
+    <rect x="524" y="176" width="260" height="28" rx="8" fill="#232327"/>
+    <rect x="655" y="178" width="127" height="24" rx="6" fill="#1d1d20"/>
+    <text x="589.5" y="194" fill="#9d9da6" font-size="11.5" text-anchor="middle">Colour</text>
+    <text x="718.5" y="194" fill="#ededef" font-size="11.5" font-weight="500" text-anchor="middle">White</text>
+
+    <rect x="524" y="221" width="260" height="8" rx="4" fill="url(#kelvinGrad)"/>
+    <circle cx="598.5" cy="226" r="8.5" fill="#000000" fill-opacity="0.24"/>
+    <circle cx="598.5" cy="225" r="8" fill="#ffffff" stroke="#00000026" stroke-width="1"/>
+
+    <rect x="524" y="247" width="50" height="24" rx="12" fill="#1d1d20" stroke="#26262a"/>
+    <text x="549" y="263" fill="#9d9da6" font-size="11" text-anchor="middle">Warm</text>
+    <rect x="580" y="247" width="58" height="24" rx="12" fill="#1d1d20" stroke="#6b6b74"/>
+    <text x="609" y="263" fill="#ededef" font-size="11" font-weight="500" text-anchor="middle">Neutral</text>
+    <rect x="644" y="247" width="62" height="24" rx="12" fill="#1d1d20" stroke="#26262a"/>
+    <text x="675" y="263" fill="#9d9da6" font-size="11" text-anchor="middle">Daylight</text>
+    <text x="784" y="263" fill="#9d9da6" font-size="11.5" text-anchor="end">4000K</text>
+  </g>
+
+  <rect x="0.5" y="0.5" width="819" height="313" rx="12" fill="none" stroke="#26262a"/>
+</svg>
