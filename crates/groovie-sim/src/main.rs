@@ -23,7 +23,7 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     count: u8,
     /// Comma-separated SKUs to cycle through.
-    #[arg(long, default_value = "H6076,H6046,H6047")]
+    #[arg(long, default_value = "H6072,H6056,H6056")]
     skus: String,
     #[arg(long, default_value_t = 4001)]
     scan_port: u16,
