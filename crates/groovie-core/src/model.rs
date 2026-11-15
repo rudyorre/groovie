@@ -35,6 +35,12 @@ pub struct Device {
     /// Firmware versions reported in `scan` replies, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware: Option<String>,
+    /// Most recent RGB colour observed or commanded on this light, preserved when switching to White mode.
+    #[serde(default, rename = "lastColor", skip_serializing_if = "Option::is_none")]
+    pub last_color: Option<Rgb>,
+    /// Most recent Kelvin temperature observed or commanded on this light, preserved when switching to Colour mode.
+    #[serde(default, rename = "lastKelvin", skip_serializing_if = "Option::is_none")]
+    pub last_kelvin: Option<u16>,
 }
 
 /// One line in the in-memory diagnostic log.

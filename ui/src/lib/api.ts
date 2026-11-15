@@ -12,6 +12,8 @@ export type Device = {
   online: boolean;
   state: DeviceState | null;
   firmware?: string;
+  lastColor?: Rgb;
+  lastKelvin?: number;
 };
 export type LogEntry = {
   tsMs: number;
@@ -136,11 +138,12 @@ function mockApi(): Api {
     online: true,
     state: { on, brightness: 80, color, kelvin: 0 },
     firmware: 'wifi 1.02.03 · ble 1.03.01',
+    lastColor: color,
   });
   const devices: Device[] = [
     mk('1F:80:C5:32:32:36:72:4E', '10.0.0.182', 'H6072', 'Floor Lamp', true, { r: 255, g: 120, b: 30 }),
     mk('3A:14:D0:88:19:40:11:2B', '10.0.0.64', 'H6056', 'Light Bars', true, { r: 120, g: 60, b: 255 }),
-    { ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', false, white), online: false, state: null, firmware: undefined },
+    { ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', false, white), online: false, state: null, firmware: undefined, lastColor: undefined },
   ];
   let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['3A:14:D0:88:19:40:11:2B'] }];
   let scenes: Scene[] = [];
@@ -167,10 +170,10 @@ function mockApi(): Api {
     : t.type === 'device' ? [t.id]
     : groups.find((g) => g.id === t.id)?.members ?? [];
 
-  const set = (id: string, f: (s: DeviceState) => void) => {
+  const set = (id: string, f: (s: DeviceState, d: Device) => void) => {
     const d = devices.find((x) => x.id === id);
     if (!d?.state) return;
-    f(d.state);
+    f(d.state, d);
     emit({ type: 'deviceUpdated', device: d });
   };
 
@@ -192,11 +195,11 @@ function mockApi(): Api {
         if (d) {
           pushLog('tx', `${d.ip}:4003`, `${d.name} (${d.sku})`, JSON.stringify({ msg: act }));
         }
-        set(id, (s) => {
+        set(id, (s, dev) => {
           if (act.type === 'power') s.on = act.value;
           if (act.type === 'brightness') s.brightness = act.value;
-          if (act.type === 'color') { s.color = act.value; s.kelvin = 0; }
-          if (act.type === 'kelvin') s.kelvin = act.value;
+          if (act.type === 'color') { s.color = act.value; s.kelvin = 0; dev.lastColor = act.value; }
+          if (act.type === 'kelvin') { s.kelvin = act.value; s.color = white; dev.lastKelvin = act.value; }
         });
       }
     },
@@ -226,11 +229,11 @@ function mockApi(): Api {
     async applyScene(id) {
       const s = scenes.find((x) => x.id === id);
       for (const e of s?.entries ?? [])
-        set(e.device, (st) => {
+        set(e.device, (st, dev) => {
           st.on = e.on;
           if (e.brightness) st.brightness = e.brightness;
-          if (e.kelvin) st.kelvin = e.kelvin;
-          else if (e.color) { st.color = e.color; st.kelvin = 0; }
+          if (e.kelvin) { st.kelvin = e.kelvin; st.color = white; dev.lastKelvin = e.kelvin; }
+          else if (e.color) { st.color = e.color; st.kelvin = 0; dev.lastColor = e.color; }
         });
     },
     async deleteScene(id) { scenes = scenes.filter((s) => s.id !== id); config(); },

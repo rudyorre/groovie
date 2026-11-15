@@ -135,6 +135,8 @@ impl Groovie {
                         online: false,
                         state: None,
                         firmware: None,
+                        last_color: None,
+                        last_kelvin: None,
                     },
                     last_seen: None,
                     last_command: None,
@@ -638,6 +640,8 @@ impl Inner {
                         online: false,
                         state: None,
                         firmware: None,
+                        last_color: None,
+                        last_kelvin: None,
                     };
                     updated.push(dev.clone());
                     devices.insert(
@@ -777,8 +781,12 @@ impl Inner {
                 Command::Color(c) => {
                     s.color = *c;
                     s.kelvin = 0;
+                    e.device.last_color = Some(*c);
                 }
-                Command::ColorTemp(k) => s.kelvin = *k,
+                Command::ColorTemp(k) => {
+                    s.kelvin = *k;
+                    e.device.last_kelvin = Some(*k);
+                }
                 _ => {}
             }
             e.device.state = Some(s);
@@ -850,6 +858,8 @@ impl Inner {
                         online: false,
                         state: None,
                         firmware: None,
+                        last_color: None,
+                        last_kelvin: None,
                     },
                     last_seen: None,
                     last_command: None,
@@ -895,7 +905,7 @@ impl Inner {
         enum StatusOutcome {
             Unknown,
             Settling(String),
-            Updated { prev: Option<DeviceState>, was_online: bool, dev: Device },
+            Updated { prev: Option<DeviceState>, was_online: bool, memo_changed: bool, dev: Device },
         }
         let outcome = {
             let mut devices = self.devices.write().await;
@@ -919,8 +929,17 @@ impl Inner {
                     if in_flight && prev.map(|p| !same_logical_state(&p, &next)).unwrap_or(false) {
                         StatusOutcome::Settling(format!("{} ({})", e.device.name, e.device.sku))
                     } else {
+                        let prev_memo = (e.device.last_color, e.device.last_kelvin);
+                        // In Kelvin mode, Govee hardware reports `color: (255,255,255)`; only
+                        // record the active mode's value so the other mode's memory survives.
+                        if next.kelvin > 0 {
+                            e.device.last_kelvin = Some(next.kelvin);
+                        } else if next.color != Rgb::new(0, 0, 0) {
+                            e.device.last_color = Some(next.color);
+                        }
+                        let memo_changed = (e.device.last_color, e.device.last_kelvin) != prev_memo;
                         e.device.state = Some(next);
-                        StatusOutcome::Updated { prev, was_online, dev: e.device.clone() }
+                        StatusOutcome::Updated { prev, was_online, memo_changed, dev: e.device.clone() }
                     }
                 }
             }
@@ -935,7 +954,7 @@ impl Inner {
                 self.log("rx", src.to_string(), Some(label), format!("{raw} (ignored mid-transition)"), true)
                     .await;
             }
-            StatusOutcome::Updated { prev, was_online, dev } => {
+            StatusOutcome::Updated { prev, was_online, memo_changed, dev } => {
                 let label = Some(format!("{} ({})", dev.name, dev.sku));
                 self.log("rx", src.to_string(), label.clone(), raw, true).await;
                 match prev {
@@ -959,7 +978,7 @@ impl Inner {
                     }
                     _ => {}
                 }
-                if !was_online || prev != Some(next) {
+                if !was_online || prev != Some(next) || memo_changed {
                     self.emit(Event::DeviceUpdated { device: dev });
                 }
             }

@@ -389,5 +389,33 @@ async fn reloads_external_dotfiles_edits_and_switches_path() {
     assert_eq!(g.groups().await[0].name, "Studio");
 }
 
+#[tokio::test]
+async fn remembers_last_kelvin_and_color_across_mode_switches() {
+    let r = rig(13, 41120, 1).await;
+    let id = r.sims[0].config.id.clone();
+    let t = Target::Device(id.clone());
+    let indigo = Rgb::new(94, 92, 230);
 
+    r.g.apply(&t, Action::Power(true)).await.unwrap();
+    r.g.apply(&t, Action::Color(indigo)).await.unwrap();
+    r.g.apply(&t, Action::Kelvin(2700)).await.unwrap();
 
+    // Wait past `refresh_delay` (100ms) so the simulated Govee device sends back
+    // `devStatus` with `color: (255, 255, 255), colorTemInKelvin: 2700`.
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    let dev = r.g.device(&id).await.unwrap();
+    assert_eq!(dev.state.unwrap().kelvin, 2700);
+    assert_eq!(dev.state.unwrap().color, Rgb::new(255, 255, 255));
+    assert_eq!(dev.last_kelvin, Some(2700));
+    assert_eq!(dev.last_color, Some(indigo), "Kelvin devStatus must not overwrite remembered RGB colour");
+
+    // Switch back to Colour, wait for `devStatus` (`colorTemInKelvin: 0`), and verify
+    // `last_kelvin` still remembers 2700K for when the user returns to White.
+    r.g.apply(&t, Action::Color(indigo)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    let dev = r.g.device(&id).await.unwrap();
+    assert_eq!(dev.state.unwrap().kelvin, 0);
+    assert_eq!(dev.state.unwrap().color, indigo);
+    assert_eq!(dev.last_color, Some(indigo));
+    assert_eq!(dev.last_kelvin, Some(2700), "Colour mode must not clear remembered Kelvin");
+}

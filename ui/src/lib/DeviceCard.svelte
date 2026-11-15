@@ -1,3 +1,51 @@
+<script module lang="ts">
+  import type { Rgb } from './api';
+
+  type ModeMemory = { color?: Rgb; kelvin?: number };
+  const STORAGE_KEY = 'groovie:mode-memory:v1';
+
+  function loadAllMemory(): Record<string, ModeMemory> {
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
+      return raw ? (JSON.parse(raw) as Record<string, ModeMemory>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function readMemory(id: string): ModeMemory {
+    return loadAllMemory()[id] ?? {};
+  }
+
+  function writeMemory(id: string, patch: ModeMemory): ModeMemory {
+    const all = loadAllMemory();
+    const prev = all[id] ?? {};
+    const next: ModeMemory = {
+      ...(prev.color ? { color: prev.color } : {}),
+      ...(prev.kelvin ? { kelvin: prev.kelvin } : {}),
+      ...(patch.color ? { color: patch.color } : {}),
+      ...(patch.kelvin ? { kelvin: patch.kelvin } : {}),
+    };
+    if (
+      prev.kelvin === next.kelvin &&
+      prev.color?.r === next.color?.r &&
+      prev.color?.g === next.color?.g &&
+      prev.color?.b === next.color?.b
+    ) {
+      return next;
+    }
+    all[id] = next;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+      }
+    } catch {
+      // Ignore storage quota or restricted webview storage errors.
+    }
+    return next;
+  }
+</script>
+
 <script lang="ts">
   import { api, fromHex, kelvinToRgb, throttle, toHex, type Action, type Device } from './api';
   import Icon, { type IconName } from './Icon.svelte';
@@ -24,6 +72,22 @@
   const iconInk = $derived(lit && 0.2126 * lit.r + 0.7152 * lit.g + 0.0722 * lit.b < 140 ? '#fff' : '#111');
   const hex = $derived(s && !s.kelvin && !isEffect ? toHex(s.color) : '');
   const custom = $derived(hex !== '' && !PRESETS.includes(hex));
+
+  // Remember each light's last RGB colour and Kelvin across tab switches and restarts.
+  let saved = $state<ModeMemory>({});
+  $effect(() => {
+    const id = device.id;
+    const st = device.state;
+    const color =
+      device.lastColor ??
+      (st && st.kelvin === 0 && (st.color.r !== 0 || st.color.g !== 0 || st.color.b !== 0) ? st.color : undefined);
+    const kelvin = device.lastKelvin ?? (st && st.kelvin > 0 ? st.kelvin : undefined);
+    saved = color || kelvin ? writeMemory(id, { color, kelvin }) : readMemory(id);
+  });
+
+  const rememberedColor = $derived<Rgb>(device.lastColor ?? saved.color ?? { r: 255, g: 159, b: 10 });
+  const rememberedKelvin = $derived<number>(device.lastKelvin ?? saved.kelvin ?? 4000);
+  const activeKelvin = $derived<number>(s?.kelvin || rememberedKelvin);
 
   // Follow the light's real mode, including external changes from the Govee app.
   const actualMode = $derived<'color' | 'white'>(s?.kelvin ? 'white' : 'color');
@@ -56,13 +120,11 @@
   const sendThrottled = throttle(send);
 
   function setMode(m: 'color' | 'white') {
+    if (m === mode) return;
     picked = m;
     if (!s) return;
-    if (m === 'white' && !s.kelvin) send({ type: 'kelvin', value: 4000 });
-    if (m === 'color' && s.kelvin) {
-      const zero = s.color.r === 0 && s.color.g === 0 && s.color.b === 0;
-      send({ type: 'color', value: zero ? { r: 255, g: 159, b: 10 } : s.color });
-    }
+    if (m === 'white' && !s.kelvin) send({ type: 'kelvin', value: rememberedKelvin });
+    if (m === 'color' && s.kelvin) send({ type: 'color', value: rememberedColor });
   }
 
   // Inline rename
@@ -148,7 +210,7 @@
         <label class="swatch custom" class:sel={custom} class:filled={custom} style="--c: {hex}" title="Custom colour">
           <input
             type="color"
-            value={hex || '#ffffff'}
+            value={hex || toHex(rememberedColor)}
             oninput={(e) => sendThrottled({ type: 'color', value: fromHex(e.currentTarget.value) })}
           />
         </label>
@@ -161,16 +223,16 @@
           min={2000}
           max={9000}
           step={100}
-          value={s.kelvin || 4000}
+          value={activeKelvin}
           oninput={(v) => sendThrottled({ type: 'kelvin', value: v })}
         />
         <div class="chips">
           {#each WHITES as w (w.k)}
-            <button class="chip" class:sel={s.kelvin === w.k} onclick={() => send({ type: 'kelvin', value: w.k })}>
+            <button class="chip" class:sel={activeKelvin === w.k} onclick={() => send({ type: 'kelvin', value: w.k })}>
               {w.label}
             </button>
           {/each}
-          <span class="k">{s.kelvin ? `${s.kelvin}K` : ''}</span>
+          <span class="k">{activeKelvin}K</span>
         </div>
       </div>
     {/if}
