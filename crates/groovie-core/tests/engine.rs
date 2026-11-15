@@ -305,5 +305,52 @@ async fn ignores_mid_fade_status_poll_after_command() {
     assert!(g.device(&id).await.unwrap().state.unwrap().on);
 }
 
+#[tokio::test]
+async fn syncs_external_changes_and_adapts_poll_interval() {
+    // Start with a 60s poll interval (like idle tray mode), then switch to fast active polling.
+    let r = rig(11, 41100, 1).await;
+    let id = r.sims[0].config.id.clone();
+
+    // Simulate toggling on + setting 4000K at 55% from the Govee mobile app.
+    {
+        let mut st = r.sims[0].state.lock().unwrap();
+        st.on = true;
+        st.brightness = 55;
+        st.kelvin = 4000;
+    }
+
+    assert!(r.g.set_poll_interval(Duration::from_millis(60)));
+    assert!(!r.g.set_poll_interval(Duration::from_millis(60)));
+
+    let g2 = r.g.clone();
+    let id2 = id.clone();
+    eventually("external Govee app change synced via active poll", || {
+        let g = g2.clone();
+        let id = id2.clone();
+        async move {
+            g.device(&id)
+                .await
+                .and_then(|d| d.state)
+                .map(|s| s.on && s.brightness == 55 && s.kelvin == 4000)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    // Switch back to quiet tray polling, wait past the 400ms debounce, and test `sync_now()` on focus.
+    assert!(r.g.set_poll_interval(Duration::from_secs(60)));
+    tokio::time::sleep(Duration::from_millis(430)).await;
+    r.sims[0].state.lock().unwrap().on = false;
+    r.g.sync_now().await;
+
+    let g3 = r.g.clone();
+    eventually("focus sync_now picked up external off", || {
+        let g = g3.clone();
+        let id = id.clone();
+        async move { g.device(&id).await.and_then(|d| d.state).map(|s| !s.on).unwrap_or(false) }
+    })
+    .await;
+}
+
 
 

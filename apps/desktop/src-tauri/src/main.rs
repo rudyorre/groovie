@@ -3,11 +3,16 @@
 
 use groovie_core::{Action, Config, Device, Group, Groovie, LogEntry, Scene, Target};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
+
+/// Fast local sync while the window is open; quiet keepalive while hidden in the tray.
+const ACTIVE_POLL: Duration = Duration::from_millis(2500);
+const IDLE_POLL: Duration = Duration::from_secs(45);
 
 /// Holds the running engine, or the startup error if UDP port 4002 was busy so
 /// the window can still open and tell the user what's holding it.
@@ -21,6 +26,7 @@ fn err(e: impl std::fmt::Display) -> String {
 
 async fn start_engine(app: &AppHandle) -> R<Groovie> {
     let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
+    groovie.set_poll_interval(ACTIVE_POLL);
     let mut rx = groovie.subscribe();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -133,12 +139,36 @@ async fn clear_logs(s: State<'_, AppState>) -> R<()> {
     Ok(())
 }
 
+#[tauri::command]
+async fn set_window_active(s: State<'_, AppState>, active: bool, sync_now: bool) -> R<()> {
+    if let Ok(g) = s.0.read().await.clone() {
+        let changed = g.set_poll_interval(if active { ACTIVE_POLL } else { IDLE_POLL });
+        if active && (sync_now || changed) {
+            g.sync_now().await;
+        }
+    }
+    Ok(())
+}
+
+fn update_poll_mode(app: &AppHandle, active: bool, force_sync: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(g) = app.state::<AppState>().0.read().await.clone() {
+            let changed = g.set_poll_interval(if active { ACTIVE_POLL } else { IDLE_POLL });
+            if active && (force_sync || changed) {
+                g.sync_now().await;
+            }
+        }
+    });
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    update_poll_mode(app, true, true);
 }
 
 fn all_power(app: &AppHandle, on: bool) {
@@ -201,11 +231,23 @@ fn main() {
             Ok(())
         })
         // Closing the window keeps Groovie in the tray; use the tray's Quit to exit.
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
+                update_poll_mode(window.app_handle(), false, false);
             }
+            WindowEvent::Focused(true) => {
+                let visible = window.is_visible().unwrap_or(true) && !window.is_minimized().unwrap_or(false);
+                if visible {
+                    update_poll_mode(window.app_handle(), true, true);
+                }
+            }
+            WindowEvent::Resized(_) => {
+                let visible = window.is_visible().unwrap_or(true) && !window.is_minimized().unwrap_or(false);
+                update_poll_mode(window.app_handle(), visible, false);
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_devices,
@@ -223,6 +265,7 @@ fn main() {
             delete_scene,
             list_logs,
             clear_logs,
+            set_window_active,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Groovie");

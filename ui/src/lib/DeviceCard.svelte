@@ -14,16 +14,25 @@
 
   const s = $derived(device.state);
   const on = $derived(!!s?.on && device.online);
-  const lit = $derived(s ? (s.kelvin ? kelvinToRgb(s.kelvin) : s.color) : null);
+  // Govee lights report RGB (0,0,0) + kelvin 0 when playing a built-in scene or music mode.
+  const isEffect = $derived(!!s && s.kelvin === 0 && s.color.r === 0 && s.color.g === 0 && s.color.b === 0);
+  const lit = $derived(
+    s ? (s.kelvin ? kelvinToRgb(s.kelvin) : isEffect ? { r: 255, g: 176, b: 32 } : s.color) : null,
+  );
   const litCss = $derived(lit ? `rgb(${lit.r} ${lit.g} ${lit.b})` : 'var(--track)');
   // Dark icon on light colours, white icon on dark ones.
   const iconInk = $derived(lit && 0.2126 * lit.r + 0.7152 * lit.g + 0.0722 * lit.b < 140 ? '#fff' : '#111');
-  const hex = $derived(s && !s.kelvin ? toHex(s.color) : '');
+  const hex = $derived(s && !s.kelvin && !isEffect ? toHex(s.color) : '');
   const custom = $derived(hex !== '' && !PRESETS.includes(hex));
 
-  // Which panel is showing; follows the light's real mode unless the user just switched.
+  // Follow the light's real mode, including external changes from the Govee app.
+  const actualMode = $derived<'color' | 'white'>(s?.kelvin ? 'white' : 'color');
   let picked = $state<'color' | 'white' | null>(null);
-  const mode = $derived(picked ?? (s?.kelvin ? 'white' : 'color'));
+  const mode = $derived(picked ?? actualMode);
+  $effect(() => {
+    void actualMode;
+    picked = null;
+  });
 
   const icon: IconName = $derived.by(() => {
     const sku = device.sku.toUpperCase();
@@ -33,7 +42,13 @@
   });
 
   const status = $derived(
-    !device.online ? 'Offline' : !s ? 'Connecting…' : s.on ? `On · ${s.brightness}%` : 'Off',
+    !device.online
+      ? 'Offline'
+      : !s
+        ? 'Connecting…'
+        : s.on
+          ? `On · ${s.brightness}%${isEffect ? ' · Scene' : ''}`
+          : 'Off',
   );
 
   const target = $derived({ type: 'device' as const, id: device.id });
@@ -44,7 +59,10 @@
     picked = m;
     if (!s) return;
     if (m === 'white' && !s.kelvin) send({ type: 'kelvin', value: 4000 });
-    if (m === 'color' && s.kelvin) send({ type: 'color', value: s.color });
+    if (m === 'color' && s.kelvin) {
+      const zero = s.color.r === 0 && s.color.g === 0 && s.color.b === 0;
+      send({ type: 'color', value: zero ? { r: 255, g: 159, b: 10 } : s.color });
+    }
   }
 
   // Inline rename
@@ -124,14 +142,14 @@
             style="--c: {c}"
             title={c}
             aria-label="Set colour {c}"
-            onclick={() => { picked = 'color'; send({ type: 'color', value: fromHex(c) }); }}
+            onclick={() => send({ type: 'color', value: fromHex(c) })}
           ></button>
         {/each}
         <label class="swatch custom" class:sel={custom} class:filled={custom} style="--c: {hex}" title="Custom colour">
           <input
             type="color"
             value={hex || '#ffffff'}
-            oninput={(e) => { picked = 'color'; sendThrottled({ type: 'color', value: fromHex(e.currentTarget.value) }); }}
+            oninput={(e) => sendThrottled({ type: 'color', value: fromHex(e.currentTarget.value) })}
           />
         </label>
       </div>

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -72,6 +72,7 @@ struct Entry {
     device: Device,
     last_seen: Option<Instant>,
     last_command: Option<Instant>,
+    missed_polls: u32,
     /// Bumped on every command so stale delayed refreshes can be skipped.
     generation: u64,
 }
@@ -83,6 +84,8 @@ struct Inner {
     devices: RwLock<HashMap<String, Entry>>,
     store: Mutex<Store>,
     logs: Mutex<VecDeque<LogEntry>>,
+    poll_tx: watch::Sender<Duration>,
+    last_refresh: Mutex<Option<Instant>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -132,12 +135,14 @@ impl Groovie {
                     },
                     last_seen: None,
                     last_command: None,
+                    missed_polls: 0,
                     generation: 0,
                 },
             );
         }
 
         let (events, _) = broadcast::channel(256);
+        let (poll_tx, _) = watch::channel(cfg.poll_interval);
         let inner = Arc::new(Inner {
             cfg,
             sock,
@@ -145,6 +150,8 @@ impl Groovie {
             devices: RwLock::new(devices),
             store: Mutex::new(store),
             logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
+            poll_tx,
+            last_refresh: Mutex::new(None),
             events,
         });
 
@@ -172,6 +179,35 @@ impl Groovie {
     /// Ask every known device for its status.
     pub async fn refresh_all(&self) {
         self.inner.refresh_all().await
+    }
+
+    /// Dynamically adjust how often background `devStatus` polls run (e.g. fast
+    /// while the desktop window is visible, quiet while hidden in the tray).
+    /// Returns `true` if the interval changed.
+    pub fn set_poll_interval(&self, interval: Duration) -> bool {
+        self.inner.poll_tx.send_if_modified(|cur| {
+            if *cur != interval {
+                *cur = interval;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Immediately poll idle devices unless a refresh already ran within the
+    /// last 400 ms (debounces rapid focus / visibility / tray events).
+    pub async fn sync_now(&self) {
+        let recent = self
+            .inner
+            .last_refresh
+            .lock()
+            .await
+            .map(|t| t.elapsed() < Duration::from_millis(400))
+            .unwrap_or(false);
+        if !recent {
+            self.inner.refresh_idle().await;
+        }
     }
 
     /// Manually add a device that discovery can't see (e.g. other subnet,
@@ -554,15 +590,13 @@ impl Inner {
         let mut ips: Vec<Ipv4Addr> = self.devices.read().await.values().map(|e| e.device.ip).collect();
         ips.sort();
         ips.dedup();
-        for ip in ips {
-            let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
-        }
+        self.poll_ips(ips).await;
     }
 
-    /// Used by the background poll loop: skip devices whose own post-command
-    /// `refresh_delay` check is still pending so we don't query mid-fade.
+    /// Used by the background poll loop and focus sync: skip devices whose own
+    /// post-command `refresh_delay` check is still pending so we don't query mid-fade.
     async fn refresh_idle(&self) {
-        let settle = self.cfg.refresh_delay * 2;
+        let settle = self.cfg.refresh_delay + Duration::from_millis(250);
         let mut ips: Vec<Ipv4Addr> = self
             .devices
             .read()
@@ -573,6 +607,22 @@ impl Inner {
             .collect();
         ips.sort();
         ips.dedup();
+        self.poll_ips(ips).await;
+    }
+
+    async fn poll_ips(&self, ips: Vec<Ipv4Addr>) {
+        if ips.is_empty() {
+            return;
+        }
+        *self.last_refresh.lock().await = Some(Instant::now());
+        {
+            let mut devices = self.devices.write().await;
+            for e in devices.values_mut() {
+                if ips.contains(&e.device.ip) {
+                    e.missed_polls = e.missed_polls.saturating_add(1);
+                }
+            }
+        }
         for ip in ips {
             let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
         }
@@ -684,6 +734,7 @@ impl Inner {
                     },
                     last_seen: None,
                     last_command: None,
+                    missed_polls: 0,
                     generation: 0,
                 }
             });
@@ -696,6 +747,7 @@ impl Inner {
             }
             e.device.online = true;
             e.last_seen = Some(Instant::now());
+            e.missed_polls = 0;
             (e.device.clone(), needs_status)
         };
         if store.upsert_known(KnownDevice { id: dev.id.clone(), ip, sku: dev.sku.clone() }) {
@@ -740,6 +792,7 @@ impl Inner {
                     let was_online = e.device.online;
                     e.device.online = true;
                     e.last_seen = Some(Instant::now());
+                    e.missed_polls = 0;
                     // Govee lights fade over ~1s and report their old `onOff` if a
                     // background poll lands right after a command. Ignore contradictory
                     // status replies until the command's settle window has elapsed.
@@ -787,20 +840,22 @@ impl Inner {
                     }
                     _ => {}
                 }
-                self.emit(Event::DeviceUpdated { device: dev });
+                if !was_online || prev != Some(next) {
+                    self.emit(Event::DeviceUpdated { device: dev });
+                }
             }
         }
     }
 
-    /// Mark devices offline if they've been silent for a few poll cycles.
-    async fn sweep_offline(&self) {
-        let cutoff = self.cfg.poll_interval * 3 + Duration::from_secs(1);
+    /// Mark devices offline if they've been silent for several poll cycles.
+    async fn sweep_offline(&self, interval: Duration) {
+        let cutoff = interval * 3 + Duration::from_secs(1);
         let mut changed = vec![];
         {
             let mut devices = self.devices.write().await;
             for e in devices.values_mut() {
                 let stale = e.last_seen.map(|t| t.elapsed() > cutoff).unwrap_or(false);
-                if e.device.online && stale {
+                if e.device.online && e.missed_polls > 3 && stale {
                     e.device.online = false;
                     changed.push(e.device.clone());
                 }
@@ -830,12 +885,21 @@ async fn recv_loop(inner: Arc<Inner>) {
 }
 
 async fn poll_loop(inner: Arc<Inner>) {
-    let mut tick = tokio::time::interval(inner.cfg.poll_interval);
-    tick.tick().await;
+    let mut rx = inner.poll_tx.subscribe();
+    let mut interval = *rx.borrow_and_update();
     loop {
-        tick.tick().await;
-        inner.refresh_idle().await;
-        inner.sweep_offline().await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                inner.refresh_idle().await;
+                inner.sweep_offline(interval).await;
+            }
+            res = rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                interval = *rx.borrow_and_update();
+            }
+        }
     }
 }
 
@@ -902,7 +966,13 @@ fn same_logical_state(a: &DeviceState, b: &DeviceState) -> bool {
 }
 
 fn describe_state(s: &DeviceState) -> String {
-    let mode = if s.kelvin > 0 { format!("{}K", s.kelvin) } else { s.color.to_hex() };
+    let mode = if s.kelvin > 0 {
+        format!("{}K", s.kelvin)
+    } else if s.color.r == 0 && s.color.g == 0 && s.color.b == 0 {
+        "scene".to_string()
+    } else {
+        s.color.to_hex()
+    };
     format!("{} · {}% · {mode}", if s.on { "on" } else { "off" }, s.brightness)
 }
 

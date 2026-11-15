@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "groovie-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "groovie-sim",
  "if-addrs",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "groovie-sim"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "grooviectl"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",

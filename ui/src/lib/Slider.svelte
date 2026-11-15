@@ -41,6 +41,7 @@
   style="--p: {pct}%"
   onpointerdown={() => (dragging = true)}
   onpointerup={() => (dragging = false)}
+  onpointercancel={() => (dragging = false)}
   onblur={() => (dragging = false)}
   oninput={(e) => {
     local = +e.currentTarget.value;

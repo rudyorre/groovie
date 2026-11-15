@@ -80,7 +80,16 @@
       const a = await api;
       update = await a.checkUpdate().catch(() => null);
     };
-    window.addEventListener('focus', maybeCheckUpdate);
+    const onFocus = () => {
+      maybeCheckUpdate();
+      api.then((a) => a.setWindowActive(true, true)).catch(() => {});
+    };
+    const onVisibility = () => {
+      const visible = !document.hidden;
+      api.then((a) => a.setWindowActive(visible, visible)).catch(() => {});
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
     api.then(async (a) => {
       off = a.onEvent((e) => {
         if (e.type === 'deviceUpdated') {
@@ -93,12 +102,14 @@
           logs = [...logs.slice(-499), e.entry];
         }
       });
+      await a.setWindowActive(!document.hidden, false).catch(() => {});
       version = await a.appVersion().catch(() => '');
       await maybeCheckUpdate();
     });
     return () => {
       off();
-      window.removeEventListener('focus', maybeCheckUpdate);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   });
 
@@ -139,7 +150,12 @@
   function fmtDeviceSummary(d: Device) {
     if (!d.online) return 'offline';
     if (!d.state) return 'online';
-    const mode = d.state.kelvin ? `${d.state.kelvin}K` : toHex(d.state.color);
+    const { color, kelvin } = d.state;
+    const mode = kelvin
+      ? `${kelvin}K`
+      : color.r === 0 && color.g === 0 && color.b === 0
+        ? 'scene'
+        : toHex(color);
     return `${d.state.on ? 'on' : 'off'} · ${d.state.brightness}% · ${mode}`;
   }
 

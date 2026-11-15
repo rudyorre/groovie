@@ -53,6 +53,7 @@ export interface Api {
   deleteScene(id: string): Promise<void>;
   listLogs(): Promise<LogEntry[]>;
   clearLogs(): Promise<void>;
+  setWindowActive(active: boolean, syncNow: boolean): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
   appVersion(): Promise<string>;
   /** Resolves to an available update, or null if up to date. */
@@ -84,6 +85,7 @@ async function tauriApi(): Promise<Api> {
     deleteScene: (id) => invoke('delete_scene', { id }),
     listLogs: () => invoke('list_logs'),
     clearLogs: () => invoke('clear_logs'),
+    setWindowActive: (active, syncNow) => invoke('set_window_active', { active, syncNow }),
     onEvent(cb) {
       const un = listen<GroovieEvent>('groovie://event', (e) => cb(e.payload));
       return () => void un.then((f) => f());
@@ -217,6 +219,7 @@ function mockApi(): Api {
     async deleteScene(id) { scenes = scenes.filter((s) => s.id !== id); config(); },
     listLogs: async () => structuredClone(logs),
     clearLogs: async () => { logs = []; },
+    setWindowActive: async () => {},
     onEvent(cb) { subs.add(cb); return () => subs.delete(cb); },
     appVersion: async () => 'demo',
     checkUpdate: async () => null,
