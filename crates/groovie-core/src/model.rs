@@ -32,6 +32,29 @@ pub struct Device {
     pub online: bool,
     /// `None` until the device has answered a status request.
     pub state: Option<DeviceState>,
+    /// Firmware versions reported in `scan` replies, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
+}
+
+/// One line in the in-memory diagnostic log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// `"action"`, `"state"`, `"tx"`, or `"rx"`.
+    pub dir: String,
+    /// Remote socket address (`10.0.0.64:4003`), or empty for high-level actions.
+    pub addr: String,
+    /// Matched device label (`"Light Bars (H6056)"`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Human-readable summary or raw UDP JSON payload.
+    pub message: String,
+    /// True for routine `devStatus` traffic so the UI can hide background polls.
+    #[serde(default)]
+    pub poll: bool,
 }
 
 /// What to do.
@@ -90,6 +113,7 @@ pub enum Event {
     DeviceUpdated { device: Device },
     /// Groups, scenes or nicknames changed.
     ConfigChanged,
+    Logged { entry: LogEntry },
 }
 
 /// Friendly default name for a SKU. Unknown SKUs fall back to `Govee <SKU>`.

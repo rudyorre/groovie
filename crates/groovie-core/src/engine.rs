@@ -4,7 +4,7 @@
 use crate::model::*;
 use crate::protocol::*;
 use crate::store::{default_store_path, KnownDevice, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -14,6 +14,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+const MAX_LOGS: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -79,6 +81,7 @@ struct Inner {
     scan_lock: Mutex<()>,
     devices: RwLock<HashMap<String, Entry>>,
     store: Mutex<Store>,
+    logs: Mutex<VecDeque<LogEntry>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -124,6 +127,7 @@ impl Groovie {
                         name,
                         online: false,
                         state: None,
+                        firmware: None,
                     },
                     last_seen: None,
                     generation: 0,
@@ -138,6 +142,7 @@ impl Groovie {
             scan_lock: Mutex::new(()),
             devices: RwLock::new(devices),
             store: Mutex::new(store),
+            logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
             events,
         });
 
@@ -212,6 +217,18 @@ impl Groovie {
             }
             a => a,
         };
+        let summary = {
+            let devices = self.inner.devices.read().await;
+            let resolved: Vec<String> = ids
+                .iter()
+                .map(|id| match devices.get(id) {
+                    Some(e) => format!("{} [{} @ {}]", e.device.name, e.device.id, e.device.ip),
+                    None => id.clone(),
+                })
+                .collect();
+            format!("apply {target:?} -> [{}]: {action:?}", resolved.join(", "))
+        };
+        self.inner.log("action", "", None, summary, false).await;
         for id in &ids {
             self.inner.send_action(id, action).await?;
         }
@@ -382,6 +399,9 @@ impl Groovie {
             .into_iter()
             .find(|s| s.id == id || s.name.eq_ignore_ascii_case(id))
             .ok_or_else(|| Error::UnknownScene(id.into()))?;
+        self.inner
+            .log("action", "", None, format!("apply_scene '{}' ({})", scene.name, scene.id), false)
+            .await;
         let gap = Duration::from_millis(40);
         for e in &scene.entries {
             if !self.inner.devices.read().await.contains_key(&e.device) {
@@ -405,12 +425,72 @@ impl Groovie {
         }
         Ok(())
     }
+
+    // ---- diagnostic logs -------------------------------------------------
+
+    pub async fn logs(&self) -> Vec<LogEntry> {
+        self.inner.logs.lock().await.iter().cloned().collect()
+    }
+
+    pub async fn clear_logs(&self) {
+        self.inner.logs.lock().await.clear();
+    }
 }
 
 impl Inner {
     fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
+    }
+
+    async fn device_label_for_ip(&self, ip: IpAddr) -> Option<String> {
+        let IpAddr::V4(v4) = ip else { return None };
+        let devices = self.devices.read().await;
+        devices
+            .values()
+            .filter(|e| e.device.ip == v4)
+            .max_by_key(|e| (e.device.online, e.last_seen))
+            .map(|e| format!("{} ({})", e.device.name, e.device.sku))
+    }
+
+    async fn log(
+        &self,
+        dir: &str,
+        addr: impl Into<String>,
+        device: Option<String>,
+        message: impl Into<String>,
+        poll: bool,
+    ) {
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = LogEntry {
+            ts_ms,
+            dir: dir.to_string(),
+            addr: addr.into(),
+            device,
+            message: message.into(),
+            poll,
+        };
+        {
+            let mut logs = self.logs.lock().await;
+            if logs.len() >= MAX_LOGS {
+                // Evict old background `devStatus` polls before commands/state changes.
+                let poll_count = logs.iter().filter(|e| e.poll).count();
+                if poll_count > MAX_LOGS / 2 {
+                    if let Some(pos) = logs.iter().position(|e| e.poll) {
+                        logs.remove(pos);
+                    } else {
+                        logs.pop_front();
+                    }
+                } else {
+                    logs.pop_front();
+                }
+            }
+            logs.push_back(entry.clone());
+        }
+        self.emit(Event::Logged { entry });
     }
 
     async fn mutate_store(&self, f: impl FnOnce(&mut Store) -> Result<()>) -> Result<()> {
@@ -424,41 +504,54 @@ impl Inner {
 
     async fn send(&self, cmd: Command, to: SocketAddr) -> Result<()> {
         debug!(?cmd, %to, "send");
-        self.sock.send_to(&cmd.to_bytes(), to).await?;
+        let json = cmd.to_json().to_string();
+        let poll = matches!(cmd, Command::DevStatus);
+        let label = self.device_label_for_ip(to.ip()).await;
+        let res = self.sock.send_to(json.as_bytes(), to).await;
+        match &res {
+            Ok(_) => self.log("tx", to.to_string(), label, json, poll).await,
+            Err(e) => self.log("tx", to.to_string(), label, format!("ERROR {e}: {json}"), false).await,
+        }
+        res?;
         Ok(())
     }
 
     async fn send_scan(&self) -> Result<()> {
         let _guard = self.scan_lock.lock().await;
-        let bytes = Command::Scan.to_bytes();
+        let json = Command::Scan.to_json().to_string();
+        let bytes = json.as_bytes();
         for target in &self.cfg.scan_targets {
             let multicast = matches!(target, SocketAddr::V4(v4) if v4.ip().is_multicast());
             if !multicast {
-                self.sock.send_to(&bytes, target).await?;
+                self.sock.send_to(bytes, target).await?;
+                self.log("tx", target.to_string(), None, json.clone(), false).await;
                 continue;
             }
             // Send the multicast scan out of every interface so multi-NIC
             // machines (VPN, ethernet + wifi, ...) still find devices.
             let ifaces = local_ipv4_interfaces();
             if ifaces.is_empty() {
-                self.sock.send_to(&bytes, target).await?;
+                self.sock.send_to(bytes, target).await?;
             }
             let sref = socket2::SockRef::from(&self.sock);
-            for ip in ifaces {
-                if let Err(e) = sref.set_multicast_if_v4(&ip) {
+            for ip in &ifaces {
+                if let Err(e) = sref.set_multicast_if_v4(ip) {
                     debug!(%ip, error = %e, "cannot use interface for multicast");
                     continue;
                 }
-                if let Err(e) = self.sock.send_to(&bytes, target).await {
+                if let Err(e) = self.sock.send_to(bytes, target).await {
                     debug!(%ip, error = %e, "multicast send failed");
                 }
             }
+            self.log("tx", target.to_string(), None, json.clone(), false).await;
         }
         Ok(())
     }
 
     async fn refresh_all(&self) {
-        let ips: Vec<Ipv4Addr> = self.devices.read().await.values().map(|e| e.device.ip).collect();
+        let mut ips: Vec<Ipv4Addr> = self.devices.read().await.values().map(|e| e.device.ip).collect();
+        ips.sort();
+        ips.dedup();
         for ip in ips {
             let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
         }
@@ -522,16 +615,28 @@ impl Inner {
     }
 
     async fn handle(&self, bytes: &[u8], src: SocketAddr) {
+        let raw = String::from_utf8_lossy(bytes).trim().to_string();
         match parse_incoming(bytes) {
-            Ok(Incoming::Scan(info)) => self.on_scan(info, src).await,
-            Ok(Incoming::Status(st)) => self.on_status(st, src).await,
-            Ok(Incoming::Other { cmd, .. }) => debug!(%src, cmd, "ignoring message"),
-            // Includes our own multicast scan request echoed back to us.
-            Err(e) => debug!(%src, error = %e, "unparseable datagram"),
+            Ok(Incoming::Scan(info)) => self.on_scan(info, src, raw).await,
+            Ok(Incoming::Status(st)) => self.on_status(st, src, raw).await,
+            Ok(Incoming::Other { cmd, .. }) => {
+                debug!(%src, cmd, "ignoring message");
+                let label = self.device_label_for_ip(src.ip()).await;
+                self.log("rx", src.to_string(), label, raw, false).await;
+            }
+            Err(e) => {
+                // Ignore our own multicast scan request echoed back to us.
+                if matches!(parse_command(bytes), Ok(Command::Scan)) {
+                    return;
+                }
+                debug!(%src, error = %e, "unparseable datagram");
+                let label = self.device_label_for_ip(src.ip()).await;
+                self.log("rx", src.to_string(), label, raw, false).await;
+            }
         }
     }
 
-    async fn on_scan(&self, info: ScanInfo, src: SocketAddr) {
+    async fn on_scan(&self, info: ScanInfo, src: SocketAddr, raw: String) {
         let ip: Ipv4Addr = match info.ip.parse() {
             Ok(ip) => ip,
             Err(_) => match src.ip() {
@@ -539,6 +644,7 @@ impl Inner {
                 IpAddr::V6(_) => return,
             },
         };
+        let fw = format_firmware(&info);
         let mut store = self.store.lock().await;
         let dev = {
             let mut devices = self.devices.write().await;
@@ -552,6 +658,7 @@ impl Inner {
                         name: String::new(),
                         online: true,
                         state: None,
+                        firmware: None,
                     },
                     last_seen: None,
                     generation: 0,
@@ -560,6 +667,9 @@ impl Inner {
             e.device.ip = ip;
             e.device.sku = info.sku.clone();
             e.device.name = display_name(&store, &info.device, &info.sku);
+            if fw.is_some() {
+                e.device.firmware = fw;
+            }
             e.device.online = true;
             e.last_seen = Some(Instant::now());
             e.device.clone()
@@ -570,30 +680,68 @@ impl Inner {
             }
         }
         drop(store);
+        let label = Some(format!("{} ({})", dev.name, dev.sku));
+        self.log("rx", src.to_string(), label, raw, false).await;
         self.emit(Event::DeviceUpdated { device: dev });
         let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
     }
 
-    async fn on_status(&self, st: StatusInfo, src: SocketAddr) {
+    async fn on_status(&self, st: StatusInfo, src: SocketAddr, raw: String) {
         let IpAddr::V4(ip) = src.ip() else { return };
-        let dev = {
-            let mut devices = self.devices.write().await;
-            let Some(e) = devices.values_mut().find(|e| e.device.ip == ip) else {
-                drop(devices);
-                // A device we haven't identified yet: ask who it is.
-                let _ = self.send(Command::Scan, SocketAddr::from((ip, self.cfg.scan_port))).await;
-                return;
-            };
-            e.device.state = Some(DeviceState {
-                on: st.on_off == 1,
-                brightness: st.brightness,
-                color: st.color,
-                kelvin: st.color_tem_in_kelvin,
-            });
-            e.device.online = true;
-            e.last_seen = Some(Instant::now());
-            e.device.clone()
+        let next = DeviceState {
+            on: st.on_off == 1,
+            brightness: st.brightness,
+            color: st.color,
+            kelvin: st.color_tem_in_kelvin,
         };
+        let outcome = {
+            let mut devices = self.devices.write().await;
+            let key = devices
+                .iter()
+                .filter(|(_, e)| e.device.ip == ip)
+                .max_by_key(|(_, e)| (e.device.online, e.last_seen))
+                .map(|(id, _)| id.clone());
+            match key.and_then(|id| devices.get_mut(&id)) {
+                None => None,
+                Some(e) => {
+                    let prev = e.device.state;
+                    let was_online = e.device.online;
+                    e.device.state = Some(next);
+                    e.device.online = true;
+                    e.last_seen = Some(Instant::now());
+                    Some((prev, was_online, e.device.clone()))
+                }
+            }
+        };
+        let Some((prev, was_online, dev)) = outcome else {
+            self.log("rx", src.to_string(), None, raw, false).await;
+            // A device we haven't identified yet: ask who it is.
+            let _ = self.send(Command::Scan, SocketAddr::from((ip, self.cfg.scan_port))).await;
+            return;
+        };
+        let label = Some(format!("{} ({})", dev.name, dev.sku));
+        self.log("rx", src.to_string(), label.clone(), raw, true).await;
+        match prev {
+            None => {
+                self.log("state", ip.to_string(), label, format!("initial state: {}", describe_state(&next)), false)
+                    .await;
+            }
+            Some(p) if !same_logical_state(&p, &next) => {
+                self.log(
+                    "state",
+                    ip.to_string(),
+                    label,
+                    format!("external/reported change: {} -> {}", describe_state(&p), describe_state(&next)),
+                    false,
+                )
+                .await;
+            }
+            Some(_) if !was_online => {
+                self.log("state", ip.to_string(), label, format!("back online: {}", describe_state(&next)), false)
+                    .await;
+            }
+            _ => {}
+        }
         self.emit(Event::DeviceUpdated { device: dev });
     }
 
@@ -612,6 +760,8 @@ impl Inner {
             }
         }
         for d in changed {
+            let label = Some(format!("{} ({})", d.name, d.sku));
+            self.log("state", d.ip.to_string(), label, "went offline (no status reply)", false).await;
             self.emit(Event::DeviceUpdated { device: d });
         }
     }
@@ -684,6 +834,29 @@ fn local_ipv4_interfaces() -> Vec<Ipv4Addr> {
 
 fn display_name(store: &Store, id: &str, sku: &str) -> String {
     store.data.nicknames.get(id).cloned().unwrap_or_else(|| friendly_sku_name(sku))
+}
+
+fn format_firmware(info: &ScanInfo) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(w) = info.wifi_version_soft.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("wifi {w}"));
+    }
+    if let Some(b) = info.ble_version_soft.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("ble {b}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn same_logical_state(a: &DeviceState, b: &DeviceState) -> bool {
+    a.on == b.on
+        && a.brightness == b.brightness
+        && a.kelvin == b.kelvin
+        && (a.kelvin > 0 || a.color == b.color)
+}
+
+fn describe_state(s: &DeviceState) -> String {
+    let mode = if s.kelvin > 0 { format!("{}K", s.kelvin) } else { s.color.to_hex() };
+    format!("{} · {}% · {mode}", if s.on { "on" } else { "off" }, s.brightness)
 }
 
 fn new_id(prefix: &str) -> String {

@@ -231,3 +231,45 @@ async fn second_instance_on_same_port_fails_cleanly() {
     assert!(err.to_string().contains("41072"), "unexpected error: {err}");
 }
 
+#[tokio::test]
+async fn records_network_and_state_logs() {
+    let r = rig(9, 41080, 2).await;
+    let devices = r.g.devices().await;
+    assert_eq!(devices[0].firmware.as_deref(), Some("wifi 1.02.03 · ble 1.03.01"));
+
+    let lamp_id = r.sims[0].config.id.clone();
+    let bars_id = r.sims[1].config.id.clone();
+    let lamp_ip = r.sims[0].config.ip.to_string();
+    let bars_ip = r.sims[1].config.ip.to_string();
+
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Power(true)).await.unwrap();
+    eventually("both on", || async { r.sims[0].state().on && r.sims[1].state().on }).await;
+
+    r.g.clear_logs().await;
+    assert!(r.g.logs().await.is_empty());
+
+    // Turn off only the light bars: no command may go to the floor lamp.
+    r.g.apply(&Target::Device(bars_id), Action::Power(false)).await.unwrap();
+    eventually("bars off", || async { !r.sims[1].state().on }).await;
+    assert!(r.sims[0].state().on);
+
+    let logs = r.g.logs().await;
+    assert!(logs.iter().any(|l| l.dir == "action" && l.message.contains(&bars_ip) && !l.message.contains(&lamp_ip)));
+    assert!(logs.iter().any(|l| l.dir == "tx" && l.addr.starts_with(&bars_ip) && l.message.contains("\"turn\"")));
+    assert!(!logs.iter().any(|l| l.dir == "tx" && l.addr.starts_with(&lamp_ip)));
+
+    // Simulate an external controller (e.g. DreamView / mobile app) toggling the lamp.
+    r.sims[0].state.lock().unwrap().on = false;
+    r.g.refresh_all().await;
+    let g2 = r.g.clone();
+    eventually("external state change logged", || {
+        let g = g2.clone();
+        async move {
+            g.logs().await.iter().any(|l| l.dir == "state" && l.message.contains("external/reported change"))
+        }
+    })
+    .await;
+}
+
+

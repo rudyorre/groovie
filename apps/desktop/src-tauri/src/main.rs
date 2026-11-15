@@ -1,7 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use groovie_core::{Action, Config, Device, Group, Groovie, Scene, Target};
+use groovie_core::{Action, Config, Device, Group, Groovie, LogEntry, Scene, Target};
 use std::net::Ipv4Addr;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -117,6 +117,22 @@ async fn delete_scene(s: State<'_, AppState>, id: String) -> R<()> {
     engine(&s).await?.delete_scene(&id).await.map_err(err)
 }
 
+#[tauri::command]
+async fn list_logs(s: State<'_, AppState>) -> R<Vec<LogEntry>> {
+    match s.0.read().await.clone() {
+        Ok(g) => Ok(g.logs().await),
+        Err(_) => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+async fn clear_logs(s: State<'_, AppState>) -> R<()> {
+    if let Ok(g) = s.0.read().await.clone() {
+        g.clear_logs().await;
+    }
+    Ok(())
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -205,6 +221,8 @@ fn main() {
             save_scene,
             apply_scene,
             delete_scene,
+            list_logs,
+            clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Groovie");

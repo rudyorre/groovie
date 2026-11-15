@@ -11,6 +11,15 @@ export type Device = {
   name: string;
   online: boolean;
   state: DeviceState | null;
+  firmware?: string;
+};
+export type LogEntry = {
+  tsMs: number;
+  dir: string;
+  addr: string;
+  device?: string;
+  message: string;
+  poll: boolean;
 };
 export type Group = { id: string; name: string; members: string[] };
 export type SceneEntry = { device: string; on: boolean; brightness?: number; color?: Rgb; kelvin?: number };
@@ -23,7 +32,10 @@ export type Action =
   | { type: 'color'; value: Rgb }
   | { type: 'kelvin'; value: number };
 export type Target = { type: 'device'; id: string } | { type: 'group'; id: string } | { type: 'all' };
-export type GroovieEvent = { type: 'deviceUpdated'; device: Device } | { type: 'configChanged' };
+export type GroovieEvent =
+  | { type: 'deviceUpdated'; device: Device }
+  | { type: 'configChanged' }
+  | { type: 'logged'; entry: LogEntry };
 
 export interface Api {
   listDevices(): Promise<Device[]>;
@@ -39,6 +51,8 @@ export interface Api {
   saveScene(name: string): Promise<Scene>;
   applyScene(id: string): Promise<void>;
   deleteScene(id: string): Promise<void>;
+  listLogs(): Promise<LogEntry[]>;
+  clearLogs(): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
   appVersion(): Promise<string>;
   /** Resolves to an available update, or null if up to date. */
@@ -68,6 +82,8 @@ async function tauriApi(): Promise<Api> {
     saveScene: (name) => invoke('save_scene', { name }),
     applyScene: (id) => invoke('apply_scene', { id }),
     deleteScene: (id) => invoke('delete_scene', { id }),
+    listLogs: () => invoke('list_logs'),
+    clearLogs: () => invoke('clear_logs'),
     onEvent(cb) {
       const un = listen<GroovieEvent>('groovie://event', (e) => cb(e.payload));
       return () => void un.then((f) => f());
@@ -94,18 +110,37 @@ async function tauriApi(): Promise<Api> {
 function mockApi(): Api {
   const white: Rgb = { r: 255, g: 255, b: 255 };
   const mk = (id: string, ip: string, sku: string, name: string, on: boolean, color: Rgb): Device => ({
-    id, ip, sku, name, online: true, state: { on, brightness: 80, color, kelvin: 0 },
+    id,
+    ip,
+    sku,
+    name,
+    online: true,
+    state: { on, brightness: 80, color, kelvin: 0 },
+    firmware: 'wifi 1.02.03 · ble 1.03.01',
   });
   const devices: Device[] = [
-    mk('AA:01', '192.168.1.21', 'H6072', 'Floor Lamp', true, { r: 255, g: 120, b: 30 }),
-    mk('AA:02', '192.168.1.22', 'H6056', 'Light Bars', true, { r: 120, g: 60, b: 255 }),
-    { ...mk('AA:03', '192.168.1.23', 'H6008', 'Bulb', false, white), online: false, state: null },
+    mk('1F:80:C5:32:32:36:72:4E', '10.0.0.182', 'H6072', 'Floor Lamp', true, { r: 255, g: 120, b: 30 }),
+    mk('3A:14:D0:88:19:40:11:2B', '10.0.0.64', 'H6056', 'Light Bars', true, { r: 120, g: 60, b: 255 }),
+    { ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', false, white), online: false, state: null, firmware: undefined },
   ];
-  let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['AA:02'] }];
+  let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['3A:14:D0:88:19:40:11:2B'] }];
   let scenes: Scene[] = [];
   const subs = new Set<(e: GroovieEvent) => void>();
   const emit = (e: GroovieEvent) => subs.forEach((cb) => cb(structuredClone(e)));
   const config = () => emit({ type: 'configChanged' });
+  let logs: LogEntry[] = [
+    { tsMs: Date.now() - 4200, dir: 'tx', addr: '239.255.255.250:4001', message: '{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}', poll: false },
+    { tsMs: Date.now() - 4120, dir: 'rx', addr: '10.0.0.182:4002', device: 'Floor Lamp (H6072)', message: '{"msg":{"cmd":"scan","data":{"ip":"10.0.0.182","device":"1F:80:C5:32:32:36:72:4E","sku":"H6072"}}}', poll: false },
+    { tsMs: Date.now() - 4110, dir: 'rx', addr: '10.0.0.64:4002', device: 'Light Bars (H6056)', message: '{"msg":{"cmd":"scan","data":{"ip":"10.0.0.64","device":"3A:14:D0:88:19:40:11:2B","sku":"H6056"}}}', poll: false },
+    { tsMs: Date.now() - 4050, dir: 'state', addr: '10.0.0.182', device: 'Floor Lamp (H6072)', message: 'initial state: on · 80% · #ff781e', poll: false },
+    { tsMs: Date.now() - 4045, dir: 'state', addr: '10.0.0.64', device: 'Light Bars (H6056)', message: 'initial state: on · 80% · #783cff', poll: false },
+    { tsMs: Date.now() - 1000, dir: 'tx', addr: '10.0.0.182:4003', device: 'Floor Lamp (H6072)', message: '{"msg":{"cmd":"devStatus","data":{}}}', poll: true },
+  ];
+  const pushLog = (dir: string, addr: string, device: string | undefined, message: string, poll = false) => {
+    const entry: LogEntry = { tsMs: Date.now(), dir, addr, device, message, poll };
+    logs = [...logs.slice(-499), entry];
+    emit({ type: 'logged', entry });
+  };
   let n = 0;
 
   const ids = (t: Target) =>
@@ -122,7 +157,9 @@ function mockApi(): Api {
 
   return {
     listDevices: async () => structuredClone(devices),
-    discover: async () => {},
+    discover: async () => {
+      pushLog('tx', '239.255.255.250:4001', undefined, '{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}');
+    },
     async apply(t, a) {
       const targets = ids(t);
       if (a.type === 'toggle') {
@@ -130,13 +167,19 @@ function mockApi(): Api {
         a = { type: 'power', value: !anyOn };
       }
       const act = a;
-      for (const id of targets)
+      pushLog('action', '', undefined, `apply ${JSON.stringify(t)} -> ${JSON.stringify(act)}`);
+      for (const id of targets) {
+        const d = devices.find((x) => x.id === id);
+        if (d) {
+          pushLog('tx', `${d.ip}:4003`, `${d.name} (${d.sku})`, JSON.stringify({ msg: act }));
+        }
         set(id, (s) => {
           if (act.type === 'power') s.on = act.value;
           if (act.type === 'brightness') s.brightness = act.value;
           if (act.type === 'color') { s.color = act.value; s.kelvin = 0; }
           if (act.type === 'kelvin') s.kelvin = act.value;
         });
+      }
     },
     async rename(id, name) {
       const d = devices.find((x) => x.id === id);
@@ -172,6 +215,8 @@ function mockApi(): Api {
         });
     },
     async deleteScene(id) { scenes = scenes.filter((s) => s.id !== id); config(); },
+    listLogs: async () => structuredClone(logs),
+    clearLogs: async () => { logs = []; },
     onEvent(cb) { subs.add(cb); return () => subs.delete(cb); },
     appVersion: async () => 'demo',
     checkUpdate: async () => null,
