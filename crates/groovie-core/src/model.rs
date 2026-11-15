@@ -139,6 +139,8 @@ pub enum Event {
     /// Groups, scenes or nicknames changed.
     ConfigChanged,
     Logged { entry: LogEntry },
+    SyncChanged { status: crate::sync::SyncStatus },
+    SyncPreview { preview: crate::sync::SyncPreview },
 }
 
 /// Friendly default name for a SKU. Unknown SKUs fall back to `Govee <SKU>`.

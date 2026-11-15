@@ -1,6 +1,6 @@
 // Backend abstraction. The desktop app talks to Rust via Tauri; in a plain
 // browser (`npm run dev`) a mock with fake lights is used instead.
-// Shapes mirror `groovie_core::model` (serde JSON).
+// Shapes mirror `groovie_core::model` & `groovie_core::sync` (serde JSON).
 
 export type Rgb = { r: number; g: number; b: number };
 export type DeviceState = { on: boolean; brightness: number; color: Rgb; kelvin: number };
@@ -34,6 +34,61 @@ export type Group = { id: string; name: string; members: string[] };
 export type SceneEntry = { device: string; on: boolean; brightness?: number; color?: Rgb; kelvin?: number };
 export type Scene = { id: string; name: string; entries: SceneEntry[] };
 
+export type DisplayInfo = {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  isPrimary: boolean;
+};
+export type SyncPreset = 'game' | 'movie' | 'custom';
+export type PlacementPart = 'single' | 'barA' | 'barB';
+export type Orientation = 'vertical' | 'horizontal';
+export type PlacementMode = 'segments' | 'solid';
+export type SyncPlacement = {
+  id: string;
+  deviceId: string;
+  part: PlacementPart;
+  excluded: boolean;
+  x: number;
+  y: number;
+  orientation: Orientation;
+  reverse: boolean;
+  mode: PlacementMode;
+  segments: number;
+};
+export type SyncConfig = {
+  displayId?: string;
+  preset: SyncPreset;
+  smoothing: number;
+  vibrance: number;
+  minGlow: number;
+  placements: SyncPlacement[];
+};
+export type SampleRect = { x0: number; y0: number; x1: number; y1: number };
+export type SyncStatus = {
+  active: boolean;
+  activeDevices: string[];
+  config: SyncConfig;
+};
+export type SyncState = {
+  supported: boolean;
+  active: boolean;
+  activeDevices: string[];
+  config: SyncConfig;
+};
+export type PlacementPreview = {
+  id: string;
+  sample: SampleRect;
+  colors: Rgb[];
+};
+export type SyncPreview = {
+  aspect: number;
+  crop: SampleRect;
+  edgeColors: [Rgb, Rgb, Rgb, Rgb];
+  placements: PlacementPreview[];
+};
+
 export type Action =
   | { type: 'power'; value: boolean }
   | { type: 'toggle' }
@@ -44,7 +99,9 @@ export type Target = { type: 'device'; id: string } | { type: 'group'; id: strin
 export type GroovieEvent =
   | { type: 'deviceUpdated'; device: Device }
   | { type: 'configChanged' }
-  | { type: 'logged'; entry: LogEntry };
+  | { type: 'logged'; entry: LogEntry }
+  | { type: 'syncChanged'; status: SyncStatus }
+  | { type: 'syncPreview'; preview: SyncPreview };
 
 export interface Api {
   listDevices(): Promise<Device[]>;
@@ -60,6 +117,12 @@ export interface Api {
   saveScene(name: string): Promise<Scene>;
   applyScene(id: string): Promise<void>;
   deleteScene(id: string): Promise<void>;
+  getSyncState(): Promise<SyncState>;
+  listDisplays(): Promise<DisplayInfo[]>;
+  setSyncEnabled(enabled: boolean): Promise<SyncState>;
+  updateSyncConfig(config: SyncConfig): Promise<SyncState>;
+  identifySyncPlacement(placementId: string): Promise<void>;
+  setSyncPreview(enabled: boolean): Promise<void>;
   listLogs(): Promise<LogEntry[]>;
   clearLogs(): Promise<void>;
   setWindowActive(active: boolean, syncNow: boolean): Promise<void>;
@@ -105,6 +168,12 @@ async function tauriApi(): Promise<Api> {
     saveScene: (name) => invoke('save_scene', { name }),
     applyScene: (id) => invoke('apply_scene', { id }),
     deleteScene: (id) => invoke('delete_scene', { id }),
+    getSyncState: () => invoke('get_sync_state'),
+    listDisplays: () => invoke('list_displays'),
+    setSyncEnabled: (enabled) => invoke('set_sync_enabled', { enabled }),
+    updateSyncConfig: (config) => invoke('update_sync_config', { config }),
+    identifySyncPlacement: (placementId) => invoke('identify_sync_placement', { placementId }),
+    setSyncPreview: (enabled) => invoke('set_sync_preview', { enabled }),
     listLogs: () => invoke('list_logs'),
     clearLogs: () => invoke('clear_logs'),
     setWindowActive: (active, syncNow) => invoke('set_window_active', { active, syncNow }),
@@ -177,6 +246,28 @@ function mockApi(): Api {
     mk('3A:14:D0:88:19:40:11:2B', '10.0.0.64', 'H6056', 'Light Bars', true, { r: 120, g: 60, b: 255 }),
     { ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', false, white), online: false, state: null, firmware: undefined, lastColor: undefined },
   ];
+  const mockDisplays: DisplayInfo[] = [
+    { id: '\\\\.\\DISPLAY1', name: 'Display 1 · LG ULTRAGEAR', width: 2560, height: 1440, isPrimary: true },
+    { id: '\\\\.\\DISPLAY2', name: 'Display 2 · DELL U2723QE', width: 3840, height: 2160, isPrimary: false },
+  ];
+  let syncConfig: SyncConfig = {
+    preset: 'game',
+    smoothing: 32,
+    vibrance: 65,
+    minGlow: 0,
+    placements: [
+      { id: '3A:14:D0:88:19:40:11:2B#A', deviceId: '3A:14:D0:88:19:40:11:2B', part: 'barA', excluded: false, x: -0.08, y: 0.5, orientation: 'vertical', reverse: false, mode: 'segments', segments: 6 },
+      { id: '3A:14:D0:88:19:40:11:2B#B', deviceId: '3A:14:D0:88:19:40:11:2B', part: 'barB', excluded: false, x: 1.08, y: 0.5, orientation: 'vertical', reverse: false, mode: 'segments', segments: 6 },
+      { id: '1F:80:C5:32:32:36:72:4E', deviceId: '1F:80:C5:32:32:36:72:4E', part: 'single', excluded: false, x: 1.30, y: 0.46, orientation: 'vertical', reverse: false, mode: 'segments', segments: 15 },
+      { id: 'AA:03:00:00:00:00:00:03', deviceId: 'AA:03:00:00:00:00:03', part: 'single', excluded: true, x: 0.5, y: -0.14, orientation: 'vertical', reverse: false, mode: 'solid', segments: 1 },
+    ],
+  };
+  let syncActive = false;
+  let syncActiveDevices: string[] = [];
+  const snapshots = new Map<string, DeviceState>();
+  let previewOn = false;
+  let previewTimer: ReturnType<typeof setInterval> | undefined;
+
   let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['3A:14:D0:88:19:40:11:2B'] }];
   let scenes: Scene[] = [];
   const subs = new Set<(e: GroovieEvent) => void>();
@@ -209,6 +300,70 @@ function mockApi(): Api {
     emit({ type: 'deviceUpdated', device: d });
   };
 
+  const currentSyncState = (): SyncState => ({
+    supported: true,
+    active: syncActive,
+    activeDevices: [...syncActiveDevices],
+    config: structuredClone(syncConfig),
+  });
+
+  const emitSyncChanged = () => {
+    emit({
+      type: 'syncChanged',
+      status: { active: syncActive, activeDevices: [...syncActiveDevices], config: structuredClone(syncConfig) },
+    });
+  };
+
+  const sampleMockColor = (nx: number, ny: number, t: number): Rgb => {
+    const wave = Math.sin(t * 1.4 + nx * 3.1 - ny * 1.8) * 0.5 + 0.5;
+    const warm = Math.cos(t * 0.9 - nx * 2.4 + ny * 2.2) * 0.5 + 0.5;
+    return {
+      r: Math.round(35 + 210 * warm * (1 - nx * 0.35)),
+      g: Math.round(45 + 150 * wave * (0.4 + ny * 0.6)),
+      b: Math.round(70 + 185 * (1 - warm * 0.5) * (0.35 + nx * 0.65)),
+    };
+  };
+
+  const updatePreviewLoop = () => {
+    if (previewTimer) {
+      clearInterval(previewTimer);
+      previewTimer = undefined;
+    }
+    if (!previewOn || !syncActive) return;
+    const tickPreview = () => {
+      const t = Date.now() / 1000;
+      const disp = mockDisplays.find((d) => d.id === syncConfig.displayId) ?? mockDisplays[0];
+      const crop: SampleRect = { x0: 0, y0: 0, x1: 1, y1: 1 };
+      const placements: PlacementPreview[] = syncConfig.placements.map((p) => {
+        const sample = computeSampleRect(p, crop);
+        const count = p.mode === 'solid' ? 1 : Math.max(1, Math.min(32, p.segments));
+        const colors: Rgb[] = Array.from({ length: count }, (_, i) => {
+          const f = (i + 0.5) / count;
+          const sx = p.orientation === 'horizontal' ? sample.x0 + (sample.x1 - sample.x0) * f : (sample.x0 + sample.x1) * 0.5;
+          const sy = p.orientation === 'vertical' ? sample.y0 + (sample.y1 - sample.y0) * f : (sample.y0 + sample.y1) * 0.5;
+          return sampleMockColor(sx, sy, t);
+        });
+        return { id: p.id, sample, colors };
+      });
+      emit({
+        type: 'syncPreview',
+        preview: {
+          aspect: disp.width / disp.height,
+          crop,
+          edgeColors: [
+            sampleMockColor(0.5, 0.08, t),
+            sampleMockColor(0.92, 0.5, t),
+            sampleMockColor(0.5, 0.92, t),
+            sampleMockColor(0.08, 0.5, t),
+          ],
+          placements,
+        },
+      });
+    };
+    tickPreview();
+    previewTimer = setInterval(tickPreview, 100);
+  };
+
   return {
     listDevices: async () => structuredClone(devices),
     discover: async () => {
@@ -221,6 +376,15 @@ function mockApi(): Api {
         a = { type: 'power', value: !anyOn };
       }
       const act = a;
+      if (syncActive && (act.type === 'color' || act.type === 'kelvin' || (act.type === 'power' && !act.value))) {
+        syncActiveDevices = syncActiveDevices.filter((id) => !targets.includes(id));
+        if (!syncActiveDevices.length) {
+          syncActive = false;
+          snapshots.clear();
+          updatePreviewLoop();
+        }
+        emitSyncChanged();
+      }
       pushLog('action', '', undefined, `apply ${JSON.stringify(t)} -> ${JSON.stringify(act)}`);
       for (const id of targets) {
         const d = devices.find((x) => x.id === id);
@@ -259,6 +423,13 @@ function mockApi(): Api {
       return s;
     },
     async applyScene(id) {
+      if (syncActive) {
+        syncActive = false;
+        syncActiveDevices = [];
+        snapshots.clear();
+        updatePreviewLoop();
+        emitSyncChanged();
+      }
       const s = scenes.find((x) => x.id === id);
       for (const e of s?.entries ?? [])
         set(e.device, (st, dev) => {
@@ -269,6 +440,61 @@ function mockApi(): Api {
         });
     },
     async deleteScene(id) { scenes = scenes.filter((s) => s.id !== id); config(); },
+    getSyncState: async () => currentSyncState(),
+    listDisplays: async () => structuredClone(mockDisplays),
+    async setSyncEnabled(enabled) {
+      if (enabled) {
+        const includedIds = Array.from(new Set(syncConfig.placements.filter((p) => !p.excluded).map((p) => p.deviceId)));
+        const onlineIds = includedIds.filter((id) => devices.find((d) => d.id === id)?.online);
+        if (!onlineIds.length) throw new Error('No online lights are included in Screen Sync');
+        for (const id of onlineIds) {
+          const d = devices.find((x) => x.id === id);
+          if (d?.state && !snapshots.has(id)) snapshots.set(id, structuredClone(d.state));
+          set(id, (s) => { s.on = true; });
+        }
+        syncActive = true;
+        syncActiveDevices = onlineIds;
+        pushLog('action', '', undefined, `Screen Sync started (${onlineIds.length} lights)`);
+      } else {
+        syncActive = false;
+        syncActiveDevices = [];
+        for (const [id, snap] of snapshots.entries()) {
+          set(id, (s) => Object.assign(s, snap));
+        }
+        snapshots.clear();
+        pushLog('action', '', undefined, 'Screen Sync stopped');
+      }
+      updatePreviewLoop();
+      emitSyncChanged();
+      return currentSyncState();
+    },
+    async updateSyncConfig(next) {
+      const preset: SyncPreset =
+        next.smoothing === 32 && next.vibrance === 65 && next.minGlow === 0
+          ? 'game'
+          : next.smoothing === 68 && next.vibrance === 45 && next.minGlow === 15
+            ? 'movie'
+            : 'custom';
+      syncConfig = { ...structuredClone(next), preset };
+      if (syncActive) {
+        const includedIds = new Set(syncConfig.placements.filter((p) => !p.excluded).map((p) => p.deviceId));
+        syncActiveDevices = syncActiveDevices.filter((id) => includedIds.has(id));
+        if (!syncActiveDevices.length) {
+          syncActive = false;
+        }
+      }
+      updatePreviewLoop();
+      emitSyncChanged();
+      config();
+      return currentSyncState();
+    },
+    async identifySyncPlacement(placementId) {
+      pushLog('action', '', undefined, `Identify placement ${placementId}`);
+    },
+    async setSyncPreview(enabled) {
+      previewOn = enabled;
+      updatePreviewLoop();
+    },
     listLogs: async () => structuredClone(logs),
     clearLogs: async () => { logs = []; },
     setWindowActive: async () => {},
@@ -279,7 +505,7 @@ function mockApi(): Api {
         path: '~/.config/groovie/groovie.json',
         defaultPath: '~/.config/groovie/groovie.json',
         isCustom: false,
-        json: JSON.stringify({ version: 1, nicknames, groups, scenes, known_devices }, null, 2),
+        json: JSON.stringify({ version: 1, nicknames, groups, scenes, known_devices, sync: syncConfig }, null, 2),
       };
     },
     async reloadConfig() {
@@ -323,6 +549,50 @@ export function kelvinToRgb(k: number): Rgb {
   const g = t <= 66 ? 99.47 * Math.log(t) - 161.12 : 288.12 * Math.pow(t - 60, -0.0755);
   const b = t >= 66 ? 255 : t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
   return { r: clamp(r), g: clamp(g), b: clamp(b) };
+}
+
+/** Mirror of `groovie_core::sync::compute_sample_rect` for 60 FPS drag overlays. */
+export function computeSampleRect(
+  p: Pick<SyncPlacement, 'x' | 'y' | 'orientation'>,
+  crop: SampleRect = { x0: 0, y0: 0, x1: 1, y1: 1 },
+): SampleRect {
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+  const dxOut = p.x < 0 ? -p.x : p.x > 1 ? p.x - 1 : 0;
+  const dyOut = p.y < 0 ? -p.y : p.y > 1 ? p.y - 1 : 0;
+  const dist = Math.hypot(dxOut, dyOut);
+  const t = clamp((dist - 0.03) / 0.35, 0, 1);
+  const depth = lerp(0.13, 0.44, t);
+
+  let nx0: number, ny0: number, nx1: number, ny1: number;
+  if (p.orientation === 'vertical') {
+    const anchorX = clamp(p.x, 0, 1);
+    nx0 = anchorX * (1 - depth);
+    nx1 = nx0 + depth;
+    const offCenter = Math.max(0, Math.abs(p.y - 0.5) - 0.15) / 0.5;
+    const spanY = clamp(lerp(0.92, 1.0, t) - 0.32 * offCenter, 0.45, 1.0);
+    const cy = clamp(p.y, spanY * 0.5, 1 - spanY * 0.5);
+    ny0 = cy - spanY * 0.5;
+    ny1 = cy + spanY * 0.5;
+  } else {
+    const anchorY = clamp(p.y, 0, 1);
+    ny0 = anchorY * (1 - depth);
+    ny1 = ny0 + depth;
+    const offCenter = Math.max(0, Math.abs(p.x - 0.5) - 0.15) / 0.5;
+    const spanX = clamp(lerp(0.92, 1.0, t) - 0.32 * offCenter, 0.45, 1.0);
+    const cx = clamp(p.x, spanX * 0.5, 1 - spanX * 0.5);
+    nx0 = cx - spanX * 0.5;
+    nx1 = cx + spanX * 0.5;
+  }
+
+  const cw = Math.max(0.1, crop.x1 - crop.x0);
+  const ch = Math.max(0.1, crop.y1 - crop.y0);
+  return {
+    x0: crop.x0 + nx0 * cw,
+    y0: crop.y0 + ny0 * ch,
+    x1: crop.x0 + nx1 * cw,
+    y1: crop.y0 + ny1 * ch,
+  };
 }
 
 /** Leading + trailing throttle so sliders feel live without flooding UDP. */

@@ -51,7 +51,15 @@
   import Icon, { type IconName } from './Icon.svelte';
   import Slider from './Slider.svelte';
 
-  let { device }: { device: Device } = $props();
+  let {
+    device,
+    syncing = false,
+    onOpenSync,
+  }: {
+    device: Device;
+    syncing?: boolean;
+    onOpenSync?: () => void;
+  } = $props();
 
   const PRESETS = ['#ff453a', '#ff9f0a', '#ffd60a', '#30d158', '#64d2ff', '#0a84ff', '#5e5ce6', '#ff375f'];
   const WHITES = [
@@ -65,7 +73,15 @@
   // Govee lights report RGB (0,0,0) + kelvin 0 when playing a built-in scene or music mode.
   const isEffect = $derived(!!s && s.kelvin === 0 && s.color.r === 0 && s.color.g === 0 && s.color.b === 0);
   const lit = $derived(
-    s ? (s.kelvin ? kelvinToRgb(s.kelvin) : isEffect ? { r: 255, g: 176, b: 32 } : s.color) : null,
+    s
+      ? syncing
+        ? { r: 255, g: 176, b: 32 }
+        : s.kelvin
+          ? kelvinToRgb(s.kelvin)
+          : isEffect
+            ? { r: 255, g: 176, b: 32 }
+            : s.color
+      : null,
   );
   const litCss = $derived(lit ? `rgb(${lit.r} ${lit.g} ${lit.b})` : 'var(--track)');
   // Dark icon on light colours, white icon on dark ones.
@@ -111,7 +127,7 @@
       : !s
         ? 'Connecting…'
         : s.on
-          ? `On · ${s.brightness}%${isEffect ? ' · Scene' : ''}`
+          ? `On · ${s.brightness}%${syncing ? ' · Syncing' : isEffect ? ' · Scene' : ''}`
           : 'Off',
   );
 
@@ -190,51 +206,59 @@
       <span class="bri-label"><Icon name="sun" size={14} /> {s.brightness}%</span>
     </div>
 
-    <div class="segmented" role="tablist">
-      <button role="tab" aria-selected={mode === 'color'} class:sel={mode === 'color'} onclick={() => setMode('color')}>Colour</button>
-      <button role="tab" aria-selected={mode === 'white'} class:sel={mode === 'white'} onclick={() => setMode('white')}>White</button>
-    </div>
-
-    {#if mode === 'color'}
-      <div class="swatches">
-        {#each PRESETS as c (c)}
-          <button
-            class="swatch"
-            class:sel={hex === c}
-            style="--c: {c}"
-            title={c}
-            aria-label="Set colour {c}"
-            onclick={() => send({ type: 'color', value: fromHex(c) })}
-          ></button>
-        {/each}
-        <label class="swatch custom" class:sel={custom} class:filled={custom} style="--c: {hex}" title="Custom colour">
-          <input
-            type="color"
-            value={hex || toHex(rememberedColor)}
-            oninput={(e) => sendThrottled({ type: 'color', value: fromHex(e.currentTarget.value) })}
-          />
-        </label>
-      </div>
+    {#if syncing}
+      <button type="button" class="sync-pill" onclick={() => onOpenSync?.()}>
+        <span class="sync-dot"></span>
+        <Icon name="monitor" size={14} />
+        <span>Syncing with screen</span>
+      </button>
     {:else}
-      <div class="white">
-        <Slider
-          variant="kelvin"
-          label="Colour temperature"
-          min={2000}
-          max={9000}
-          step={100}
-          value={activeKelvin}
-          oninput={(v) => sendThrottled({ type: 'kelvin', value: v })}
-        />
-        <div class="chips">
-          {#each WHITES as w (w.k)}
-            <button class="chip" class:sel={activeKelvin === w.k} onclick={() => send({ type: 'kelvin', value: w.k })}>
-              {w.label}
-            </button>
-          {/each}
-          <span class="k">{activeKelvin}K</span>
-        </div>
+      <div class="segmented" role="tablist">
+        <button role="tab" aria-selected={mode === 'color'} class:sel={mode === 'color'} onclick={() => setMode('color')}>Colour</button>
+        <button role="tab" aria-selected={mode === 'white'} class:sel={mode === 'white'} onclick={() => setMode('white')}>White</button>
       </div>
+
+      {#if mode === 'color'}
+        <div class="swatches">
+          {#each PRESETS as c (c)}
+            <button
+              class="swatch"
+              class:sel={hex === c}
+              style="--c: {c}"
+              title={c}
+              aria-label="Set colour {c}"
+              onclick={() => send({ type: 'color', value: fromHex(c) })}
+            ></button>
+          {/each}
+          <label class="swatch custom" class:sel={custom} class:filled={custom} style="--c: {hex}" title="Custom colour">
+            <input
+              type="color"
+              value={hex || toHex(rememberedColor)}
+              oninput={(e) => sendThrottled({ type: 'color', value: fromHex(e.currentTarget.value) })}
+            />
+          </label>
+        </div>
+      {:else}
+        <div class="white">
+          <Slider
+            variant="kelvin"
+            label="Colour temperature"
+            min={2000}
+            max={9000}
+            step={100}
+            value={activeKelvin}
+            oninput={(v) => sendThrottled({ type: 'kelvin', value: v })}
+          />
+          <div class="chips">
+            {#each WHITES as w (w.k)}
+              <button class="chip" class:sel={activeKelvin === w.k} onclick={() => send({ type: 'kelvin', value: w.k })}>
+                {w.label}
+              </button>
+            {/each}
+            <span class="k">{activeKelvin}K</span>
+          </div>
+        </div>
+      {/if}
     {/if}
   {/if}
 </article>
@@ -327,4 +351,27 @@
   .white { display: flex; flex-direction: column; gap: 10px; }
   .chips { display: flex; gap: 6px; align-items: center; }
   .k { margin-left: auto; color: var(--text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  .sync-pill {
+    width: 100%;
+    height: 36px;
+    justify-content: center;
+    gap: 8px;
+    border-radius: 9px;
+    background: #ffb02016;
+    border-color: #ffb02048;
+    color: var(--accent);
+    font-size: 12.5px;
+    font-weight: 550;
+  }
+  .sync-pill:hover:not(:disabled) {
+    background: #ffb02026;
+  }
+  .sync-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+  }
 </style>

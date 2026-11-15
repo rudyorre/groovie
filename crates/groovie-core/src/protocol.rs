@@ -60,6 +60,14 @@ pub enum Command {
     /// Colour temperature in Kelvin.
     ColorTemp(u16),
     DevStatus,
+    /// Enter (`true`) or exit (`false`) low-latency LAN segment streaming (`cmd: "razer"`).
+    RazerEnable(bool),
+    /// Stream per-segment RGB values (`1..=255` slots) in `cmd: "razer"` mode.
+    /// `gradient = true` sets the `0x01` stretch/interpolation flag used by Govee DreamView/Razer.
+    RazerFrame {
+        gradient: bool,
+        colors: Vec<Rgb>,
+    },
 }
 
 impl Command {
@@ -80,6 +88,14 @@ impl Command {
                 }),
             ),
             Command::DevStatus => ("devStatus", json!({})),
+            Command::RazerEnable(on) => {
+                let pt = if *on { "uwABsQEK" } else { "uwABsQAL" };
+                ("razer", json!({ "pt": pt }))
+            }
+            Command::RazerFrame { gradient, colors } => {
+                let raw = encode_razer_raw(*gradient, colors);
+                ("razer", json!({ "pt": b64_encode(&raw) }))
+            }
         };
         json!({ "msg": { "cmd": cmd, "data": data } })
     }
@@ -87,6 +103,114 @@ impl Command {
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(&self.to_json()).expect("command serialises")
     }
+
+    /// Fast-path encoder for 30 Hz UDP streaming: writes compact `cmd: "razer"`
+    /// JSON directly into `out` without intermediate `serde_json::Value` allocations.
+    pub fn write_razer_frame_bytes(gradient: bool, colors: &[Rgb], out: &mut Vec<u8>) {
+        const PREFIX: &[u8] = br#"{"msg":{"cmd":"razer","data":{"pt":""#;
+        const SUFFIX: &[u8] = br#""}}}"#;
+        let raw = encode_razer_raw(gradient, colors);
+        out.clear();
+        out.reserve(PREFIX.len() + raw.len().div_ceil(3) * 4 + SUFFIX.len());
+        out.extend_from_slice(PREFIX);
+        b64_encode_into(&raw, out);
+        out.extend_from_slice(SUFFIX);
+    }
+}
+
+fn encode_razer_raw(gradient: bool, colors: &[Rgb]) -> Vec<u8> {
+    let count = colors.len().min(255);
+    let payload_len = (2 + 3 * count) as u16;
+    let mut raw = Vec::with_capacity(7 + 3 * count);
+    raw.push(0xBB);
+    raw.push((payload_len >> 8) as u8);
+    raw.push((payload_len & 0xFF) as u8);
+    raw.push(0xB0);
+    raw.push(u8::from(gradient));
+    raw.push(count as u8);
+    for c in colors.iter().take(count) {
+        raw.push(c.r);
+        raw.push(c.g);
+        raw.push(c.b);
+    }
+    let xor = raw.iter().fold(0u8, |acc, &b| acc ^ b);
+    raw.push(xor);
+    raw
+}
+
+const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(input: &[u8]) -> String {
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    b64_encode_into(input, &mut out);
+    // Safety: `B64_TABLE` and `'='` are pure ASCII.
+    String::from_utf8(out).expect("base64 is valid ASCII")
+}
+
+fn b64_encode_into(input: &[u8], out: &mut Vec<u8>) {
+    let mut chunks = input.chunks_exact(3);
+    for c in &mut chunks {
+        let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
+        out.push(B64_TABLE[((n >> 18) & 0x3F) as usize]);
+        out.push(B64_TABLE[((n >> 12) & 0x3F) as usize]);
+        out.push(B64_TABLE[((n >> 6) & 0x3F) as usize]);
+        out.push(B64_TABLE[(n & 0x3F) as usize]);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(B64_TABLE[((n >> 18) & 0x3F) as usize]);
+            out.push(B64_TABLE[((n >> 12) & 0x3F) as usize]);
+            out.push(b'=');
+            out.push(b'=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(B64_TABLE[((n >> 18) & 0x3F) as usize]);
+            out.push(B64_TABLE[((n >> 12) & 0x3F) as usize]);
+            out.push(B64_TABLE[((n >> 6) & 0x3F) as usize]);
+            out.push(b'=');
+        }
+        _ => {}
+    }
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("invalid base64 length".into());
+    }
+    let val = |b: u8| -> Result<u8, String> {
+        match b {
+            b'A'..=b'Z' => Ok(b - b'A'),
+            b'a'..=b'z' => Ok(b - b'a' + 26),
+            b'0'..=b'9' => Ok(b - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte {b:#x}")),
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+            return Err("invalid base64 padding".into());
+        }
+        let a = val(chunk[0])? as u32;
+        let b = val(chunk[1])? as u32;
+        let c = if pad >= 2 { 0 } else { val(chunk[2])? as u32 };
+        let d = if pad >= 1 { 0 } else { val(chunk[3])? as u32 };
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push(((n >> 16) & 0xFF) as u8);
+        if pad < 2 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if pad < 1 {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Reply to a `scan` request.
@@ -167,8 +291,50 @@ pub fn parse_command(bytes: &[u8]) -> Result<Command, String> {
                 Command::Color(c)
             }
         }
+        "razer" => {
+            let pt = d.get("pt").and_then(Value::as_str).ok_or("missing razer pt")?;
+            parse_razer_payload(pt)?
+        }
         other => return Err(format!("unknown cmd {other}")),
     })
+}
+
+fn parse_razer_payload(pt: &str) -> Result<Command, String> {
+    let raw = b64_decode(pt)?;
+    if raw.len() < 6 || raw[0] != 0xBB {
+        return Err("invalid razer header".into());
+    }
+    if raw.iter().fold(0u8, |acc, &b| acc ^ b) != 0 {
+        return Err("razer xor checksum mismatch".into());
+    }
+    let payload_len = u16::from_be_bytes([raw[1], raw[2]]) as usize;
+    if raw.len() != 5 + payload_len {
+        return Err(format!("razer length mismatch: expected {}, got {}", 5 + payload_len, raw.len()));
+    }
+    match raw[3] {
+        0xB1 => {
+            if payload_len != 1 {
+                return Err("invalid razer enable length".into());
+            }
+            Ok(Command::RazerEnable(raw[4] != 0))
+        }
+        0xB0 => {
+            if payload_len < 2 {
+                return Err("invalid razer frame length".into());
+            }
+            let gradient = raw[4] != 0;
+            let count = raw[5] as usize;
+            if payload_len != 2 + 3 * count {
+                return Err("razer segment count mismatch".into());
+            }
+            let mut colors = Vec::with_capacity(count);
+            for rgb in raw[6..6 + 3 * count].chunks_exact(3) {
+                colors.push(Rgb::new(rgb[0], rgb[1], rgb[2]));
+            }
+            Ok(Command::RazerFrame { gradient, colors })
+        }
+        sub => Err(format!("unknown razer subcommand {sub:#x}")),
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +363,40 @@ mod tests {
             Command::Color(Rgb::new(1, 2, 3)).to_json(),
             json!({"msg":{"cmd":"colorwc","data":{"color":{"r":1,"g":2,"b":3},"colorTemInKelvin":0}}})
         );
+        assert_eq!(
+            Command::RazerEnable(true).to_json(),
+            json!({"msg":{"cmd":"razer","data":{"pt":"uwABsQEK"}}})
+        );
+        assert_eq!(
+            Command::RazerEnable(false).to_json(),
+            json!({"msg":{"cmd":"razer","data":{"pt":"uwABsQAL"}}})
+        );
+    }
+
+    #[test]
+    fn razer_golden_vector_and_fast_path_match() {
+        // Golden 10-segment Razer frame vector:
+        // bb 00 20 b0 01 0a (10 RGB triples) d5 -> "uwAgsAEKABH/JWzySsflbyLYlH3Ludi+3jOxA46kKOmXTUSK1Q=="
+        let colors = vec![
+            Rgb::new(0x00, 0x11, 0xFF),
+            Rgb::new(0x25, 0x6C, 0xF2),
+            Rgb::new(0x4A, 0xC7, 0xE5),
+            Rgb::new(0x6F, 0x22, 0xD8),
+            Rgb::new(0x94, 0x7D, 0xCB),
+            Rgb::new(0xB9, 0xD8, 0xBE),
+            Rgb::new(0xDE, 0x33, 0xB1),
+            Rgb::new(0x03, 0x8E, 0xA4),
+            Rgb::new(0x28, 0xE9, 0x97),
+            Rgb::new(0x4D, 0x44, 0x8A),
+        ];
+        let cmd = Command::RazerFrame { gradient: true, colors: colors.clone() };
+        assert_eq!(
+            cmd.to_json(),
+            json!({"msg":{"cmd":"razer","data":{"pt":"uwAgsAEKABH/JWzySsflbyLYlH3Ludi+3jOxA46kKOmXTUSK1Q=="}}})
+        );
+        let mut fast = Vec::new();
+        Command::write_razer_frame_bytes(true, &colors, &mut fast);
+        assert_eq!(parse_command(&fast).unwrap(), cmd);
     }
 
     #[test]
@@ -208,6 +408,16 @@ mod tests {
             Command::Brightness(42),
             Command::Color(Rgb::new(9, 8, 7)),
             Command::ColorTemp(4000),
+            Command::RazerEnable(true),
+            Command::RazerEnable(false),
+            Command::RazerFrame {
+                gradient: true,
+                colors: vec![Rgb::new(255, 0, 128), Rgb::new(12, 34, 56)],
+            },
+            Command::RazerFrame {
+                gradient: false,
+                colors: vec![Rgb::new(1, 2, 3)],
+            },
         ] {
             assert_eq!(parse_command(&c.to_bytes()).unwrap(), c);
         }

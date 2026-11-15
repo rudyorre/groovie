@@ -26,8 +26,6 @@ jobs:
   desktop:
     name: Desktop app (${{ matrix.name }})
     needs: test
-    # Installers are built on pushes to main, tags and manual runs (not on every PR).
-    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -66,11 +64,18 @@ jobs:
             apps/desktop/package-lock.json
       - run: npm ci
         working-directory: apps/desktop
-      - run: npx tauri build ${{ matrix.args }}
+      - name: Build desktop installer
+        shell: bash
         working-directory: apps/desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            EXTRA_ARGS+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+          fi
+          npx tauri build ${{ matrix.args }} "${EXTRA_ARGS[@]}"
       - uses: actions/upload-artifact@v7
         with:
           name: Groovie-${{ matrix.name }}

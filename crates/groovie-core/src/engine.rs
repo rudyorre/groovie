@@ -7,18 +7,27 @@ use crate::store::{
     default_auto_store_path, default_store_path, normalize_user_store_path, write_custom_store_path,
     KnownDevice, Store,
 };
-use std::collections::{HashMap, VecDeque};
+use crate::sync::{
+    build_identify_razer_colors, device_uses_razer, reconcile_placements, DeviceSyncCommand,
+    SyncConfig, SyncFrame, SyncPlacement, SyncProcessor, SyncStatus,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const MAX_LOGS: usize = 500;
+const SYNC_TICK: Duration = Duration::from_millis(33);
+const RAZER_KEEPALIVE: Duration = Duration::from_millis(450);
+const RAZER_REASSERT: Duration = Duration::from_secs(25);
+const SOLID_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -32,6 +41,12 @@ pub enum Error {
     UnknownScene(String),
     #[error("nothing matches '{0}'")]
     NoMatch(String),
+    #[error("no lights are enabled for Screen Sync")]
+    NoSyncDevices,
+    #[error("no enabled lights are online yet")]
+    NoOnlineSyncDevices,
+    #[error("unknown placement '{0}'")]
+    UnknownPlacement(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,6 +95,42 @@ struct Entry {
     generation: u64,
 }
 
+struct SyncDeviceSession {
+    ip: Ipv4Addr,
+    sku: String,
+    snapshot: DeviceState,
+    uses_razer: bool,
+    last_razer: Option<Vec<Rgb>>,
+    last_solid: Option<Rgb>,
+    last_sent_at: Option<Instant>,
+    last_razer_enable_at: Instant,
+}
+
+struct IdentifyPulse {
+    placement_id: String,
+    device_id: String,
+    ip: Ipv4Addr,
+    sku: String,
+    uses_razer: bool,
+    started_at: Instant,
+    duration: Duration,
+    /// Set when Screen Sync was not already active for this device so state is restored afterwards.
+    restore_after: Option<DeviceState>,
+}
+
+#[derive(Default)]
+struct SyncRuntime {
+    active: bool,
+    sessions: HashMap<String, SyncDeviceSession>,
+    detached: HashSet<String>,
+    frame: Option<SyncFrame>,
+    processor: SyncProcessor,
+    preview_enabled: bool,
+    preview_dirty: bool,
+    last_preview_at: Option<Instant>,
+    identify: Option<IdentifyPulse>,
+}
+
 struct Inner {
     cfg: Config,
     sock: UdpSocket,
@@ -89,6 +140,8 @@ struct Inner {
     logs: Mutex<VecDeque<LogEntry>>,
     poll_tx: watch::Sender<Duration>,
     last_refresh: Mutex<Option<Instant>>,
+    sync_rt: Mutex<SyncRuntime>,
+    sync_notify: Notify,
     events: broadcast::Sender<Event>,
 }
 
@@ -157,6 +210,8 @@ impl Groovie {
             logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
             poll_tx,
             last_refresh: Mutex::new(None),
+            sync_rt: Mutex::new(SyncRuntime::default()),
+            sync_notify: Notify::new(),
             events,
         });
 
@@ -164,6 +219,7 @@ impl Groovie {
             tokio::spawn(recv_loop(inner.clone())),
             tokio::spawn(poll_loop(inner.clone())),
             tokio::spawn(rescan_loop(inner.clone())),
+            tokio::spawn(sync_loop(inner.clone())),
         ];
 
         let me = Self { inner, _tasks: Arc::new(TaskGuard(tasks)) };
@@ -273,6 +329,13 @@ impl Groovie {
             format!("apply {target:?} -> [{}]: {action:?}", resolved.join(", "))
         };
         self.inner.log("action", "", None, summary, false).await;
+
+        // Turning off or manually recolouring a synced light detaches it from the
+        // current Screen Sync session cleanly (sending RazerEnable(false) first).
+        if matches!(action, Action::Power(false) | Action::Color(_) | Action::Kelvin(_)) {
+            self.inner.detach_synced_devices(&ids).await;
+        }
+
         for id in &ids {
             self.inner.send_action(id, action).await?;
         }
@@ -443,6 +506,8 @@ impl Groovie {
             .into_iter()
             .find(|s| s.id == id || s.name.eq_ignore_ascii_case(id))
             .ok_or_else(|| Error::UnknownScene(id.into()))?;
+        // Exit Screen Sync without restoring pre-sync snapshots so the scene's own look takes over.
+        self.inner.abort_sync_without_restore("scene applied").await;
         self.inner
             .log("action", "", None, format!("apply_scene '{}' ({})", scene.name, scene.id), false)
             .await;
@@ -468,6 +533,53 @@ impl Groovie {
             }
         }
         Ok(())
+    }
+
+    // ---- screen sync -----------------------------------------------------
+
+    pub async fn sync_status(&self) -> SyncStatus {
+        self.inner.current_sync_status().await
+    }
+
+    pub async fn update_sync_config(&self, config: SyncConfig) -> Result<SyncStatus> {
+        self.inner.update_sync_config(config).await
+    }
+
+    pub async fn start_sync(&self) -> Result<SyncStatus> {
+        self.inner.start_sync().await
+    }
+
+    pub async fn stop_sync(&self, reason: Option<&str>) -> SyncStatus {
+        self.inner.stop_sync(reason).await
+    }
+
+    pub async fn push_sync_frame(&self, frame: SyncFrame) {
+        let should_wake = {
+            let mut rt = self.inner.sync_rt.lock().await;
+            rt.frame = Some(frame);
+            rt.preview_dirty = true;
+            rt.active || rt.preview_enabled
+        };
+        if should_wake {
+            self.inner.sync_notify.notify_one();
+        }
+    }
+
+    pub async fn set_sync_preview(&self, enabled: bool) {
+        let should_wake = {
+            let mut rt = self.inner.sync_rt.lock().await;
+            rt.preview_enabled = enabled;
+            rt.preview_dirty = enabled;
+            rt.last_preview_at = None;
+            enabled && rt.frame.is_some()
+        };
+        if should_wake {
+            self.inner.sync_notify.notify_one();
+        }
+    }
+
+    pub async fn identify_sync_placement(&self, placement_id: &str) -> Result<()> {
+        self.inner.identify_sync_placement(placement_id).await
     }
 
     // ---- config file -----------------------------------------------------
@@ -717,14 +829,23 @@ impl Inner {
     }
 
     /// Used by the background poll loop and focus sync: skip devices whose own
-    /// post-command `refresh_delay` check is still pending so we don't query mid-fade.
+    /// post-command `refresh_delay` check is still pending or that are actively streaming Screen Sync.
     async fn refresh_idle(&self) {
+        let synced_ids: HashSet<String> = {
+            let rt = self.sync_rt.lock().await;
+            let mut set: HashSet<String> = rt.sessions.keys().cloned().collect();
+            if let Some(id_pulse) = &rt.identify {
+                set.insert(id_pulse.device_id.clone());
+            }
+            set
+        };
         let settle = self.cfg.refresh_delay + Duration::from_millis(250);
         let mut ips: Vec<Ipv4Addr> = self
             .devices
             .read()
             .await
             .values()
+            .filter(|e| !synced_ids.contains(&e.device.id))
             .filter(|e| e.last_command.map(|t| t.elapsed() >= settle).unwrap_or(true))
             .map(|e| e.device.ip)
             .collect();
@@ -798,19 +919,628 @@ impl Inner {
         self.send(cmd, SocketAddr::from((ip, self.cfg.command_port))).await?;
         self.emit(Event::DeviceUpdated { device: dev });
 
-        // Confirm the real state once the user has stopped fiddling.
-        let me = self.clone();
-        let id = id.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(me.cfg.refresh_delay).await;
-            let current = me.devices.read().await.get(&id).map(|e| (e.generation, e.device.ip));
-            if let Some((g, ip)) = current {
-                if g == generation {
-                    let _ = me.send(Command::DevStatus, SocketAddr::from((ip, me.cfg.command_port))).await;
+        let is_synced = self.sync_rt.lock().await.sessions.contains_key(id);
+        if !is_synced {
+            // Confirm the real state once the user has stopped fiddling.
+            let me = self.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(me.cfg.refresh_delay).await;
+                let still_unsynced = !me.sync_rt.lock().await.sessions.contains_key(&id);
+                if !still_unsynced {
+                    return;
+                }
+                let current = me.devices.read().await.get(&id).map(|e| (e.generation, e.device.ip));
+                if let Some((g, ip)) = current {
+                    if g == generation {
+                        let _ = me.send(Command::DevStatus, SocketAddr::from((ip, me.cfg.command_port))).await;
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    // ---- screen sync internals -------------------------------------------
+
+    async fn reconciled_sync_config(&self) -> SyncConfig {
+        let dev_pairs: Vec<(String, String)> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .map(|e| (e.device.id.clone(), e.device.sku.clone()))
+            .collect();
+        let mut cfg = self.store.lock().await.data.sync.clone();
+        reconcile_placements(
+            &mut cfg,
+            dev_pairs.iter().map(|(id, sku)| (id.as_str(), sku.as_str())),
+        );
+        cfg
+    }
+
+    async fn current_sync_status(&self) -> SyncStatus {
+        let cfg = self.reconciled_sync_config().await;
+        let (active, mut active_devices) = {
+            let rt = self.sync_rt.lock().await;
+            (rt.active, rt.sessions.keys().cloned().collect::<Vec<_>>())
+        };
+        active_devices.sort();
+        SyncStatus { active, active_devices, config: cfg }
+    }
+
+    async fn update_sync_config(&self, config: SyncConfig) -> Result<SyncStatus> {
+        let dev_pairs: Vec<(String, String)> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .map(|e| (e.device.id.clone(), e.device.sku.clone()))
+            .collect();
+
+        let mut sanitized = config.sanitized();
+        reconcile_placements(
+            &mut sanitized,
+            dev_pairs.iter().map(|(id, sku)| (id.as_str(), sku.as_str())),
+        );
+
+        {
+            let mut store = self.store.lock().await;
+            store.data.sync = sanitized.clone();
+            store.save()?;
+        }
+        self.emit(Event::ConfigChanged);
+
+        // If Screen Sync is actively streaming, reconcile newly excluded/included or mode-changed lights live.
+        let is_active = {
+            let mut rt = self.sync_rt.lock().await;
+            rt.preview_dirty = true;
+            rt.active
+        };
+        if is_active {
+            self.reconcile_live_sync_sessions(&sanitized).await;
+        }
+
+        let status = self.current_sync_status().await;
+        self.emit(Event::SyncChanged { status: status.clone() });
+        self.sync_notify.notify_one();
+        Ok(status)
+    }
+
+    async fn start_sync(&self) -> Result<SyncStatus> {
+        let cfg = self.reconciled_sync_config().await;
+        let enabled_ids: HashSet<String> = cfg
+            .placements
+            .iter()
+            .filter(|p| !p.excluded)
+            .map(|p| p.device_id.clone())
+            .collect();
+        if enabled_ids.is_empty() {
+            return Err(Error::NoSyncDevices);
+        }
+
+        let candidates: Vec<(Device, DeviceState, bool)> = {
+            let devices = self.devices.read().await;
+            let mut out = Vec::new();
+            for id in &enabled_ids {
+                let Some(e) = devices.get(id) else { continue };
+                if !e.device.online {
+                    continue;
+                }
+                let snap = snapshot_for_device(&e.device);
+                let placements: Vec<&SyncPlacement> = cfg
+                    .placements
+                    .iter()
+                    .filter(|p| &p.device_id == id && !p.excluded)
+                    .collect();
+                let uses_razer = device_uses_razer(&e.device.sku, &placements);
+                out.push((e.device.clone(), snap, uses_razer));
+            }
+            out
+        };
+
+        if candidates.is_empty() {
+            return Err(Error::NoOnlineSyncDevices);
+        }
+
+        // Wake any sleeping lights before entering Razer streaming mode.
+        let mut woke_any = false;
+        for (dev, snap, _) in &candidates {
+            if !snap.on {
+                woke_any = true;
+                let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
+                let _ = self.send(Command::Turn(true), addr).await;
+                let updated = {
+                    let mut devices = self.devices.write().await;
+                    devices.get_mut(&dev.id).map(|e| {
+                        let mut s = e.device.state.unwrap_or(*snap);
+                        s.on = true;
+                        e.device.state = Some(s);
+                        e.last_command = Some(Instant::now());
+                        e.generation += 1;
+                        e.device.clone()
+                    })
+                };
+                if let Some(d) = updated {
+                    self.emit(Event::DeviceUpdated { device: d });
                 }
             }
-        });
+        }
+        if woke_any {
+            tokio::time::sleep(Duration::from_millis(85)).await;
+        }
+
+        let now = Instant::now();
+        let mut new_sessions = HashMap::new();
+        for (dev, snap, uses_razer) in &candidates {
+            if *uses_razer {
+                let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
+                let _ = self.send(Command::RazerEnable(true), addr).await;
+            }
+            new_sessions.insert(
+                dev.id.clone(),
+                SyncDeviceSession {
+                    ip: dev.ip,
+                    sku: dev.sku.clone(),
+                    snapshot: *snap,
+                    uses_razer: *uses_razer,
+                    last_razer: None,
+                    last_solid: None,
+                    last_sent_at: None,
+                    last_razer_enable_at: now,
+                },
+            );
+        }
+
+        let count = new_sessions.len();
+        {
+            let mut rt = self.sync_rt.lock().await;
+            // Preserve pre-sync snapshots for any device that was already in an active session.
+            for (id, prev) in std::mem::take(&mut rt.sessions) {
+                if let Some(next) = new_sessions.get_mut(&id) {
+                    next.snapshot = prev.snapshot;
+                }
+            }
+            rt.active = true;
+            rt.detached.clear();
+            rt.processor.reset();
+            rt.sessions = new_sessions;
+        }
+
+        self.log(
+            "action",
+            "",
+            None,
+            format!("Screen Sync started ({count} {})", if count == 1 { "light" } else { "lights" }),
+            false,
+        )
+        .await;
+
+        let status = self.current_sync_status().await;
+        self.emit(Event::SyncChanged { status: status.clone() });
+        self.sync_notify.notify_one();
+        Ok(status)
+    }
+
+    async fn stop_sync(&self, reason: Option<&str>) -> SyncStatus {
+        let to_restore: Vec<(String, SyncDeviceSession)> = {
+            let mut rt = self.sync_rt.lock().await;
+            if !rt.active && rt.sessions.is_empty() {
+                drop(rt);
+                return self.current_sync_status().await;
+            }
+            rt.active = false;
+            rt.detached.clear();
+            rt.processor.reset();
+            rt.sessions.drain().collect()
+        };
+
+        let status = self.current_sync_status().await;
+        let msg = match reason {
+            Some(r) if !r.is_empty() => format!("Screen Sync stopped ({r})"),
+            _ => "Screen Sync stopped".to_string(),
+        };
+        self.log("action", "", None, msg, false).await;
+        self.emit(Event::SyncChanged { status: status.clone() });
+
+        for (id, sess) in to_restore {
+            self.restore_device_snapshot(&id, sess.ip, sess.uses_razer, sess.snapshot).await;
+        }
+        status
+    }
+
+    async fn abort_sync_without_restore(&self, reason: &str) {
+        let to_disable: Vec<(Ipv4Addr, bool)> = {
+            let mut rt = self.sync_rt.lock().await;
+            if !rt.active && rt.sessions.is_empty() {
+                return;
+            }
+            rt.active = false;
+            rt.detached.clear();
+            rt.processor.reset();
+            rt.sessions.drain().map(|(_, s)| (s.ip, s.uses_razer)).collect()
+        };
+        self.log("action", "", None, format!("Screen Sync stopped ({reason})"), false).await;
+        for (ip, uses_razer) in to_disable {
+            if uses_razer {
+                let _ = self.send(Command::RazerEnable(false), SocketAddr::from((ip, self.cfg.command_port))).await;
+            }
+        }
+        let status = self.current_sync_status().await;
+        self.emit(Event::SyncChanged { status });
+    }
+
+    async fn detach_synced_devices(&self, ids: &[String]) {
+        let mut detached_razer = Vec::new();
+        let mut stopped_all = false;
+        let mut any_removed = false;
+        {
+            let mut rt = self.sync_rt.lock().await;
+            if !rt.active {
+                return;
+            }
+            for id in ids {
+                if let Some(sess) = rt.sessions.remove(id) {
+                    any_removed = true;
+                    rt.detached.insert(id.clone());
+                    if sess.uses_razer {
+                        detached_razer.push(sess.ip);
+                    }
+                }
+            }
+            if any_removed && rt.sessions.is_empty() {
+                rt.active = false;
+                rt.detached.clear();
+                rt.processor.reset();
+                stopped_all = true;
+            }
+        }
+        if !any_removed {
+            return;
+        }
+        for ip in detached_razer {
+            let _ = self.send(Command::RazerEnable(false), SocketAddr::from((ip, self.cfg.command_port))).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if stopped_all {
+            self.log("action", "", None, "Screen Sync stopped (all synced lights detached)", false).await;
+        }
+        let status = self.current_sync_status().await;
+        self.emit(Event::SyncChanged { status });
+    }
+
+    async fn reconcile_live_sync_sessions(&self, cfg: &SyncConfig) {
+        let enabled_by_dev: HashMap<String, Vec<&SyncPlacement>> = {
+            let mut m: HashMap<String, Vec<&SyncPlacement>> = HashMap::new();
+            for p in cfg.placements.iter().filter(|p| !p.excluded) {
+                m.entry(p.device_id.clone()).or_default().push(p);
+            }
+            m
+        };
+
+        let online_devs: HashMap<String, Device> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| e.device.online)
+            .map(|e| (e.device.id.clone(), e.device.clone()))
+            .collect();
+
+        let mut to_restore = Vec::new();
+        let mut razer_toggles: Vec<(Ipv4Addr, bool)> = Vec::new();
+        let mut to_wake: Vec<(Device, DeviceState, bool)> = Vec::new();
+        let mut auto_stopped = false;
+
+        {
+            let mut rt = self.sync_rt.lock().await;
+            if !rt.active {
+                return;
+            }
+            // Remove devices that were excluded in config.
+            let existing_ids: Vec<String> = rt.sessions.keys().cloned().collect();
+            for id in existing_ids {
+                match enabled_by_dev.get(&id) {
+                    None => {
+                        if let Some(sess) = rt.sessions.remove(&id) {
+                            to_restore.push((id, sess));
+                        }
+                    }
+                    Some(placements) => {
+                        if let Some(sess) = rt.sessions.get_mut(&id) {
+                            let next_razer = device_uses_razer(&sess.sku, placements);
+                            if sess.uses_razer != next_razer {
+                                sess.uses_razer = next_razer;
+                                sess.last_razer = None;
+                                sess.last_solid = None;
+                                sess.last_sent_at = None;
+                                sess.last_razer_enable_at = Instant::now();
+                                razer_toggles.push((sess.ip, next_razer));
+                            }
+                        }
+                    }
+                }
+            }
+            // Attach newly un-excluded online devices.
+            for (id, placements) in &enabled_by_dev {
+                if !rt.sessions.contains_key(id) && !rt.detached.contains(id) {
+                    if let Some(dev) = online_devs.get(id) {
+                        let snap = snapshot_for_device(dev);
+                        let uses_razer = device_uses_razer(&dev.sku, placements);
+                        to_wake.push((dev.clone(), snap, uses_razer));
+                    }
+                }
+            }
+            if rt.sessions.is_empty() && to_wake.is_empty() {
+                rt.active = false;
+                rt.processor.reset();
+                auto_stopped = true;
+            }
+        }
+
+        for (id, sess) in to_restore {
+            self.restore_device_snapshot(&id, sess.ip, sess.uses_razer, sess.snapshot).await;
+        }
+        for (ip, en) in razer_toggles {
+            let _ = self.send(Command::RazerEnable(en), SocketAddr::from((ip, self.cfg.command_port))).await;
+        }
+        for (dev, snap, uses_razer) in to_wake {
+            let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
+            if !snap.on {
+                let _ = self.send(Command::Turn(true), addr).await;
+                tokio::time::sleep(Duration::from_millis(85)).await;
+            }
+            if uses_razer {
+                let _ = self.send(Command::RazerEnable(true), addr).await;
+            }
+            let mut rt = self.sync_rt.lock().await;
+            if rt.active {
+                rt.sessions.insert(
+                    dev.id.clone(),
+                    SyncDeviceSession {
+                        ip: dev.ip,
+                        sku: dev.sku.clone(),
+                        snapshot: snap,
+                        uses_razer,
+                        last_razer: None,
+                        last_solid: None,
+                        last_sent_at: None,
+                        last_razer_enable_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        if auto_stopped {
+            self.log("action", "", None, "Screen Sync stopped (no active lights remaining)", false).await;
+        }
+    }
+
+    async fn restore_device_snapshot(
+        &self,
+        id: &str,
+        ip: Ipv4Addr,
+        uses_razer: bool,
+        snap: DeviceState,
+    ) {
+        let addr = SocketAddr::from((ip, self.cfg.command_port));
+        if uses_razer {
+            let _ = self.send(Command::RazerEnable(false), addr).await;
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+        if !snap.on {
+            let _ = self.send(Command::Turn(false), addr).await;
+        } else {
+            let _ = self.send(Command::Turn(true), addr).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = self.send(Command::Brightness(snap.brightness.clamp(1, 100)), addr).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if snap.kelvin > 0 {
+                let _ = self.send(Command::ColorTemp(snap.kelvin), addr).await;
+            } else if snap.color != Rgb::new(0, 0, 0) {
+                let _ = self.send(Command::Color(snap.color), addr).await;
+            }
+        }
+
+        let updated = {
+            let mut devices = self.devices.write().await;
+            devices.get_mut(id).map(|e| {
+                e.device.state = Some(snap);
+                e.last_command = Some(Instant::now());
+                e.generation += 1;
+                e.device.clone()
+            })
+        };
+        if let Some(device) = updated {
+            self.emit(Event::DeviceUpdated { device });
+        }
+    }
+
+    async fn identify_sync_placement(&self, placement_id: &str) -> Result<()> {
+        let cfg = self.reconciled_sync_config().await;
+        let placement = cfg
+            .placements
+            .iter()
+            .find(|p| p.id == placement_id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownPlacement(placement_id.to_string()))?;
+
+        let (dev, snap) = {
+            let devices = self.devices.read().await;
+            let e = devices
+                .get(&placement.device_id)
+                .ok_or_else(|| Error::UnknownDevice(placement.device_id.clone()))?;
+            (e.device.clone(), snapshot_for_device(&e.device))
+        };
+
+        let dev_placements: Vec<&SyncPlacement> = cfg
+            .placements
+            .iter()
+            .filter(|p| p.device_id == dev.id)
+            .collect();
+        let uses_razer = device_uses_razer(&dev.sku, &dev_placements);
+
+        let already_synced = {
+            let rt = self.sync_rt.lock().await;
+            rt.active && rt.sessions.contains_key(&dev.id)
+        };
+
+        let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
+        if !already_synced {
+            if !snap.on {
+                let _ = self.send(Command::Turn(true), addr).await;
+                tokio::time::sleep(Duration::from_millis(85)).await;
+            }
+            if uses_razer {
+                let _ = self.send(Command::RazerEnable(true), addr).await;
+            }
+        }
+
+        {
+            let mut rt = self.sync_rt.lock().await;
+            // Preserve an earlier `restore_after` if the user clicks Identify twice in a row.
+            let prev_restore = rt
+                .identify
+                .as_ref()
+                .filter(|prev| prev.device_id == dev.id)
+                .and_then(|prev| prev.restore_after);
+            rt.identify = Some(IdentifyPulse {
+                placement_id: placement.id,
+                device_id: dev.id,
+                ip: dev.ip,
+                sku: dev.sku,
+                uses_razer,
+                started_at: Instant::now(),
+                duration: Duration::from_millis(850),
+                restore_after: if already_synced { None } else { prev_restore.or(Some(snap)) },
+            });
+        }
+        self.sync_notify.notify_one();
         Ok(())
+    }
+
+    async fn sync_tick(&self, dt_secs: f32, pkt_buf: &mut Vec<u8>) {
+        let cfg = self.reconciled_sync_config().await;
+        let now = Instant::now();
+
+        let mut raw_sends: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        let mut finished_identify: Option<IdentifyPulse> = None;
+        let mut preview_to_emit = None;
+
+        {
+            let mut rt = self.sync_rt.lock().await;
+            let identify_dev_id = rt.identify.as_ref().map(|p| p.device_id.clone());
+
+            if let Some(pulse) = &rt.identify {
+                let elapsed = now.saturating_duration_since(pulse.started_at);
+                if elapsed >= pulse.duration {
+                    finished_identify = rt.identify.take();
+                } else {
+                    let progress = (elapsed.as_secs_f32() / pulse.duration.as_secs_f32()).clamp(0.0, 1.0);
+                    let addr = SocketAddr::from((pulse.ip, self.cfg.command_port));
+                    if pulse.uses_razer {
+                        let colors = build_identify_razer_colors(
+                            &cfg,
+                            &pulse.device_id,
+                            &pulse.sku,
+                            &pulse.placement_id,
+                            progress,
+                        );
+                        Command::write_razer_frame_bytes(true, &colors, pkt_buf);
+                        raw_sends.push((addr, pkt_buf.clone()));
+                    } else if elapsed.as_millis() < 120 {
+                        raw_sends.push((addr, Command::Color(Rgb::new(255, 176, 32)).to_bytes()));
+                    }
+                }
+            }
+
+            if let Some(frame) = rt.frame.clone() {
+                let active_skus: HashMap<String, String> = if rt.active {
+                    rt.sessions
+                        .iter()
+                        .filter(|(id, _)| Some(id.as_str()) != identify_dev_id.as_deref())
+                        .map(|(id, s)| (id.clone(), s.sku.clone()))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+
+                if rt.active || rt.preview_enabled {
+                    let out = rt.processor.step(&frame, &cfg, &active_skus, dt_secs);
+
+                    for (dev_id, dev_cmd) in out.commands {
+                        let Some(sess) = rt.sessions.get_mut(&dev_id) else { continue };
+                        let addr = SocketAddr::from((sess.ip, self.cfg.command_port));
+
+                        if sess.uses_razer && now.saturating_duration_since(sess.last_razer_enable_at) >= RAZER_REASSERT {
+                            sess.last_razer_enable_at = now;
+                            raw_sends.push((addr, Command::RazerEnable(true).to_bytes()));
+                        }
+
+                        match dev_cmd {
+                            DeviceSyncCommand::Razer { colors } => {
+                                let keepalive_due = sess
+                                    .last_sent_at
+                                    .map(|t| now.saturating_duration_since(t) >= RAZER_KEEPALIVE)
+                                    .unwrap_or(true);
+                                let changed = sess
+                                    .last_razer
+                                    .as_ref()
+                                    .map(|prev| slice_color_diff(prev, &colors) >= 2)
+                                    .unwrap_or(true);
+                                if changed || keepalive_due {
+                                    Command::write_razer_frame_bytes(true, &colors, pkt_buf);
+                                    raw_sends.push((addr, pkt_buf.clone()));
+                                    sess.last_razer = Some(colors);
+                                    sess.last_sent_at = Some(now);
+                                }
+                            }
+                            DeviceSyncCommand::Solid { color } => {
+                                let interval_ok = sess
+                                    .last_sent_at
+                                    .map(|t| now.saturating_duration_since(t) >= SOLID_MIN_INTERVAL)
+                                    .unwrap_or(true);
+                                let changed = sess
+                                    .last_solid
+                                    .map(|prev| rgb_max_diff(prev, color) >= 2)
+                                    .unwrap_or(true);
+                                if interval_ok && changed {
+                                    raw_sends.push((addr, Command::Color(color).to_bytes()));
+                                    sess.last_solid = Some(color);
+                                    sess.last_sent_at = Some(now);
+                                }
+                            }
+                        }
+                    }
+
+                    if rt.preview_enabled {
+                        let due = rt
+                            .last_preview_at
+                            .map(|t| now.saturating_duration_since(t) >= PREVIEW_MIN_INTERVAL)
+                            .unwrap_or(true);
+                        if due {
+                            rt.last_preview_at = Some(now);
+                            rt.preview_dirty = false;
+                            preview_to_emit = Some(out.preview);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (addr, payload) in raw_sends {
+            let _ = self.sock.send_to(&payload, addr).await;
+        }
+
+        if let Some(preview) = preview_to_emit {
+            self.emit(Event::SyncPreview { preview });
+        }
+
+        if let Some(done) = finished_identify {
+            if let Some(snap) = done.restore_after {
+                self.restore_device_snapshot(&done.device_id, done.ip, done.uses_razer, snap)
+                    .await;
+            }
+        }
     }
 
     async fn handle(&self, bytes: &[u8], src: SocketAddr) {
@@ -879,7 +1609,8 @@ impl Inner {
             e.missed_polls = 0;
             (e.device.clone(), needs_status)
         };
-        if store.upsert_known(KnownDevice { id: dev.id.clone(), ip, sku: dev.sku.clone() }) {
+        let is_new_known = store.upsert_known(KnownDevice { id: dev.id.clone(), ip, sku: dev.sku.clone() });
+        if is_new_known {
             if let Err(e) = store.save() {
                 warn!(error = %e, "failed to save config");
             }
@@ -887,14 +1618,37 @@ impl Inner {
         drop(store);
         let label = Some(format!("{} ({})", dev.name, dev.sku));
         self.log("rx", src.to_string(), label, raw, false).await;
-        self.emit(Event::DeviceUpdated { device: dev });
+        self.emit(Event::DeviceUpdated { device: dev.clone() });
+        if is_new_known {
+            let status = self.current_sync_status().await;
+            self.emit(Event::SyncChanged { status });
+        }
         if needs_status {
-            let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+            let is_synced = self.sync_rt.lock().await.sessions.contains_key(&dev.id);
+            if !is_synced {
+                let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+            }
         }
     }
 
     async fn on_status(&self, st: StatusInfo, src: SocketAddr, raw: String) {
         let IpAddr::V4(ip) = src.ip() else { return };
+        // Ignore color=(0,0,0) status replies from lights currently in Razer streaming mode.
+        {
+            let synced_match = {
+                let rt = self.sync_rt.lock().await;
+                rt.sessions.values().any(|s| s.ip == ip)
+            };
+            if synced_match {
+                let mut devices = self.devices.write().await;
+                for e in devices.values_mut().filter(|e| e.device.ip == ip) {
+                    e.device.online = true;
+                    e.last_seen = Some(Instant::now());
+                    e.missed_polls = 0;
+                }
+                return;
+            }
+        }
         let next = DeviceState {
             on: st.on_off == 1,
             brightness: st.brightness,
@@ -1050,6 +1804,75 @@ async fn rescan_loop(inner: Arc<Inner>) {
             debug!(error = %e, "rescan failed");
         }
     }
+}
+
+async fn sync_loop(inner: Arc<Inner>) {
+    let mut pkt_buf = Vec::with_capacity(256);
+    loop {
+        // Sleep completely idle until Screen Sync or an Identify sweep is active.
+        let running = {
+            let rt = inner.sync_rt.lock().await;
+            rt.active || rt.identify.is_some() || (rt.preview_enabled && rt.preview_dirty && rt.frame.is_some())
+        };
+        if !running {
+            inner.sync_notify.notified().await;
+            continue;
+        }
+
+        let mut tick = tokio::time::interval(SYNC_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = Instant::now();
+        loop {
+            tick.tick().await;
+            let keep_going = {
+                let rt = inner.sync_rt.lock().await;
+                rt.active || rt.identify.is_some()
+            };
+            let now = Instant::now();
+            let dt = now.saturating_duration_since(last).as_secs_f32().clamp(0.005, 0.25);
+            last = now;
+            inner.sync_tick(dt, &mut pkt_buf).await;
+            if !keep_going {
+                break;
+            }
+        }
+    }
+}
+
+fn snapshot_for_device(dev: &Device) -> DeviceState {
+    if let Some(s) = dev.state {
+        if s.kelvin == 0 && s.color == Rgb::new(0, 0, 0) {
+            // If the light was running a built-in scene, fall back to its remembered colour or warm white.
+            if let Some(c) = dev.last_color {
+                return DeviceState { color: c, ..s };
+            }
+            if let Some(k) = dev.last_kelvin {
+                return DeviceState { kelvin: k, ..s };
+            }
+        }
+        return s;
+    }
+    DeviceState {
+        on: false,
+        brightness: 80,
+        color: dev.last_color.unwrap_or(Rgb::new(255, 180, 100)),
+        kelvin: dev.last_kelvin.unwrap_or(0),
+    }
+}
+
+fn rgb_max_diff(a: Rgb, b: Rgb) -> u8 {
+    a.r.abs_diff(b.r).max(a.g.abs_diff(b.g)).max(a.b.abs_diff(b.b))
+}
+
+fn slice_color_diff(a: &[Rgb], b: &[Rgb]) -> u8 {
+    if a.len() != b.len() {
+        return u8::MAX;
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| rgb_max_diff(x, y))
+        .max()
+        .unwrap_or(0)
 }
 
 fn bind_socket(addr: SocketAddr) -> io::Result<UdpSocket> {

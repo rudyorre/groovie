@@ -3,6 +3,7 @@
 //! can address devices without waiting for discovery.
 
 use crate::model::{Group, Scene};
+use crate::sync::SyncConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -25,6 +26,8 @@ pub struct StoreData {
     pub groups: Vec<Group>,
     pub scenes: Vec<Scene>,
     pub known_devices: Vec<KnownDevice>,
+    #[serde(default, skip_serializing_if = "SyncConfig::is_default")]
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug)]
