@@ -55,10 +55,13 @@ async fn list_devices(s: State<'_, AppState>) -> R<Vec<Device>> {
 
 #[tauri::command]
 async fn discover(app: AppHandle, s: State<'_, AppState>) -> R<()> {
-    // If startup failed because the port was busy, Retry comes through here.
+    // If startup failed because the port was busy (or an update was cancelled), Retry comes through here.
     if s.0.read().await.is_err() {
         let g = start_engine(&app).await?;
         *s.0.write().await = Ok(g);
+        if app.tray_by_id("main").is_none() {
+            let _ = build_tray(&app);
+        }
         let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
         return Ok(());
     }
@@ -256,6 +259,22 @@ fn open_github() -> R<()> {
     Ok(())
 }
 
+#[tauri::command]
+async fn prepare_update_install(app: AppHandle, s: State<'_, AppState>, before_install: bool) -> R<()> {
+    // On Windows, `Update::install()` spawns the installer and exits the process
+    // immediately (`std::process::exit(0)`), so UDP port 4002 and the tray icon
+    // must be cleaned up *before* `install()` runs.
+    // On macOS and Linux, `install()` returns to JS (and `.deb` prompts via `pkexec`
+    // first), so teardown happens *after* `install()` right before `relaunch()`.
+    if before_install == cfg!(windows) {
+        *s.0.write().await = Err("restarting to finish update".into());
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        remove_tray_icon(&app);
+    }
+    Ok(())
+}
+
 fn open_directory(dir: &std::path::Path) -> R<()> {
     #[cfg(target_os = "windows")]
     {
@@ -302,6 +321,53 @@ fn all_power(app: &AppHandle, on: bool) {
     });
 }
 
+fn remove_tray_icon(app: &AppHandle) {
+    if let Some(tray) = app.remove_tray_by_id("main") {
+        let _ = tray.set_visible(false);
+    }
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    // Tray icon: left-click opens Groovie; right-click opens the menu.
+    let on = MenuItem::with_id(app, "on", "All on", true, None::<&str>)?;
+    let off = MenuItem::with_id(app, "off", "All off", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show Groovie", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&on, &off, &show, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("Groovie")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .on_menu_event(|app, ev| match ev.id.as_ref() {
+            "on" => all_power(app, true),
+            "off" => all_power(app, false),
+            "show" => show_main(app),
+            "quit" => {
+                if let Ok(mut guard) = app.state::<AppState>().0.try_write() {
+                    *guard = Err("quitting".into());
+                }
+                remove_tray_icon(app);
+                app.exit(0);
+            }
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         // Must come first: if Groovie is already running in the tray, focus its
@@ -318,38 +384,7 @@ fn main() {
             let handle = app.handle().clone();
             let initial = tauri::async_runtime::block_on(start_engine(&handle));
             app.manage(AppState(RwLock::new(initial)));
-
-            // Tray icon: left-click opens Groovie; right-click opens the menu.
-            let on = MenuItem::with_id(app, "on", "All on", true, None::<&str>)?;
-            let off = MenuItem::with_id(app, "off", "All off", true, None::<&str>)?;
-            let show = MenuItem::with_id(app, "show", "Show Groovie", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&on, &off, &show, &quit])?;
-            let mut tray = TrayIconBuilder::with_id("main")
-                .tooltip("Groovie")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_main(tray.app_handle());
-                    }
-                })
-                .on_menu_event(|app, ev| match ev.id.as_ref() {
-                    "on" => all_power(app, true),
-                    "off" => all_power(app, false),
-                    "show" => show_main(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            tray.build(app)?;
+            build_tray(&handle)?;
             Ok(())
         })
         // Closing the window keeps Groovie in the tray; use the tray's Quit to exit.
@@ -393,6 +428,7 @@ fn main() {
             set_config_path,
             open_config_folder,
             open_github,
+            prepare_update_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Groovie");

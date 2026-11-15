@@ -1,8 +1,10 @@
 name: Release
 
-# Push a tag like `v0.2.0` (matching the version in apps/desktop/src-tauri/tauri.conf.json)
-# to publish a GitHub Release. Installed copies of Groovie pick it up automatically
-# via latest.json.
+# Push a tag like `v0.2.6` (matching the version in Cargo.toml and
+# apps/desktop/src-tauri/tauri.conf.json) to publish an atomic GitHub Release:
+#   1. `create-release` verifies versions and opens a hidden draft release.
+#   2. `build` compiles desktop installers + `grooviectl` CLI on all 3 OSes in parallel.
+#   3. `publish-release` builds `latest.json` once, verifies every asset, and flips draft=false.
 on:
   push:
     tags: ['v*']
@@ -10,16 +12,69 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  release:
-    name: Release (${{ matrix.name }})
+  create-release:
+    name: Prepare draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify version parity across manifests
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          EXPECTED="${TAG#v}"
+          TAURI_VER=$(jq -r '.version' apps/desktop/src-tauri/tauri.conf.json)
+          DESKTOP_CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/desktop/src-tauri/Cargo.toml | head -n1)
+          WORKSPACE_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "$EXPECTED" != "$TAURI_VER" ] || [ "$EXPECTED" != "$DESKTOP_CARGO_VER" ] || [ "$EXPECTED" != "$WORKSPACE_VER" ]; then
+            echo "::error::Tag '$TAG' disagrees with manifests (tauri.conf.json=$TAURI_VER, src-tauri/Cargo.toml=$DESKTOP_CARGO_VER, Cargo.toml=$WORKSPACE_VER)"
+            exit 1
+          fi
+      - name: Create or reuse draft GitHub Release
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          NOTES="Download the installer for your system below (\`grooviectl-*\` archives contain the standalone CLI). Already have Groovie? It will offer this update automatically."
+          if VIEW=$(gh release view "$TAG" --json databaseId,isDraft 2>/dev/null); then
+            IS_DRAFT=$(printf '%s' "$VIEW" | jq -r '.isDraft')
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "::error::Release $TAG is already published; bump the version to cut a new release."
+              exit 1
+            fi
+            RELEASE_ID=$(printf '%s' "$VIEW" | jq -r '.databaseId')
+          else
+            PRERELEASE_FLAG=()
+            if [[ "$TAG" == *-* ]]; then
+              PRERELEASE_FLAG=(--prerelease)
+            fi
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --title "Groovie $TAG" \
+              --notes "$NOTES" \
+              "${PRERELEASE_FLAG[@]}"
+            RELEASE_ID=$(gh release view "$TAG" --json databaseId -q '.databaseId')
+          fi
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows
             os: windows-latest
-            args: ''
+            args: --bundles nsis
           - name: macOS
             os: macos-latest
             args: --target universal-apple-darwin
@@ -40,7 +95,39 @@ jobs:
           targets: ${{ matrix.rust-targets }}
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: apps/desktop/src-tauri
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+      - name: Build and upload grooviectl CLI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "${{ runner.os }}" in
+            Windows)
+              cargo build --release --locked -p grooviectl
+              7z a -tzip grooviectl-windows-x64.zip ./target/release/grooviectl.exe
+              ASSET=grooviectl-windows-x64.zip
+              ;;
+            macOS)
+              cargo build --release --locked -p grooviectl --target aarch64-apple-darwin
+              cargo build --release --locked -p grooviectl --target x86_64-apple-darwin
+              mkdir -p dist-cli
+              lipo -create -output dist-cli/grooviectl \
+                target/aarch64-apple-darwin/release/grooviectl \
+                target/x86_64-apple-darwin/release/grooviectl
+              chmod +x dist-cli/grooviectl
+              tar -C dist-cli -czf grooviectl-macos-universal.tar.gz grooviectl
+              ASSET=grooviectl-macos-universal.tar.gz
+              ;;
+            Linux)
+              cargo build --release --locked -p grooviectl
+              tar -C target/release -czf grooviectl-linux-x64.tar.gz grooviectl
+              ASSET=grooviectl-linux-x64.tar.gz
+              ;;
+          esac
+          gh release upload "$TAG" "$ASSET" --clobber
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -57,10 +144,29 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: Groovie ${{ github.ref_name }}
-          releaseBody: Download the installer for your system below. Already have Groovie? It will offer this update automatically.
-          releaseDraft: false
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          uploadUpdaterJson: false
           args: ${{ matrix.args }}
+
+  publish-release:
+    name: Generate latest.json & publish
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Generate and upload latest.json, then publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          node .github/scripts/generate-latest-json.mjs
+          gh release upload "$TAG" latest.json --clobber
+          if [[ "$TAG" == *-* ]]; then
+            gh release edit "$TAG" --draft=false
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi

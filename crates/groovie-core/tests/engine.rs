@@ -419,3 +419,18 @@ async fn remembers_last_kelvin_and_color_across_mode_switches() {
     assert_eq!(dev.last_color, Some(indigo));
     assert_eq!(dev.last_kelvin, Some(2700), "Colour mode must not clear remembered Kelvin");
 }
+
+#[tokio::test]
+async fn dropping_engine_releases_udp_port_immediately() {
+    let mut cfg = config(14, 41130, 0, None);
+    cfg.scan_targets.clear();
+
+    let first = Groovie::start(cfg.clone()).await.unwrap();
+    assert!(Groovie::start(cfg.clone()).await.is_err());
+
+    drop(first);
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let _restarted = Groovie::start(cfg).await.expect("dropped engine must release UDP port for relaunch");
+}

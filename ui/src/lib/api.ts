@@ -74,7 +74,15 @@ export interface Api {
   checkUpdate(): Promise<Update | null>;
 }
 
-export type Update = { version: string; install: () => Promise<void> };
+export type UpdateProgress =
+  | { stage: 'downloading'; percent: number | null }
+  | { stage: 'installing' }
+  | { stage: 'restarting' };
+
+export type Update = {
+  version: string;
+  install: (onProgress?: (p: UpdateProgress) => void) => Promise<void>;
+};
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -116,8 +124,32 @@ async function tauriApi(): Promise<Api> {
       if (!u) return null;
       return {
         version: u.version,
-        async install() {
-          await u.downloadAndInstall();
+        async install(onProgress) {
+          let total: number | undefined;
+          let received = 0;
+          onProgress?.({ stage: 'downloading', percent: null });
+          await u.download((ev) => {
+            if (ev.event === 'Started') {
+              total = ev.data.contentLength;
+              onProgress?.({ stage: 'downloading', percent: total ? 0 : null });
+            } else if (ev.event === 'Progress') {
+              received += ev.data.chunkLength;
+              const percent = total ? Math.min(100, Math.round((received / total) * 100)) : null;
+              onProgress?.({ stage: 'downloading', percent });
+            } else if (ev.event === 'Finished') {
+              onProgress?.({ stage: 'downloading', percent: 100 });
+            }
+          });
+          onProgress?.({ stage: 'installing' });
+          await invoke('prepare_update_install', { beforeInstall: true });
+          try {
+            await u.install();
+          } catch (e) {
+            await invoke('discover').catch(() => {});
+            throw e;
+          }
+          onProgress?.({ stage: 'restarting' });
+          await invoke('prepare_update_install', { beforeInstall: false });
           const { relaunch } = await import('@tauri-apps/plugin-process');
           await relaunch();
         },

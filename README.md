@@ -40,9 +40,10 @@
 
 Grab the latest installer from [**Releases**](https://github.com/rudyorre/groovie/releases/latest):
 
-- **Windows:** `Groovie_x.y.z_x64-setup.exe` (or `.msi`)
+- **Windows:** `Groovie_x.y.z_x64-setup.exe`
 - **macOS:** `Groovie_x.y.z_universal.dmg` (Apple Silicon & Intel)
 - **Linux:** `Groovie_x.y.z_amd64.AppImage` or `.deb`
+- **`grooviectl` CLI (optional):** `grooviectl-windows-x64.zip`, `grooviectl-macos-universal.tar.gz`, `grooviectl-linux-x64.tar.gz`
 
 **In-app updates:** when a new release is published, Groovie shows an **Update** button in the sidebar that downloads, verifies, installs, and relaunches in one click.
 
@@ -58,6 +59,8 @@ Each light must join your Wi-Fi once in the official Govee Home app. Then open t
 Tested hardware includes `H6072` (Floor Lamp) and `H6056` (Light Bars); most Wi-Fi Govee lights with a **LAN Control** toggle work out of the box.
 
 ## Command line
+
+Download the `grooviectl-*` archive for your OS from [**Releases**](https://github.com/rudyorre/groovie/releases/latest) (or build from source with `cargo install --path crates/grooviectl`) and place `grooviectl` on your `PATH`:
 
 ```sh
 grooviectl list                           # discover lights and print status

@@ -11,6 +11,7 @@
     type Scene,
     type Target,
     type Update,
+    type UpdateProgress,
   } from './lib/api';
   import DeviceCard from './lib/DeviceCard.svelte';
   import Icon from './lib/Icon.svelte';
@@ -24,7 +25,7 @@
   let startupError = $state('');
   let version = $state('');
   let update = $state<Update | null>(null);
-  let updating = $state(false);
+  let updateProgress = $state<UpdateProgress | null>(null);
 
   // Dialogs / inline editors
   let editing = $state<Group | null>(null); // id '' = new group
@@ -50,6 +51,21 @@
   const target = $derived<Target>(group ? { type: 'group', id: group.id } : { type: 'all' });
   const onCount = $derived(shown.filter((d) => d.online && d.state?.on).length);
   const shownLogs = $derived(hidePolls ? logs.filter((l) => !l.poll) : logs);
+  const updating = $derived(updateProgress !== null);
+  const updatePct = $derived(
+    updateProgress?.stage === 'downloading' ? (updateProgress.percent ?? 15) : updateProgress ? 100 : 0,
+  );
+  const updateLabel = $derived(
+    !updateProgress
+      ? `Update to ${update?.version ?? ''}`
+      : updateProgress.stage === 'downloading'
+        ? updateProgress.percent !== null
+          ? `Downloading ${updateProgress.percent}%`
+          : 'Downloading…'
+        : updateProgress.stage === 'installing'
+          ? 'Installing…'
+          : 'Restarting…',
+  );
 
   let toastTimer: ReturnType<typeof setTimeout>;
   function showToast(msg: string) {
@@ -82,7 +98,7 @@
     let off = () => {};
     let lastUpdateCheck = 0;
     const maybeCheckUpdate = async () => {
-      if (update || Date.now() - lastUpdateCheck < 60_000) return;
+      if (update || updating || Date.now() - lastUpdateCheck < 60_000) return;
       lastUpdateCheck = Date.now();
       const a = await api;
       update = await a.checkUpdate().catch(() => null);
@@ -294,12 +310,14 @@
   }
 
   async function installUpdate() {
-    if (!update) return;
-    updating = true;
+    if (!update || updating) return;
+    updateProgress = { stage: 'downloading', percent: null };
     try {
-      await update.install();
+      await update.install((p) => {
+        updateProgress = p;
+      });
     } catch (e) {
-      updating = false;
+      updateProgress = null;
       showToast(`Update failed: ${e}`);
     }
   }
@@ -369,9 +387,16 @@
 
     <footer>
       {#if update}
-        <button class="update" onclick={installUpdate} disabled={updating}>
-          <Icon name="download" size={14} />
-          {updating ? 'Updating…' : `Update to ${update.version}`}
+        <button
+          class="update"
+          class:busy={updating}
+          class:spin={updateProgress !== null && updateProgress.stage !== 'downloading'}
+          style:--pct="{updatePct}%"
+          onclick={installUpdate}
+          disabled={updating}
+        >
+          <Icon name={updateProgress && updateProgress.stage !== 'downloading' ? 'refresh' : 'download'} size={14} />
+          <span>{updateLabel}</span>
         </button>
       {/if}
       <div class="foot-row">
@@ -737,11 +762,35 @@
     color: var(--text-3);
   }
   .update {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
     justify-content: center;
     background: var(--accent);
     border-color: var(--accent);
     color: #1a1204;
     font-weight: 550;
+    font-variant-numeric: tabular-nums;
+  }
+  .update:hover:not(:disabled) {
+    background: var(--accent);
+    border-color: var(--accent);
+    filter: brightness(1.05);
+  }
+  .update.busy:disabled {
+    opacity: 1;
+    background: var(--surface-2);
+    border-color: #ffb02066;
+    color: var(--text);
+  }
+  .update.busy::before {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: -1;
+    width: var(--pct, 0%);
+    background: #ffb02038;
+    transition: width 0.15s ease-out;
   }
 
   main { overflow-y: auto; padding: 22px 28px 40px; }
