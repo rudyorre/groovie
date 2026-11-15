@@ -22,7 +22,7 @@ fn err(e: impl std::fmt::Display) -> String {
 async fn start_engine(app: &AppHandle) -> R<Groovie> {
     let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
     let mut rx = groovie.subscribe();
-    let handle = app.handle().clone();
+    let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
