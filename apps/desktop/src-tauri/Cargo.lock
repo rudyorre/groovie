@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "groovie-core"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "if-addrs",
  "serde",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "groovie-desktop"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "groovie-core",
  "serde",

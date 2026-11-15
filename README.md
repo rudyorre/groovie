@@ -32,6 +32,7 @@
 - **Direct control:** power, brightness, RGB colour, and white colour temperature (`2000K–9000K`)
 - **Two-way LAN sync:** changes made in the Govee mobile app sync back automatically without cloud polling
 - **Groups & scenes:** control rooms together (e.g. "Desk") and snapshot saved looks (e.g. "Evening")
+- **Screen Sync (Windows):** low-latency 2D spatial display sync with per-segment & split-bar RGBIC streaming, Oklab smoothing, and automatic letterbox cropping
 - **Lightweight tray app + CLI:** native Tauri desktop app for Windows, macOS, and Linux, plus `grooviectl` for scripts and keybindings
 
 > Groovie is an independent open-source project and is not affiliated with or endorsed by Govee.
