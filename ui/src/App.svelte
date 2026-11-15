@@ -9,17 +9,23 @@
     type Group,
     type LogEntry,
     type Scene,
+    type SyncConfig,
+    type SyncPreview,
+    type SyncState,
     type Target,
     type Update,
     type UpdateProgress,
   } from './lib/api';
   import DeviceCard from './lib/DeviceCard.svelte';
   import Icon from './lib/Icon.svelte';
+  import ScreenSyncView from './lib/ScreenSyncView.svelte';
 
   let devices = $state<Device[]>([]);
   let groups = $state<Group[]>([]);
   let scenes = $state<Scene[]>([]);
-  /** 'all' or a group id */
+  let syncState = $state<SyncState | null>(null);
+  let syncPreview = $state<SyncPreview | null>(null);
+  /** 'all', 'sync', or a group id */
   let view = $state('all');
   let toast = $state('');
   let startupError = $state('');
@@ -85,12 +91,35 @@
   async function reload() {
     try {
       const a = await api;
-      [devices, groups, scenes] = await Promise.all([a.listDevices(), a.listGroups(), a.listScenes()]);
+      [devices, groups, scenes, syncState] = await Promise.all([
+        a.listDevices(),
+        a.listGroups(),
+        a.listScenes(),
+        a.getSyncState(),
+      ]);
       startupError = '';
-      if (view !== 'all' && !groups.some((g) => g.id === view)) view = 'all';
+      if (view === 'sync' && !syncState.supported) view = 'all';
+      else if (view !== 'all' && view !== 'sync' && !groups.some((g) => g.id === view)) view = 'all';
     } catch (e) {
       startupError = String(e);
     }
+  }
+
+  async function toggleSync(enabled: boolean) {
+    const next = await run((a) => a.setSyncEnabled(enabled));
+    if (next) {
+      syncState = next;
+      if (!next.active) syncPreview = null;
+    }
+  }
+
+  async function updateSyncCfg(nextCfg: SyncConfig) {
+    const next = await run((a) => a.updateSyncConfig(nextCfg));
+    if (next) syncState = next;
+  }
+
+  async function identifyPlacement(placementId: string) {
+    await run((a) => a.identifySyncPlacement(placementId));
   }
 
   onMount(() => {
@@ -119,6 +148,11 @@
           const i = devices.findIndex((d) => d.id === e.device.id);
           if (i >= 0) devices[i] = e.device;
           else devices = [...devices, e.device].sort((x, y) => x.name.localeCompare(y.name));
+        } else if (e.type === 'syncChanged') {
+          syncState = { supported: syncState?.supported ?? false, ...e.status };
+          if (!e.status.active) syncPreview = null;
+        } else if (e.type === 'syncPreview') {
+          syncPreview = e.preview;
         } else if (e.type === 'configChanged') {
           reload();
           if (configOpen) {
@@ -338,6 +372,22 @@
         <Icon name="grid" /> <span>All lights</span> <small>{devices.length}</small>
       </button>
 
+      {#if syncState?.supported}
+        <div class="sync-nav" class:active={view === 'sync'} class:live={syncState.active}>
+          <button class="nav-item" onclick={() => (view = 'sync')}>
+            <Icon name="monitor" /> <span>Screen sync</span>
+          </button>
+          <label class="switch nav-switch" title={syncState.active ? 'Stop screen sync' : 'Start screen sync'}>
+            <input
+              type="checkbox"
+              checked={syncState.active}
+              onchange={(e) => toggleSync(e.currentTarget.checked)}
+            />
+            <span></span>
+          </label>
+        </div>
+      {/if}
+
       <div class="section">
         <span>Groups</span>
         <button class="ghost icon-btn" title="New group" onclick={() => (editing = { id: '', name: '', members: [] })}>
@@ -431,53 +481,77 @@
   </aside>
 
   <main>
-    <header>
-      <div>
-        <h1>{group?.name ?? 'All lights'}</h1>
-        <p class="sub">
-          {shown.length} {shown.length === 1 ? 'light' : 'lights'}{#if shown.length}{' · '}{onCount} on{/if}
-        </p>
-      </div>
-      <div class="actions">
-        {#if group}
-          <button class="ghost" onclick={() => (editing = structuredClone($state.snapshot(group)))}>
-            <Icon name="pencil" size={14} /> Edit group
-          </button>
-        {/if}
-        <button class="ghost icon-btn" title="Add light by IP" onclick={() => (addingLight = true)}><Icon name="plus" /></button>
-        <button class="ghost icon-btn" class:spin={scanning} title="Search for lights" onclick={rescan}><Icon name="refresh" /></button>
-        <button onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))} disabled={!shown.length}>
-          <Icon name="power" size={14} /> {onCount ? 'All off' : 'All on'}
-        </button>
-      </div>
-    </header>
-
-    {#if startupError}
-      <div class="banner" role="alert">
+    {#if view === 'sync' && syncState?.supported}
+      {#if startupError}
+        <div class="banner" role="alert">
+          <div>
+            <strong>Could not start local network listener</strong>
+            <p>{startupError}</p>
+          </div>
+          <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+        </div>
+      {/if}
+      <ScreenSyncView
+        {devices}
+        {syncState}
+        preview={syncPreview}
+        onToggleSync={toggleSync}
+        onUpdateConfig={updateSyncCfg}
+        onIdentify={identifyPlacement}
+      />
+    {:else}
+      <header>
         <div>
-          <strong>Could not start local network listener</strong>
-          <p>{startupError}</p>
+          <h1>{group?.name ?? 'All lights'}</h1>
+          <p class="sub">
+            {shown.length} {shown.length === 1 ? 'light' : 'lights'}{#if shown.length}{' · '}{onCount} on{/if}
+          </p>
         </div>
-        <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
-      </div>
-    {/if}
-
-    <section class="grid">
-      {#each shown as d (d.id)}
-        <DeviceCard device={d} />
-      {:else}
-        <div class="empty">
+        <div class="actions">
           {#if group}
-            <p class="empty-title">This group is empty</p>
-            <p>Use <b>Edit group</b> to choose which lights belong here.</p>
-          {:else}
-            <p class="empty-title">Looking for lights…</p>
-            <p>Turn on <b>LAN Control</b> for each light in the Govee app (device settings), and make sure this
-              computer is on the same Wi‑Fi. You can also add a light by its IP address with <b>+</b>.</p>
+            <button class="ghost" onclick={() => (editing = structuredClone($state.snapshot(group)))}>
+              <Icon name="pencil" size={14} /> Edit group
+            </button>
           {/if}
+          <button class="ghost icon-btn" title="Add light by IP" onclick={() => (addingLight = true)}><Icon name="plus" /></button>
+          <button class="ghost icon-btn" class:spin={scanning} title="Search for lights" onclick={rescan}><Icon name="refresh" /></button>
+          <button onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))} disabled={!shown.length}>
+            <Icon name="power" size={14} /> {onCount ? 'All off' : 'All on'}
+          </button>
         </div>
-      {/each}
-    </section>
+      </header>
+
+      {#if startupError}
+        <div class="banner" role="alert">
+          <div>
+            <strong>Could not start local network listener</strong>
+            <p>{startupError}</p>
+          </div>
+          <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+        </div>
+      {/if}
+
+      <section class="grid">
+        {#each shown as d (d.id)}
+          <DeviceCard
+            device={d}
+            syncing={Boolean(syncState?.active && syncState.activeDevices.includes(d.id))}
+            onOpenSync={() => (view = 'sync')}
+          />
+        {:else}
+          <div class="empty">
+            {#if group}
+              <p class="empty-title">This group is empty</p>
+              <p>Use <b>Edit group</b> to choose which lights belong here.</p>
+            {:else}
+              <p class="empty-title">Looking for lights…</p>
+              <p>Turn on <b>LAN Control</b> for each light in the Govee app (device settings), and make sure this
+                computer is on the same Wi‑Fi. You can also add a light by its IP address with <b>+</b>.</p>
+            {/if}
+          </div>
+        {/each}
+      </section>
+    {/if}
   </main>
 </div>
 
@@ -724,6 +798,30 @@
   .nav-item:hover { background: var(--hover); color: var(--text); }
   .nav-item.active { background: var(--active); color: var(--text); }
   .nav-item:focus-visible { outline: 2px solid var(--focus); }
+
+  .sync-nav {
+    display: flex;
+    align-items: center;
+    border-radius: 7px;
+    padding-right: 7px;
+  }
+  .sync-nav:hover { background: var(--hover); }
+  .sync-nav:hover .nav-item { background: transparent; color: var(--text); }
+  .sync-nav.active { background: var(--active); }
+  .sync-nav.active .nav-item { background: transparent; color: var(--text); }
+  .sync-nav.live :global(svg) { color: var(--accent); }
+  .nav-switch {
+    width: 30px;
+    height: 18px;
+  }
+  .nav-switch span { border-radius: 9px; }
+  .nav-switch span::before {
+    width: 14px;
+    height: 14px;
+    left: 2px;
+    top: 2px;
+  }
+  .nav-switch input:checked + span::before { transform: translateX(12px); }
 
   .section {
     display: flex;

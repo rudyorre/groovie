@@ -17,10 +17,12 @@ pub mod engine;
 pub mod model;
 pub mod protocol;
 pub mod store;
+pub mod sync;
 
 pub use engine::{Config, Error, Groovie, Result};
 pub use model::*;
 pub use protocol::Rgb;
+pub use sync::*;
 
 impl Config {
     /// Apply developer overrides from the environment, handy for pointing the

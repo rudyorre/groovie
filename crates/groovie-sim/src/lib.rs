@@ -50,6 +50,10 @@ pub struct SimDevice {
     pub state: Arc<Mutex<DeviceState>>,
     /// Every command received, in order (excluding scans).
     pub received: Arc<Mutex<Vec<Command>>>,
+    /// True while the device is in `cmd: "razer"` streaming mode.
+    pub razer_enabled: Arc<Mutex<bool>>,
+    /// Most recent per-segment colors streamed via `Command::RazerFrame`.
+    pub last_razer_frame: Arc<Mutex<Option<Vec<Rgb>>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -65,6 +69,8 @@ impl SimDevice {
     pub async fn spawn(config: SimConfig) -> std::io::Result<Self> {
         let state = Arc::new(Mutex::new(DeviceState::default()));
         let received = Arc::new(Mutex::new(Vec::new()));
+        let razer_enabled = Arc::new(Mutex::new(false));
+        let last_razer_frame = Arc::new(Mutex::new(None));
 
         let scan_sock = if config.multicast {
             let s = reusable_socket(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.scan_port)))?;
@@ -72,7 +78,7 @@ impl SimDevice {
             s
         } else {
             UdpSocket::bind((config.ip, config.scan_port)).await?
-        };
+        } ;
         let cmd_sock = Arc::new(UdpSocket::bind((config.ip, config.command_port)).await?);
 
         let scan_task = {
@@ -99,8 +105,10 @@ impl SimDevice {
             let cfg = config.clone();
             let state = state.clone();
             let received = received.clone();
+            let razer_enabled = razer_enabled.clone();
+            let last_razer_frame = last_razer_frame.clone();
             tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
+                let mut buf = [0u8; 4096];
                 loop {
                     let Ok((n, src)) = cmd_sock.recv_from(&mut buf).await else { continue };
                     let Ok(cmd) = parse_command(&buf[..n]) else { continue };
@@ -108,7 +116,12 @@ impl SimDevice {
                     let reply = {
                         let mut s = state.lock().unwrap();
                         match &cmd {
-                            Command::Turn(on) => s.on = *on,
+                            Command::Turn(on) => {
+                                s.on = *on;
+                                if !*on {
+                                    *razer_enabled.lock().unwrap() = false;
+                                }
+                            }
                             Command::Brightness(b) => s.brightness = *b,
                             Command::Color(c) => {
                                 s.color = *c;
@@ -117,6 +130,19 @@ impl SimDevice {
                             Command::ColorTemp(k) => {
                                 s.kelvin = *k;
                                 s.color = Rgb::new(255, 255, 255);
+                            }
+                            Command::RazerEnable(en) => {
+                                *razer_enabled.lock().unwrap() = *en;
+                                if *en {
+                                    // Like real hardware in effect/Razer mode, devStatus reports (0,0,0), kelvin 0.
+                                    s.color = Rgb::new(0, 0, 0);
+                                    s.kelvin = 0;
+                                }
+                            }
+                            Command::RazerFrame { colors, .. } => {
+                                if *razer_enabled.lock().unwrap() {
+                                    *last_razer_frame.lock().unwrap() = Some(colors.clone());
+                                }
                             }
                             Command::Scan | Command::DevStatus => {}
                         }
@@ -139,7 +165,14 @@ impl SimDevice {
             })
         };
 
-        Ok(Self { config, state, received, tasks: vec![scan_task, cmd_task] })
+        Ok(Self {
+            config,
+            state,
+            received,
+            razer_enabled,
+            last_razer_frame,
+            tasks: vec![scan_task, cmd_task],
+        })
     }
 
     pub fn state(&self) -> DeviceState {
@@ -148,6 +181,14 @@ impl SimDevice {
 
     pub fn received(&self) -> Vec<Command> {
         self.received.lock().unwrap().clone()
+    }
+
+    pub fn is_razer_enabled(&self) -> bool {
+        *self.razer_enabled.lock().unwrap()
+    }
+
+    pub fn last_razer_frame(&self) -> Option<Vec<Rgb>> {
+        self.last_razer_frame.lock().unwrap().clone()
     }
 }
 

@@ -1,10 +1,17 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use groovie_core::{Action, Config, ConfigInfo, Device, Group, Groovie, LogEntry, Scene, Target};
+mod capture;
+
+use capture::CaptureManager;
+use groovie_core::{
+    Action, Config, ConfigInfo, Device, DisplayInfo, Group, Groovie, LogEntry, Scene, SyncConfig,
+    SyncStatus, Target,
+};
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 use std::time::Duration;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
@@ -18,6 +25,28 @@ const GITHUB_URL: &str = "https://github.com/rudyorre/groovie";
 /// Holds the running engine, or the startup error if UDP port 4002 was busy so
 /// the window can still open and tell the user what's holding it.
 struct AppState(RwLock<Result<Groovie, String>>);
+
+struct TraySyncItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncStatePayload {
+    supported: bool,
+    active: bool,
+    active_devices: Vec<String>,
+    config: SyncConfig,
+}
+
+impl SyncStatePayload {
+    fn from_status(st: SyncStatus) -> Self {
+        Self {
+            supported: CaptureManager::is_supported(),
+            active: st.active,
+            active_devices: st.active_devices,
+            config: st.config,
+        }
+    }
+}
 
 type R<T> = Result<T, String>;
 
@@ -34,6 +63,14 @@ async fn start_engine(app: &AppHandle) -> R<Groovie> {
         loop {
             match rx.recv().await {
                 Ok(ev) => {
+                    if let groovie_core::Event::SyncChanged { ref status } = ev {
+                        if !status.active {
+                            handle.state::<CaptureManager>().stop();
+                        }
+                        if let Some(item) = handle.state::<TraySyncItem>().0.lock().unwrap().clone() {
+                            let _ = item.set_checked(status.active);
+                        }
+                    }
                     let _ = handle.emit("groovie://event", ev);
                 }
                 Err(RecvError::Lagged(_)) => continue,
@@ -46,6 +83,43 @@ async fn start_engine(app: &AppHandle) -> R<Groovie> {
 
 async fn engine(s: &State<'_, AppState>) -> R<Groovie> {
     s.0.read().await.clone()
+}
+
+async fn shutdown_engine_cleanly(app: &AppHandle, reason: &str) {
+    app.state::<CaptureManager>().stop();
+    let prev = {
+        let state = app.state::<AppState>();
+        let mut guard = state.0.write().await;
+        std::mem::replace(&mut *guard, Err(reason.into()))
+    };
+    if let Ok(g) = prev {
+        g.stop_sync(Some(reason)).await;
+    }
+}
+
+async fn set_or_toggle_sync(app: &AppHandle, desired: Option<bool>) -> R<SyncStatePayload> {
+    let g = app.state::<AppState>().0.read().await.clone()?;
+    let cur = g.sync_status().await;
+    let enable = desired.unwrap_or(!cur.active);
+
+    if enable {
+        if !CaptureManager::is_supported() {
+            return Err("Screen Sync is currently supported on Windows only".into());
+        }
+        app.state::<CaptureManager>()
+            .start(g.clone(), cur.config.display_id.clone())?;
+        match g.start_sync().await {
+            Ok(st) => Ok(SyncStatePayload::from_status(st)),
+            Err(e) => {
+                app.state::<CaptureManager>().stop();
+                Err(err(e))
+            }
+        }
+    } else {
+        app.state::<CaptureManager>().stop();
+        let st = g.stop_sync(Some("stopped")).await;
+        Ok(SyncStatePayload::from_status(st))
+    }
 }
 
 #[tauri::command]
@@ -125,6 +199,58 @@ async fn apply_scene(s: State<'_, AppState>, id: String) -> R<()> {
 #[tauri::command]
 async fn delete_scene(s: State<'_, AppState>, id: String) -> R<()> {
     engine(&s).await?.delete_scene(&id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn get_sync_state(s: State<'_, AppState>) -> R<SyncStatePayload> {
+    match s.0.read().await.clone() {
+        Ok(g) => Ok(SyncStatePayload::from_status(g.sync_status().await)),
+        Err(_) => Ok(SyncStatePayload {
+            supported: CaptureManager::is_supported(),
+            active: false,
+            active_devices: Vec::new(),
+            config: SyncConfig::default(),
+        }),
+    }
+}
+
+#[tauri::command]
+fn list_displays() -> Vec<DisplayInfo> {
+    CaptureManager::list_displays()
+}
+
+#[tauri::command]
+async fn set_sync_enabled(app: AppHandle, enabled: bool) -> R<SyncStatePayload> {
+    set_or_toggle_sync(&app, Some(enabled)).await
+}
+
+#[tauri::command]
+async fn update_sync_config(
+    app: AppHandle,
+    s: State<'_, AppState>,
+    config: SyncConfig,
+) -> R<SyncStatePayload> {
+    let g = engine(&s).await?;
+    let prev = g.sync_status().await;
+    let st = g.update_sync_config(config).await.map_err(err)?;
+    if st.active && st.config.display_id != prev.config.display_id {
+        app.state::<CaptureManager>()
+            .start(g, st.config.display_id.clone())?;
+    }
+    Ok(SyncStatePayload::from_status(st))
+}
+
+#[tauri::command]
+async fn identify_sync_placement(s: State<'_, AppState>, placement_id: String) -> R<()> {
+    engine(&s).await?.identify_sync_placement(&placement_id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_sync_preview(s: State<'_, AppState>, enabled: bool) -> R<()> {
+    if let Ok(g) = s.0.read().await.clone() {
+        g.set_sync_preview(enabled).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -260,14 +386,14 @@ fn open_github() -> R<()> {
 }
 
 #[tauri::command]
-async fn prepare_update_install(app: AppHandle, s: State<'_, AppState>, before_install: bool) -> R<()> {
+async fn prepare_update_install(app: AppHandle, before_install: bool) -> R<()> {
     // On Windows, `Update::install()` spawns the installer and exits the process
-    // immediately (`std::process::exit(0)`), so UDP port 4002 and the tray icon
-    // must be cleaned up *before* `install()` runs.
+    // immediately (`std::process::exit(0)`), so Screen Sync, UDP port 4002, and the
+    // tray icon must be cleaned up *before* `install()` runs.
     // On macOS and Linux, `install()` returns to JS (and `.deb` prompts via `pkexec`
     // first), so teardown happens *after* `install()` right before `relaunch()`.
     if before_install == cfg!(windows) {
-        *s.0.write().await = Err("restarting to finish update".into());
+        shutdown_engine_cleanly(&app, "restarting to finish update").await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(25)).await;
         remove_tray_icon(&app);
@@ -296,6 +422,9 @@ fn update_poll_mode(app: &AppHandle, active: bool, force_sync: bool) {
     tauri::async_runtime::spawn(async move {
         if let Ok(g) = app.state::<AppState>().0.read().await.clone() {
             let changed = g.set_poll_interval(if active { ACTIVE_POLL } else { IDLE_POLL });
+            if !active {
+                g.set_sync_preview(false).await;
+            }
             if active && (force_sync || changed) {
                 g.sync_now().await;
             }
@@ -322,6 +451,7 @@ fn all_power(app: &AppHandle, on: bool) {
 }
 
 fn remove_tray_icon(app: &AppHandle) {
+    *app.state::<TraySyncItem>().0.lock().unwrap() = None;
     if let Some(tray) = app.remove_tray_by_id("main") {
         let _ = tray.set_visible(false);
     }
@@ -333,7 +463,16 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let off = MenuItem::with_id(app, "off", "All off", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show Groovie", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&on, &off, &show, &quit])?;
+
+    let menu = if CaptureManager::is_supported() {
+        let sync_item = CheckMenuItem::with_id(app, "sync", "Screen sync", true, false, None::<&str>)?;
+        let sep = PredefinedMenuItem::separator(app)?;
+        *app.state::<TraySyncItem>().0.lock().unwrap() = Some(sync_item.clone());
+        Menu::with_items(app, &[&sync_item, &sep, &on, &off, &show, &quit])?
+    } else {
+        Menu::with_items(app, &[&on, &off, &show, &quit])?
+    };
+
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("Groovie")
         .menu(&menu)
@@ -349,15 +488,34 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .on_menu_event(|app, ev| match ev.id.as_ref() {
+            "sync" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match set_or_toggle_sync(&app, None).await {
+                        Ok(st) => {
+                            if let Some(item) = app.state::<TraySyncItem>().0.lock().unwrap().clone() {
+                                let _ = item.set_checked(st.active);
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(item) = app.state::<TraySyncItem>().0.lock().unwrap().clone() {
+                                let _ = item.set_checked(false);
+                            }
+                            show_main(&app);
+                        }
+                    }
+                });
+            }
             "on" => all_power(app, true),
             "off" => all_power(app, false),
             "show" => show_main(app),
             "quit" => {
-                if let Ok(mut guard) = app.state::<AppState>().0.try_write() {
-                    *guard = Err("quitting".into());
-                }
-                remove_tray_icon(app);
-                app.exit(0);
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    shutdown_engine_cleanly(&app, "quitting").await;
+                    remove_tray_icon(&app);
+                    app.exit(0);
+                });
             }
             _ => {}
         });
@@ -382,6 +540,8 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
+            app.manage(CaptureManager::new());
+            app.manage(TraySyncItem(Mutex::new(None)));
             let initial = tauri::async_runtime::block_on(start_engine(&handle));
             app.manage(AppState(RwLock::new(initial)));
             build_tray(&handle)?;
@@ -420,6 +580,12 @@ fn main() {
             save_scene,
             apply_scene,
             delete_scene,
+            get_sync_state,
+            list_displays,
+            set_sync_enabled,
+            update_sync_config,
+            identify_sync_placement,
+            set_sync_preview,
             list_logs,
             clear_logs,
             set_window_active,
