@@ -360,6 +360,37 @@ impl StoreData {
             }
         }
     }
+
+    /// Remove every persisted reference to `id` (`known_devices`, `nicknames`,
+    /// `groups[*].members`, `scenes[*].entries`, and `sync.placements`).
+    /// Returns `true` if any stored reference was removed.
+    pub fn forget_device(&mut self, id: &str) -> bool {
+        let mut changed = false;
+
+        let before = self.known_devices.len();
+        self.known_devices.retain(|d| d.id != id);
+        changed |= self.known_devices.len() != before;
+
+        changed |= self.nicknames.remove(id).is_some();
+
+        for g in &mut self.groups {
+            let before = g.members.len();
+            g.members.retain(|m| m != id);
+            changed |= g.members.len() != before;
+        }
+
+        for sc in &mut self.scenes {
+            let before = sc.entries.len();
+            sc.entries.retain(|e| e.device != id);
+            changed |= sc.entries.len() != before;
+        }
+
+        let before = self.sync.placements.len();
+        self.sync.placements.retain(|p| p.device_id != id);
+        changed |= self.sync.placements.len() != before;
+
+        changed
+    }
 }
 
 /// Active default config file location (honoring any custom path pointer).
@@ -496,5 +527,90 @@ mod tests {
             read_desktop_prefs_at(&path),
             Some(StoredDesktopPrefs { start_minimized: true })
         );
+    }
+
+    #[test]
+    fn forget_device_prunes_all_references() {
+        use crate::model::SceneEntry;
+        use crate::protocol::Rgb;
+        use crate::sync::{Orientation, PlacementMode, PlacementPart, SyncPlacement};
+
+        let mut data = StoreData {
+            version: 1,
+            ..Default::default()
+        };
+        data.known_devices.push(KnownDevice {
+            id: "AA".into(),
+            ip: Ipv4Addr::new(10, 0, 0, 10),
+            sku: "H6072".into(),
+        });
+        data.known_devices.push(KnownDevice {
+            id: "BB".into(),
+            ip: Ipv4Addr::new(10, 0, 0, 11),
+            sku: "H6056".into(),
+        });
+        data.nicknames.insert("AA".into(), "Floor Lamp".into());
+        data.nicknames.insert("BB".into(), "Bars".into());
+        data.groups.push(Group {
+            id: "g1".into(),
+            name: "Desk".into(),
+            members: vec!["AA".into(), "BB".into()],
+        });
+        data.scenes.push(Scene {
+            id: "s1".into(),
+            name: "Evening".into(),
+            entries: vec![
+                SceneEntry {
+                    device: "AA".into(),
+                    on: true,
+                    brightness: Some(50),
+                    color: Some(Rgb::new(255, 120, 30)),
+                    kelvin: None,
+                },
+                SceneEntry {
+                    device: "BB".into(),
+                    on: true,
+                    brightness: Some(60),
+                    color: None,
+                    kelvin: Some(3200),
+                },
+            ],
+        });
+        data.sync.placements.push(SyncPlacement {
+            id: "AA".into(),
+            device_id: "AA".into(),
+            part: PlacementPart::Single,
+            excluded: false,
+            x: 1.2,
+            y: 0.5,
+            orientation: Orientation::Vertical,
+            reverse: false,
+            mode: PlacementMode::Segments,
+            segments: 15,
+        });
+        data.sync.placements.push(SyncPlacement {
+            id: "BB#A".into(),
+            device_id: "BB".into(),
+            part: PlacementPart::BarA,
+            excluded: false,
+            x: -0.1,
+            y: 0.5,
+            orientation: Orientation::Vertical,
+            reverse: false,
+            mode: PlacementMode::Segments,
+            segments: 6,
+        });
+
+        assert!(data.forget_device("AA"));
+        assert!(!data.forget_device("AA"));
+        assert_eq!(data.known_devices.len(), 1);
+        assert_eq!(data.known_devices[0].id, "BB");
+        assert!(!data.nicknames.contains_key("AA"));
+        assert_eq!(data.nicknames.get("BB").map(String::as_str), Some("Bars"));
+        assert_eq!(data.groups[0].members, vec!["BB".to_string()]);
+        assert_eq!(data.scenes[0].entries.len(), 1);
+        assert_eq!(data.scenes[0].entries[0].device, "BB");
+        assert_eq!(data.sync.placements.len(), 1);
+        assert_eq!(data.sync.placements[0].device_id, "BB");
     }
 }

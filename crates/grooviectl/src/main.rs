@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use groovie_core::ipc::{IpcOutcome, IpcRequest, SyncStatusInfo};
+use groovie_core::ipc::{ForgottenDevice, IpcOutcome, IpcRequest, SyncStatusInfo};
 use groovie_core::store::Store;
 use groovie_core::{
     new_store_id, send_ephemeral_action, send_ephemeral_scene, Action, Config, Device, Group,
@@ -59,6 +59,8 @@ enum Cmd {
     },
     /// Give a light a nickname (empty string resets it).
     Rename { target: String, name: String },
+    /// Forget a light across saved devices, nicknames, groups, scenes, and sync placements.
+    Forget { target: String },
     /// Add a light by IP when discovery can't find it.
     AddIp { ip: Ipv4Addr },
     /// Manage groups.
@@ -280,6 +282,18 @@ async fn try_run_via_ipc(
         )
         .await?
         .is_some()),
+        Cmd::Forget { target } => {
+            let Some(forgotten) = call_daemon::<ForgottenDevice>(
+                ipc_path,
+                IpcRequest::Forget { target: target.clone() },
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            output_forgotten(&forgotten, cli.json)?;
+            Ok(true)
+        }
         Cmd::AddIp { ip } => {
             let Some(d) = call_daemon::<Device>(
                 ipc_path,
@@ -485,6 +499,22 @@ async fn try_run_ephemeral(
             store.save()?;
             Ok(true)
         }
+        Cmd::Forget { target } => {
+            let Some(Target::Device(id)) = store.data.resolve_target(target) else {
+                return Ok(false);
+            };
+            let name = store
+                .data
+                .known_devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| store.data.display_name(&d.id, &d.sku))
+                .unwrap_or_else(|| id.clone());
+            store.data.forget_device(&id);
+            store.save()?;
+            output_forgotten(&ForgottenDevice { id, name }, cli.json)?;
+            Ok(true)
+        }
         Cmd::Group(gc) => match gc {
             GroupCmd::List => {
                 if cli.json {
@@ -673,6 +703,16 @@ async fn run_standalone(cfg: Config, cli: Cli, parsed_color: Option<Rgb>) -> Res
             let id = device_id(&g, &target).await?;
             g.rename_device(&id, &name).await?;
         }
+        Cmd::Forget { target } => {
+            let id = device_id(&g, &target).await?;
+            let name = g
+                .device(&id)
+                .await
+                .map(|d| d.name)
+                .unwrap_or_else(|| id.clone());
+            g.remove_device(&id).await?;
+            output_forgotten(&ForgottenDevice { id, name }, cli.json)?;
+        }
         Cmd::Group(c) => group(&g, c, cli.json).await?,
         Cmd::Scene(c) => scene(&g, c, cli.json).await?,
     }
@@ -856,6 +896,15 @@ fn output_devices(devices: &[Device], json: bool) -> Result<()> {
         println!("No lights found. Is LAN Control enabled in the Govee app?");
     } else {
         print_devices(devices);
+    }
+    Ok(())
+}
+
+fn output_forgotten(forgotten: &ForgottenDevice, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(forgotten)?);
+    } else {
+        println!("Forgot '{}' ({})", forgotten.name, forgotten.id);
     }
     Ok(())
 }

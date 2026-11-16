@@ -112,6 +112,7 @@ export interface Api {
   discover(): Promise<void>;
   apply(target: Target, action: Action): Promise<void>;
   rename(id: string, name: string): Promise<void>;
+  removeDevice(id: string): Promise<void>;
   addIp(ip: string): Promise<void>;
   listGroups(): Promise<Group[]>;
   createGroup(name: string, members: string[]): Promise<Group>;
@@ -168,6 +169,7 @@ async function tauriApi(): Promise<Api> {
     discover: () => invoke('discover'),
     apply: (target, action) => invoke('apply', { target, action }),
     rename: (id, name) => invoke('rename', { id, name }),
+    removeDevice: (id) => invoke('remove_device', { id }),
     addIp: (ip) => invoke('add_ip', { ip }),
     listGroups: () => invoke('list_groups'),
     createGroup: (name, members) => invoke('create_group', { name, members }),
@@ -417,6 +419,26 @@ function mockApi(): Api {
     async rename(id, name) {
       const d = devices.find((x) => x.id === id);
       if (d) { d.name = name || d.sku; emit({ type: 'deviceUpdated', device: d }); }
+    },
+    async removeDevice(id) {
+      const idx = devices.findIndex((x) => x.id === id);
+      if (idx >= 0) devices.splice(idx, 1);
+      groups = groups.map((g) => ({ ...g, members: g.members.filter((m) => m !== id) }));
+      scenes = scenes.map((sc) => ({ ...sc, entries: sc.entries.filter((e) => e.device !== id) }));
+      syncConfig = {
+        ...syncConfig,
+        placements: syncConfig.placements.filter((p) => p.deviceId !== id),
+      };
+      if (syncActiveDevices.includes(id)) {
+        syncActiveDevices = syncActiveDevices.filter((x) => x !== id);
+        if (!syncActiveDevices.length) {
+          syncActive = false;
+          snapshots.clear();
+          updatePreviewLoop();
+        }
+      }
+      emitSyncChanged();
+      config();
     },
     addIp: async () => {},
     listGroups: async () => structuredClone(groups),

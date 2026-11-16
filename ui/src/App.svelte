@@ -504,6 +504,16 @@
     if (ip) await run((a) => a.addIp(ip));
   }
 
+  async function forgetDevice(d: Device) {
+    const ok = await run(async (a) => {
+      await a.removeDevice(d.id);
+      return true;
+    });
+    if (ok) {
+      showToast(`Forgot "${d.name}"`);
+    }
+  }
+
   async function installUpdate() {
     if (!update || updating) return;
     updateProgress = { stage: 'downloading', percent: null };
@@ -699,6 +709,7 @@
             device={d}
             syncing={Boolean(syncState?.active && syncState.activeDevices.includes(d.id))}
             onOpenSync={() => (view = 'sync')}
+            onForget={forgetDevice}
           />
         {:else}
           <div class="empty">

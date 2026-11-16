@@ -58,6 +58,13 @@ impl SyncStatusInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgottenDevice {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum IpcRequest {
     Ping,
@@ -74,6 +81,9 @@ pub enum IpcRequest {
     Rename {
         target: String,
         name: String,
+    },
+    Forget {
+        target: String,
     },
     AddIp {
         ip: Ipv4Addr,
@@ -321,6 +331,16 @@ async fn dispatch(
             let id = resolve_single_device(g, &target).await?;
             g.rename_device(&id, &name).await.map_err(|e| e.to_string())?;
             Ok(Value::Null)
+        }
+        IpcRequest::Forget { target } => {
+            let id = resolve_single_device(g, &target).await?;
+            let name = g
+                .device(&id)
+                .await
+                .map(|d| d.name)
+                .unwrap_or_else(|| id.clone());
+            g.remove_device(&id).await.map_err(|e| e.to_string())?;
+            to_val(serde_json::to_value(ForgottenDevice { id, name }))
         }
         IpcRequest::AddIp { ip, wait_ms } => {
             let found = g

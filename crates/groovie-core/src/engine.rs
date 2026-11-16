@@ -346,13 +346,41 @@ impl Groovie {
         self.inner.devices.read().await.get(id).map(|e| e.device.clone())
     }
 
-    /// Forget a device (it will come back if discovery sees it again).
+    /// Forget a device across runtime state, active Screen Sync, nicknames,
+    /// groups, scenes, and sync placements (it will come back if discovery sees it again).
     pub async fn remove_device(&self, id: &str) -> Result<()> {
-        self.inner.devices.write().await.remove(id);
-        let mut store = self.inner.store.lock().await;
-        store.data.known_devices.retain(|d| d.id != id);
-        store.save()?;
-        drop(store);
+        self.inner.detach_synced_devices(&[id.to_string()]).await;
+        {
+            let mut rt = self.inner.sync_rt.lock().await;
+            rt.detached.remove(id);
+            if rt.identify.as_ref().map(|p| p.device_id == id).unwrap_or(false) {
+                rt.identify = None;
+            }
+            rt.preview_dirty = true;
+        }
+
+        let removed_entry = self.inner.devices.write().await.remove(id);
+        let store_changed = {
+            let mut store = self.inner.store.lock().await;
+            let changed = store.data.forget_device(id);
+            if changed {
+                store.save()?;
+            }
+            changed
+        };
+
+        if removed_entry.is_none() && !store_changed {
+            return Err(Error::UnknownDevice(id.into()));
+        }
+
+        let summary = match &removed_entry {
+            Some(e) => format!("forget {} [{} @ {}]", e.device.name, e.device.id, e.device.ip),
+            None => format!("forget {id}"),
+        };
+        self.inner.log("action", "", None, summary, false).await;
+
+        let status = self.inner.current_sync_status().await;
+        self.inner.emit(Event::SyncChanged { status });
         self.inner.emit(Event::ConfigChanged);
         Ok(())
     }

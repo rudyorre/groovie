@@ -76,6 +76,7 @@ grooviectl scene rename Evening "Late Night"
 grooviectl scene apply "Late Night"
 grooviectl sync toggle                    # start/stop Screen Sync in the desktop app
 grooviectl add-ip 192.168.1.50            # add a light directly if multicast is blocked
+grooviectl forget "Old Bulb"              # remove a light from groups, scenes & config
 grooviectl config                         # print active groovie.json path (--json for contents)
 ```
 
