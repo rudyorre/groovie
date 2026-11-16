@@ -107,7 +107,23 @@
     return 'var(--accent)';
   });
 
-  const send = (a: Action) => api.then((x) => x.apply(target, a)).catch(console.error);
+  let waking = false;
+  const send = async (a: Action) => {
+    try {
+      const x = await api;
+      if (a.type !== 'power' && a.type !== 'toggle' && controllableDevices.length > 0 && litDevices.length === 0 && !waking) {
+        waking = true;
+        try {
+          await x.apply(target, { type: 'power', value: true });
+        } finally {
+          waking = false;
+        }
+      }
+      await x.apply(target, a);
+    } catch (e) {
+      console.error(e);
+    }
+  };
   const sendThrottled = throttle(send);
 </script>
 

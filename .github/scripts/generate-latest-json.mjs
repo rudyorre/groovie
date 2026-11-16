@@ -9,8 +9,10 @@ import { pathToFileURL } from 'node:url';
 
 const REQUIRED_CLI_ARCHIVES = [
   'grooviectl-windows-x64.zip',
+  'grooviectl-windows-arm64.zip',
   'grooviectl-macos-universal.tar.gz',
   'grooviectl-linux-x64.tar.gz',
+  'grooviectl-linux-arm64.tar.gz',
 ];
 
 const REQUIRED_PLATFORMS = [

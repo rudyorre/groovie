@@ -246,6 +246,24 @@
     }
     patchPlacement(p.id, { x: final.x, y: final.y }, false);
   }
+
+  function nudgePlacement(e: KeyboardEvent, p: SyncPlacement) {
+    let dx = 0;
+    let dy = 0;
+    if (e.key === 'ArrowLeft') dx = -1;
+    else if (e.key === 'ArrowRight') dx = 1;
+    else if (e.key === 'ArrowUp') dy = -1;
+    else if (e.key === 'ArrowDown') dy = 1;
+    else return;
+
+    e.preventDefault();
+    selectedId = p.id;
+    const step = e.shiftKey ? 0.08 : 0.02;
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    const nx = Math.round(clamp(p.x + dx * step, -0.4, 1.4) * 1000) / 1000;
+    const ny = Math.round(clamp(p.y + dy * step, -0.34, 1.34) * 1000) / 1000;
+    patchPlacement(p.id, { x: nx, y: ny }, false);
+  }
 </script>
 
 <div class="sync-view">
@@ -398,11 +416,13 @@
           class:horiz={p.orientation === 'horizontal'}
           class:offline={isOffline}
           class:identifying={identifyingId === p.id}
+          aria-label="{placementName(p)} placement — use arrow keys to adjust position"
           style="left: {pctX(p.x)}%; top: {pctY(p.y)}%"
           onpointerdown={(e) => startDrag(e, p)}
           onpointermove={(e) => moveDrag(e, p)}
           onpointerup={(e) => endDrag(e, p)}
           onpointercancel={(e) => endDrag(e, p)}
+          onkeydown={(e) => nudgePlacement(e, p)}
           onclick={() => (selectedId = p.id)}
         >
           <span class="led-strip" class:horiz={p.orientation === 'horizontal'}>
