@@ -82,6 +82,16 @@ pub struct ConfigInfo {
     pub json: String,
 }
 
+/// Per-machine desktop startup preferences (stored outside dotfiles `groovie.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPrefs {
+    #[serde(default)]
+    pub launch_at_login: bool,
+    #[serde(default)]
+    pub start_minimized: bool,
+}
+
 /// What to do.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
