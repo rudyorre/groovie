@@ -188,4 +188,25 @@ async fn cli_works_alongside_daemon_and_fast_path_when_daemon_closed() {
     let (ok, _, stderr, _) = run_cli(&["sync", "start"], &store_path, None, net, base);
     assert!(!ok);
     assert!(stderr.contains("requires the Groovie desktop app"), "stderr: {stderr}");
+
+    // Create a group containing Desk Bars, then `grooviectl forget "Desk Bars"` offline (<500ms)
+    // and verify known_devices, nicknames, groups, and scenes are pruned.
+    let (ok, _, stderr, _) = run_cli(
+        &["group", "create", "Workstation", "Desk Bars"],
+        &store_path,
+        None,
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+
+    let (ok, stdout, stderr, elapsed) = run_cli(&["forget", "Desk Bars"], &store_path, None, net, base);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Forgot 'Desk Bars'"), "stdout: {stdout}");
+    assert!(elapsed < Duration::from_millis(500), "forget took {elapsed:?}");
+
+    let (ok, stdout, stderr, _) = run_cli(&["--json", "config"], &store_path, None, net, base);
+    assert!(ok, "stderr: {stderr}");
+    assert!(!stdout.contains(&sim.config.id), "forgotten id still in config: {stdout}");
 }
+

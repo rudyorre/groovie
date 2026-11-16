@@ -229,6 +229,11 @@ async fn rename(s: State<'_, AppState>, id: String, name: String) -> R<()> {
 }
 
 #[tauri::command]
+async fn remove_device(s: State<'_, AppState>, id: String) -> R<()> {
+    engine(&s).await?.remove_device(&id).await.map_err(err)
+}
+
+#[tauri::command]
 async fn add_ip(s: State<'_, AppState>, ip: String) -> R<()> {
     let ip: Ipv4Addr = ip.trim().parse().map_err(|_| format!("'{ip}' is not an IPv4 address"))?;
     engine(&s).await?.add_device_by_ip(ip).await.map_err(err)
@@ -838,6 +843,7 @@ fn main() {
             discover,
             apply,
             rename,
+            remove_device,
             add_ip,
             list_groups,
             create_group,

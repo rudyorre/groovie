@@ -55,10 +55,12 @@
     device,
     syncing = false,
     onOpenSync,
+    onForget,
   }: {
     device: Device;
     syncing?: boolean;
     onOpenSync?: () => void;
+    onForget?: (device: Device) => void;
   } = $props();
 
   const PRESETS = ['#ff453a', '#ff9f0a', '#ffd60a', '#30d158', '#64d2ff', '#0a84ff', '#5e5ce6', '#ff375f'];
@@ -155,9 +157,36 @@
     editing = false;
     if (save && draft.trim() !== device.name) api.then((x) => x.rename(device.id, draft.trim()));
   }
+
+  // Per-card details & two-step forget
+  let detailsOpen = $state(false);
+  let confirmingForget = $state(false);
+  let copiedDetails = $state(false);
+
+  async function copyDetails() {
+    const lines = [
+      `${device.name} (${device.sku})`,
+      `IP: ${device.ip}`,
+      `ID: ${device.id}`,
+      ...(device.firmware ? [`Firmware: ${device.firmware}`] : []),
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      copiedDetails = true;
+      setTimeout(() => (copiedDetails = false), 1800);
+    } catch {
+      // Ignore restricted clipboard errors.
+    }
+  }
 </script>
 
-<article class="card" class:on class:offline={!device.online} style="--lit: {litCss}; --ink: {iconInk}">
+<article
+  class="card"
+  class:on
+  class:offline={!device.online}
+  class:details-open={detailsOpen}
+  style="--lit: {litCss}; --ink: {iconInk}"
+>
   <div class="top">
     <div class="tile"><Icon name={icon} size={20} /></div>
     <div class="meta">
@@ -182,6 +211,20 @@
       {/if}
       <div class="status">{status}</div>
     </div>
+    <button
+      type="button"
+      class="ghost icon-btn details-btn"
+      class:open={detailsOpen}
+      title="Light details"
+      aria-label="Light details for {device.name}"
+      aria-expanded={detailsOpen}
+      onclick={() => {
+        detailsOpen = !detailsOpen;
+        confirmingForget = false;
+      }}
+    >
+      <Icon name="info" size={14} />
+    </button>
     <label class="switch" title={on ? 'Turn off' : 'Turn on'}>
       <input
         type="checkbox"
@@ -192,6 +235,70 @@
       <span></span>
     </label>
   </div>
+
+  {#if detailsOpen}
+    <div class="details">
+      <dl class="details-grid">
+        <div>
+          <dt>Model</dt>
+          <dd>{device.sku}</dd>
+        </div>
+        <div>
+          <dt>IP address</dt>
+          <dd>{device.ip}</dd>
+        </div>
+        <div class="wide">
+          <dt>Device ID</dt>
+          <dd>{device.id}</dd>
+        </div>
+        {#if device.firmware}
+          <div class="wide">
+            <dt>Firmware</dt>
+            <dd>{device.firmware}</dd>
+          </div>
+        {/if}
+      </dl>
+      <div class="details-actions">
+        {#if confirmingForget}
+          <span class="confirm-note">Remove from groups, scenes &amp; sync?</span>
+          <span class="spacer"></span>
+          <button type="button" class="ghost sm" onclick={() => (confirmingForget = false)}>Cancel</button>
+          <button
+            type="button"
+            class="danger-solid sm"
+            onclick={() => {
+              confirmingForget = false;
+              detailsOpen = false;
+              onForget?.(device);
+            }}
+          >
+            Forget light
+          </button>
+        {:else}
+          <button type="button" class="ghost sm" onclick={copyDetails}>
+            <Icon name={copiedDetails ? 'check' : 'copy'} size={13} />
+            {copiedDetails ? 'Copied' : 'Copy'}
+          </button>
+          <button
+            type="button"
+            class="ghost sm"
+            onclick={() => {
+              detailsOpen = false;
+              startRename();
+            }}
+          >
+            <Icon name="pencil" size={13} /> Rename
+          </button>
+          <span class="spacer"></span>
+          {#if onForget}
+            <button type="button" class="ghost sm danger-text" onclick={() => (confirmingForget = true)}>
+              <Icon name="trash" size={13} /> Forget
+            </button>
+          {/if}
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   {#if s}
     <div class="bri">
@@ -275,6 +382,7 @@
     transition: border-color 0.2s;
   }
   .card.offline { opacity: 0.55; }
+  .card.offline.details-open { opacity: 0.92; }
 
   .top { display: flex; align-items: center; gap: 12px; }
   .tile {
@@ -295,6 +403,17 @@
   .name span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .edit { opacity: 0; }
   .card:hover .edit, .edit:focus-visible { opacity: 1; }
+  .details-btn { opacity: 0; flex: none; }
+  .card:hover .details-btn,
+  .card.offline .details-btn,
+  .details-btn:focus-visible,
+  .details-btn.open {
+    opacity: 1;
+  }
+  .details-btn.open {
+    background: var(--surface-2);
+    color: var(--text);
+  }
   .status { color: var(--text-2); font-size: 12.5px; margin-top: 1px; }
   .rename {
     font: inherit;
@@ -306,6 +425,77 @@
     border-radius: 6px;
     padding: 1px 6px;
     margin-left: -7px;
+  }
+
+  .details {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .details-grid {
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+  }
+  .details-grid .wide {
+    grid-column: 1 / -1;
+  }
+  .details-grid dt {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+  }
+  .details-grid dd {
+    margin: 1px 0 0;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .details-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  .details-actions .spacer {
+    flex: 1;
+  }
+  .details-actions .sm {
+    height: 27px;
+    padding: 0 8px;
+    font-size: 12px;
+    gap: 5px;
+  }
+  .danger-text {
+    color: #ff453a;
+  }
+  .danger-text:hover:not(:disabled) {
+    color: #ff6961;
+    background: #ff453a18;
+  }
+  .danger-solid {
+    background: #ff453a;
+    border-color: transparent;
+    color: #fff;
+    font-weight: 550;
+  }
+  .danger-solid:hover:not(:disabled) {
+    background: #ff5b51;
+  }
+  .confirm-note {
+    font-size: 11.5px;
+    color: var(--text-2);
   }
 
   .bri { position: relative; --fill: var(--track-strong); }

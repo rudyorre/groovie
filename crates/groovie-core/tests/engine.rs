@@ -837,3 +837,49 @@ async fn ephemeral_fast_path_works_without_binding_reply_port() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn remove_device_detaches_sync_and_prunes_all_store_state() {
+    let r = spawn_custom_sims(21, 41200, &["H6056", "H6072"]).await;
+    let bars_id = r.sims[0].config.id.clone();
+    let lamp_id = r.sims[1].config.id.clone();
+
+    r.g.rename_device(&bars_id, "Gaming Bars").await.unwrap();
+    r.g.create_group("Studio", vec![bars_id.clone(), lamp_id.clone()]).await.unwrap();
+    r.g.apply(&Target::All, Action::Power(true)).await.unwrap();
+    eventually("both lights on", || async { r.sims[0].state().on && r.sims[1].state().on }).await;
+    r.g.save_scene("Focus", None).await.unwrap();
+
+    // Start Screen Sync across both lights, then forget `bars_id` mid-sync.
+    let st = r.g.start_sync().await.unwrap();
+    assert!(st.active);
+    assert_eq!(st.active_devices.len(), 2);
+    eventually("bars entered razer sync", || async { *r.sims[0].razer_enabled.lock().unwrap() }).await;
+
+    r.g.remove_device(&bars_id).await.unwrap();
+    eventually("bars exited razer sync on forget", || async { !*r.sims[0].razer_enabled.lock().unwrap() }).await;
+
+    // Only `lamp_id` remains across devices, active sync, placements, groups, and scenes.
+    let devs = r.g.devices().await;
+    assert_eq!(devs.len(), 1);
+    assert_eq!(devs[0].id, lamp_id);
+
+    let sync_after = r.g.sync_status().await;
+    assert!(sync_after.active);
+    assert_eq!(sync_after.active_devices, vec![lamp_id.clone()]);
+    assert!(sync_after.config.placements.iter().all(|p| p.device_id != bars_id));
+
+    assert_eq!(r.g.groups().await[0].members, vec![lamp_id.clone()]);
+    let scenes = r.g.scenes().await;
+    assert_eq!(scenes[0].entries.len(), 1);
+    assert_eq!(scenes[0].entries[0].device, lamp_id);
+
+    // Persisted JSON has zero references to `bars_id`, and forgetting an unknown ID errors cleanly.
+    let persisted = r.g.config_info().await.json;
+    assert!(!persisted.contains(&bars_id), "persisted json leaked bars_id: {persisted}");
+    assert!(matches!(
+        r.g.remove_device("DOES:NOT:EXIST").await,
+        Err(groovie_core::Error::UnknownDevice(_))
+    ));
+}
+
