@@ -97,7 +97,37 @@ async fn cli_works_alongside_daemon_and_fast_path_when_daemon_closed() {
     }
     assert!(sim.state().on);
 
-    // 2. `grooviectl sync` toggles Screen Sync in the running daemon!
+    // 2. `grooviectl scene` save/rename/update + `sync` over IPC!
+    let (ok, stdout, stderr, _) = run_cli(
+        &["scene", "save", "WarmDesk", "Desk Bars"],
+        &store_path,
+        Some(&ipc_path),
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Saved scene 'WarmDesk'"), "stdout: {stdout}");
+
+    let (ok, stdout, stderr, _) = run_cli(
+        &["scene", "rename", "WarmDesk", "NightDesk"],
+        &store_path,
+        Some(&ipc_path),
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Renamed scene to 'NightDesk'"), "stdout: {stdout}");
+
+    let (ok, stdout, stderr, _) = run_cli(
+        &["scene", "update", "NightDesk"],
+        &store_path,
+        Some(&ipc_path),
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Updated scene 'NightDesk'"), "stdout: {stdout}");
+
     let (ok, stdout, stderr, _) = run_cli(&["sync", "start"], &store_path, Some(&ipc_path), net, base);
     assert!(ok, "stderr: {stderr}");
     assert!(stdout.contains("Screen Sync: active"), "stdout: {stdout}");
@@ -131,6 +161,28 @@ async fn cli_works_alongside_daemon_and_fast_path_when_daemon_closed() {
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
     assert_eq!(sim.state().color, Rgb::new(255, 68, 0));
+
+    // Offline `scene rename` succeeds immediately via store edit, and `scene update` works standalone.
+    let (ok, stdout, stderr, elapsed) = run_cli(
+        &["scene", "rename", "NightDesk", "EmberDesk"],
+        &store_path,
+        None,
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Renamed scene to 'EmberDesk'"), "stdout: {stdout}");
+    assert!(elapsed < Duration::from_millis(500));
+
+    let (ok, stdout, stderr, _) = run_cli(
+        &["scene", "update", "EmberDesk"],
+        &store_path,
+        None,
+        net,
+        base,
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("Updated scene 'EmberDesk'"), "stdout: {stdout}");
 
     // Offline `sync start` cleanly reports that the desktop app is required.
     let (ok, _, stderr, _) = run_cli(&["sync", "start"], &store_path, None, net, base);

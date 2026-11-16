@@ -106,6 +106,16 @@ enum SceneCmd {
     List,
     /// Save the current state of every light (or just the listed ones).
     Save { name: String, lights: Vec<String> },
+    /// Rename a saved scene.
+    Rename { scene: String, name: String },
+    /// Overwrite a saved scene with the current look (defaults to its existing lights, or `--all` / listed lights).
+    Update {
+        scene: String,
+        /// Capture every discovered light instead of only the scene's existing lights.
+        #[arg(long)]
+        all: bool,
+        lights: Vec<String>,
+    },
     Apply { scene: String },
     Delete { scene: String },
 }
@@ -357,6 +367,34 @@ async fn try_run_via_ipc(
                 println!("Saved scene '{}' with {} lights", saved.name, saved.entries.len());
                 Ok(true)
             }
+            SceneCmd::Rename { scene, name } => {
+                let Some(updated) = call_daemon::<Scene>(
+                    ipc_path,
+                    IpcRequest::SceneRename { scene: scene.clone(), name: name.clone() },
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                println!("Renamed scene to '{}'", updated.name);
+                Ok(true)
+            }
+            SceneCmd::Update { scene, all, lights } => {
+                let Some(updated) = call_daemon::<Scene>(
+                    ipc_path,
+                    IpcRequest::SceneUpdate {
+                        scene: scene.clone(),
+                        all: *all,
+                        lights: lights.clone(),
+                    },
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                println!("Updated scene '{}' with {} lights", updated.name, updated.entries.len());
+                Ok(true)
+            }
             SceneCmd::Apply { scene } => Ok(call_daemon::<serde_json::Value>(
                 ipc_path,
                 IpcRequest::SceneApply { scene: scene.clone() },
@@ -528,7 +566,24 @@ async fn try_run_ephemeral(
                 output_scenes(&store.data.scenes, cli.json)?;
                 Ok(true)
             }
-            SceneCmd::Save { .. } => Ok(false),
+            SceneCmd::Save { .. } | SceneCmd::Update { .. } => Ok(false),
+            SceneCmd::Rename { scene, name } => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    bail!("scene name cannot be empty");
+                }
+                let sc = store
+                    .data
+                    .scenes
+                    .iter_mut()
+                    .find(|s| s.id == *scene || s.name.eq_ignore_ascii_case(scene))
+                    .with_context(|| format!("no scene called '{scene}'"))?;
+                sc.name = trimmed.to_string();
+                let updated = sc.name.clone();
+                store.save()?;
+                println!("Renamed scene to '{updated}'");
+                Ok(true)
+            }
             SceneCmd::Apply { scene } => Ok(send_ephemeral_scene(&store, scene, cfg.command_port).await?),
             SceneCmd::Delete { scene } => {
                 let before = store.data.scenes.len();
@@ -649,6 +704,26 @@ async fn known_ready_ids(g: &Groovie, cmd: &Cmd) -> Option<Vec<String>> {
             }
             Some(ids)
         }
+        Cmd::Scene(SceneCmd::Update { scene, all, lights }) if !*all => {
+            if !lights.is_empty() {
+                let mut ids = Vec::with_capacity(lights.len());
+                for q in lights {
+                    match g.resolve(q).await.ok()? {
+                        Target::Device(id) => ids.push(id),
+                        _ => return None,
+                    }
+                }
+                Some(ids)
+            } else {
+                let existing = g
+                    .scenes()
+                    .await
+                    .into_iter()
+                    .find(|s| s.id == *scene || s.name.eq_ignore_ascii_case(scene))?;
+                (!existing.entries.is_empty())
+                    .then(|| existing.entries.into_iter().map(|e| e.device).collect())
+            }
+        }
         _ => None,
     }
 }
@@ -680,6 +755,14 @@ async fn find_group(g: &Groovie, q: &str) -> Result<Group> {
         .into_iter()
         .find(|x| x.id == q || x.name.eq_ignore_ascii_case(q))
         .with_context(|| format!("no group called '{q}'"))
+}
+
+async fn find_scene(g: &Groovie, q: &str) -> Result<Scene> {
+    g.scenes()
+        .await
+        .into_iter()
+        .find(|x| x.id == q || x.name.eq_ignore_ascii_case(q))
+        .with_context(|| format!("no scene called '{q}'"))
 }
 
 async fn group(g: &Groovie, c: GroupCmd, json: bool) -> Result<()> {
@@ -738,14 +821,28 @@ async fn scene(g: &Groovie, c: SceneCmd, json: bool) -> Result<()> {
             let s = g.save_scene(&name, ids).await?;
             println!("Saved scene '{}' with {} lights", s.name, s.entries.len());
         }
+        SceneCmd::Rename { scene, name } => {
+            let existing = find_scene(g, &scene).await?;
+            let updated = g.rename_scene(&existing.id, &name).await?;
+            println!("Renamed scene to '{}'", updated.name);
+        }
+        SceneCmd::Update { scene, all, lights } => {
+            let existing = find_scene(g, &scene).await?;
+            let ids = if all {
+                None
+            } else if !lights.is_empty() {
+                Some(device_ids(g, &lights).await?)
+            } else if !existing.entries.is_empty() {
+                Some(existing.entries.iter().map(|e| e.device.clone()).collect())
+            } else {
+                None
+            };
+            let updated = g.update_scene(&existing.id, None, ids).await?;
+            println!("Updated scene '{}' with {} lights", updated.name, updated.entries.len());
+        }
         SceneCmd::Apply { scene } => g.apply_scene(&scene).await?,
         SceneCmd::Delete { scene } => {
-            let s = g
-                .scenes()
-                .await
-                .into_iter()
-                .find(|s| s.id == scene || s.name.eq_ignore_ascii_case(&scene))
-                .with_context(|| format!("no scene called '{scene}'"))?;
+            let s = find_scene(g, &scene).await?;
             g.delete_scene(&s.id).await?;
         }
     }

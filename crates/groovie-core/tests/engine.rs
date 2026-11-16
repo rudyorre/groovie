@@ -674,13 +674,36 @@ async fn ipc_coexists_with_running_daemon_and_toggles_sync() {
 
     let IpcOutcome::Ok(sc) = try_call_at::<Scene>(
         &ipc_path,
-        IpcRequest::SceneSave { name: "Focus".into(), lights: vec![bars_id] },
+        IpcRequest::SceneSave { name: "Focus".into(), lights: vec![bars_id.clone()] },
     )
     .await
     else {
         panic!("expected IPC SceneSave to succeed");
     };
     assert_eq!(sc.entries.len(), 1);
+
+    let IpcOutcome::Ok(renamed_sc) = try_call_at::<Scene>(
+        &ipc_path,
+        IpcRequest::SceneRename { scene: "Focus".into(), name: "Deep Focus".into() },
+    )
+    .await
+    else {
+        panic!("expected IPC SceneRename to succeed");
+    };
+    assert_eq!(renamed_sc.id, sc.id);
+    assert_eq!(renamed_sc.name, "Deep Focus");
+
+    r.g.apply(&Target::Device(bars_id), Action::Brightness(33)).await.unwrap();
+    let IpcOutcome::Ok(updated_sc) = try_call_at::<Scene>(
+        &ipc_path,
+        IpcRequest::SceneUpdate { scene: "Deep Focus".into(), all: false, lights: vec![] },
+    )
+    .await
+    else {
+        panic!("expected IPC SceneUpdate to succeed");
+    };
+    assert_eq!(updated_sc.entries.len(), 1);
+    assert_eq!(updated_sc.entries[0].brightness, Some(33));
 
     let IpcOutcome::Ok(sync_on) =
         try_call_at::<SyncStatusInfo>(&ipc_path, IpcRequest::SyncSet { enabled: Some(true) }).await
@@ -703,6 +726,55 @@ async fn ipc_coexists_with_running_daemon_and_toggles_sync() {
         try_call_at::<Vec<Device>>(&ipc_path, IpcRequest::ListDevices { scan: false, wait_ms: 0 }).await,
         IpcOutcome::Unavailable
     ));
+}
+
+#[tokio::test]
+async fn scene_scoped_save_rename_update_and_restore() {
+    let r = spawn_custom_sims(20, 41190, &["H6056", "H6072"]).await;
+    let bars_id = r.sims[0].config.id.clone();
+    let lamp_id = r.sims[1].config.id.clone();
+
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Color(Rgb::new(20, 120, 250)))
+        .await
+        .unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Brightness(60)).await.unwrap();
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Kelvin(2700)).await.unwrap();
+    eventually("both lights configured", || async {
+        r.sims[0].state().color == Rgb::new(20, 120, 250) && r.sims[1].state().kelvin == 2700
+    })
+    .await;
+
+    // 1. Save scene scoped solely to the bars.
+    let sc = r.g.save_scene("Desk Blue", Some(vec![bars_id.clone()])).await.unwrap();
+    assert_eq!(sc.entries.len(), 1);
+    assert_eq!(sc.entries[0].device, bars_id);
+    assert_eq!(sc.entries[0].color, Some(Rgb::new(20, 120, 250)));
+
+    // 2. Rename scene without touching entries.
+    let renamed = r.g.rename_scene(&sc.id, "Ocean Desk").await.unwrap();
+    assert_eq!(renamed.id, sc.id);
+    assert_eq!(renamed.name, "Ocean Desk");
+    assert_eq!(renamed.entries, sc.entries);
+
+    // 3. Change bars to emerald @ 85% and overwrite the scene with both lights (`None` = all).
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Color(Rgb::new(10, 220, 90)))
+        .await
+        .unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Brightness(85)).await.unwrap();
+    let updated = r.g.update_scene(&sc.id, Some("Full Room"), None).await.unwrap();
+    assert_eq!(updated.id, sc.id);
+    assert_eq!(updated.name, "Full Room");
+    assert_eq!(updated.entries.len(), 2);
+
+    // 4. Delete and restore via `restore_scene` (undoable delete path).
+    r.g.delete_scene(&sc.id).await.unwrap();
+    assert!(r.g.scenes().await.is_empty());
+
+    let restored = r.g.restore_scene(updated.clone()).await.unwrap();
+    assert_eq!(restored, updated);
+    assert_eq!(r.g.scenes().await, vec![updated]);
 }
 
 #[tokio::test]
