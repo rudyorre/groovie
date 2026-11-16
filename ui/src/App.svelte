@@ -21,6 +21,7 @@
   import Icon from './lib/Icon.svelte';
   import MasterControlBar from './lib/MasterControlBar.svelte';
   import ScreenSyncView from './lib/ScreenSyncView.svelte';
+  import { applyTheme, readTheme, type ThemeMode } from './lib/theme';
 
   type SceneScope = 'all' | 'group' | 'custom';
   type SceneModalState = {
@@ -59,10 +60,61 @@
   let configOpen = $state(false);
   let configInfo = $state<ConfigInfo | null>(null);
   let desktopPrefs = $state<DesktopPrefs>({ launchAtLogin: false, startMinimized: false });
+  let theme = $state<ThemeMode>(readTheme());
   let editingPath = $state(false);
   let pathDraft = $state('');
   let copiedPath = $state(false);
   let copiedConfig = $state(false);
+
+  function selectTheme(next: ThemeMode) {
+    theme = next;
+    applyTheme(next);
+  }
+
+  function modalFocusTrap(node: HTMLElement) {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const selector =
+      'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
+
+    queueMicrotask(() => {
+      if (!node.contains(document.activeElement)) {
+        node.querySelector<HTMLElement>(selector)?.focus();
+      }
+    });
+
+    function onKeydown(e: KeyboardEvent) {
+      if (e.key !== 'Tab') return;
+      const focusables = Array.from(node.querySelectorAll<HTMLElement>(selector)).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
+      if (focusables.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (!active || !node.contains(active) || active === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (!active || !node.contains(active) || active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    node.addEventListener('keydown', onKeydown);
+    return {
+      destroy() {
+        node.removeEventListener('keydown', onKeydown);
+        if (opener && opener.isConnected) {
+          opener.focus();
+        }
+      },
+    };
+  }
 
   const group = $derived(groups.find((g) => g.id === view));
   const shown = $derived(group ? devices.filter((d) => group.members.includes(d.id)) : devices);
@@ -634,6 +686,7 @@
           class:busy={updating}
           class:spin={updateProgress !== null && updateProgress.stage !== 'downloading'}
           style:--pct="{updatePct}%"
+          title={update.notes ? `Groovie v${update.version}\n\n${update.notes}` : `Install Groovie v${update.version}`}
           onclick={installUpdate}
           disabled={updating}
         >
@@ -779,163 +832,187 @@
 
 {#if editing}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (editing = null)}>
-    <form class="dialog" onsubmit={(e) => { e.preventDefault(); saveGroup(); }}>
-      <h2>{editing.id ? 'Edit group' : 'New group'}</h2>
-      <!-- svelte-ignore a11y_autofocus -->
-      <input class="field" bind:value={editing.name} placeholder="Name, e.g. Desk" autofocus />
-      <div class="checks">
-        {#each devices as d (d.id)}
-          <label class="check">
-            <input type="checkbox" value={d.id} bind:group={editing.members} />
-            <span>{d.name}</span>
-            <small>{d.sku}</small>
-          </label>
-        {/each}
-      </div>
-      <div class="dialog-actions">
-        {#if editing.id}
-          <button
-            type="button"
-            class="ghost danger"
-            onclick={() => { const id = editing!.id; editing = null; run((a) => a.deleteGroup(id)); }}
-          ><Icon name="trash" size={14} /> Delete</button>
-        {/if}
-        <span class="spacer"></span>
-        <button type="button" class="ghost" onclick={() => (editing = null)}>Cancel</button>
-        <button type="submit" class="primary">Save</button>
-      </div>
-    </form>
+    <div
+      class="dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label={editing.id ? 'Edit group' : 'New group'}
+      use:modalFocusTrap
+    >
+      <form class="dialog-form" onsubmit={(e) => { e.preventDefault(); saveGroup(); }}>
+        <h2>{editing.id ? 'Edit group' : 'New group'}</h2>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input class="field" bind:value={editing.name} placeholder="Name, e.g. Desk" autofocus />
+        <div class="checks">
+          {#each devices as d (d.id)}
+            <label class="check">
+              <input type="checkbox" value={d.id} bind:group={editing.members} />
+              <span>{d.name}</span>
+              <small>{d.sku}</small>
+            </label>
+          {/each}
+        </div>
+        <div class="dialog-actions">
+          {#if editing.id}
+            <button
+              type="button"
+              class="ghost danger"
+              onclick={() => { const id = editing!.id; editing = null; run((a) => a.deleteGroup(id)); }}
+            ><Icon name="trash" size={14} /> Delete</button>
+          {/if}
+          <span class="spacer"></span>
+          <button type="button" class="ghost" onclick={() => (editing = null)}>Cancel</button>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </div>
   </div>
 {/if}
 
 {#if sceneModal}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (sceneModal = null)}>
-    <form class="dialog scene-dialog" onsubmit={(e) => { e.preventDefault(); submitSceneModal(); }}>
-      <h2>{sceneModal.id ? 'Edit scene' : 'Save scene'}</h2>
-      <p class="dialog-text">
-        {sceneModal.id
-          ? 'Rename this scene, adjust which lights it controls, or overwrite it with your current room look.'
-          : 'Snapshot the current power, brightness, colour, or white temperature of the selected lights.'}
-      </p>
+    <div
+      class="dialog scene-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label={sceneModal.id ? 'Edit scene' : 'Save scene'}
+      use:modalFocusTrap
+    >
+      <form class="dialog-form" onsubmit={(e) => { e.preventDefault(); submitSceneModal(); }}>
+        <h2>{sceneModal.id ? 'Edit scene' : 'Save scene'}</h2>
+        <p class="dialog-text">
+          {sceneModal.id
+            ? 'Rename this scene, adjust which lights it controls, or overwrite it with your current room look.'
+            : 'Snapshot the current power, brightness, colour, or white temperature of the selected lights.'}
+        </p>
 
-      <!-- svelte-ignore a11y_autofocus -->
-      <input class="field" bind:value={sceneModal.name} placeholder="Name, e.g. Late night" autofocus />
+        <!-- svelte-ignore a11y_autofocus -->
+        <input class="field" bind:value={sceneModal.name} placeholder="Name, e.g. Late night" autofocus />
 
-      <div class="scope-block">
-        <span class="path-label">Lights in scene</span>
-        <div class="segmented" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={sceneModal.scope === 'all'}
-            class:sel={sceneModal.scope === 'all'}
-            onclick={() => (sceneModal!.scope = 'all')}
-          >
-            All lights
-          </button>
-          {#if groups.length > 0}
+        <div class="scope-block">
+          <span class="path-label">Lights in scene</span>
+          <div class="segmented" role="tablist">
             <button
               type="button"
               role="tab"
-              aria-selected={sceneModal.scope === 'group'}
-              class:sel={sceneModal.scope === 'group'}
-              onclick={() => {
-                if (!sceneModal!.groupId && groups[0]) sceneModal!.groupId = groups[0].id;
-                sceneModal!.scope = 'group';
-              }}
+              aria-selected={sceneModal.scope === 'all'}
+              class:sel={sceneModal.scope === 'all'}
+              onclick={() => (sceneModal!.scope = 'all')}
             >
-              Group
+              All lights
             </button>
+            {#if groups.length > 0}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sceneModal.scope === 'group'}
+                class:sel={sceneModal.scope === 'group'}
+                onclick={() => {
+                  if (!sceneModal!.groupId && groups[0]) sceneModal!.groupId = groups[0].id;
+                  sceneModal!.scope = 'group';
+                }}
+              >
+                Group
+              </button>
+            {/if}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sceneModal.scope === 'custom'}
+              class:sel={sceneModal.scope === 'custom'}
+              onclick={() => (sceneModal!.scope = 'custom')}
+            >
+              Choose lights
+            </button>
+          </div>
+
+          {#if sceneModal.scope === 'group'}
+            <select class="field" bind:value={sceneModal.groupId} aria-label="Scene group">
+              {#each groups as g (g.id)}
+                <option value={g.id}>{g.name} ({g.members.length} {g.members.length === 1 ? 'light' : 'lights'})</option>
+              {/each}
+            </select>
+          {:else if sceneModal.scope === 'custom'}
+            <div class="checks">
+              {#each devices as d (d.id)}
+                <label class="check">
+                  <input type="checkbox" value={d.id} bind:group={sceneModal.members} />
+                  <span>{d.name}</span>
+                  <small>{d.sku}</small>
+                </label>
+              {/each}
+            </div>
+          {:else}
+            <p class="scope-hint">
+              Includes {devices.length === 1 ? '1 discovered light' : `all ${devices.length} discovered lights`}.
+            </p>
           {/if}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={sceneModal.scope === 'custom'}
-            class:sel={sceneModal.scope === 'custom'}
-            onclick={() => (sceneModal!.scope = 'custom')}
-          >
-            Choose lights
-          </button>
         </div>
 
-        {#if sceneModal.scope === 'group'}
-          <select class="field" bind:value={sceneModal.groupId} aria-label="Scene group">
-            {#each groups as g (g.id)}
-              <option value={g.id}>{g.name} ({g.members.length} {g.members.length === 1 ? 'light' : 'lights'})</option>
-            {/each}
-          </select>
-        {:else if sceneModal.scope === 'custom'}
-          <div class="checks">
-            {#each devices as d (d.id)}
-              <label class="check">
-                <input type="checkbox" value={d.id} bind:group={sceneModal.members} />
-                <span>{d.name}</span>
-                <small>{d.sku}</small>
-              </label>
-            {/each}
-          </div>
-        {:else}
-          <p class="scope-hint">
-            Includes {devices.length === 1 ? '1 discovered light' : `all ${devices.length} discovered lights`}.
-          </p>
-        {/if}
-      </div>
-
-      {#if sceneModal.id}
-        <button
-          type="button"
-          class="capture-btn"
-          disabled={!sceneModal.name.trim()}
-          onclick={captureSceneCurrentLook}
-        >
-          <Icon name="sparkle" size={14} />
-          <span>Overwrite with current look</span>
-        </button>
-      {/if}
-
-      <div class="dialog-actions">
         {#if sceneModal.id}
           <button
             type="button"
-            class="ghost danger"
-            onclick={() => {
-              const sc = scenes.find((s) => s.id === sceneModal?.id);
-              sceneModal = null;
-              if (sc) deleteSceneWithUndo(sc);
-            }}
+            class="capture-btn"
+            disabled={!sceneModal.name.trim()}
+            onclick={captureSceneCurrentLook}
           >
-            <Icon name="trash" size={14} /> Delete
+            <Icon name="sparkle" size={14} />
+            <span>Overwrite with current look</span>
           </button>
         {/if}
-        <span class="spacer"></span>
-        <button type="button" class="ghost" onclick={() => (sceneModal = null)}>Cancel</button>
-        <button type="submit" class="primary" disabled={!sceneModal.name.trim()}>
-          {sceneModal.id ? 'Save' : 'Save scene'}
-        </button>
-      </div>
-    </form>
+
+        <div class="dialog-actions">
+          {#if sceneModal.id}
+            <button
+              type="button"
+              class="ghost danger"
+              onclick={() => {
+                const sc = scenes.find((s) => s.id === sceneModal?.id);
+                sceneModal = null;
+                if (sc) deleteSceneWithUndo(sc);
+              }}
+            >
+              <Icon name="trash" size={14} /> Delete
+            </button>
+          {/if}
+          <span class="spacer"></span>
+          <button type="button" class="ghost" onclick={() => (sceneModal = null)}>Cancel</button>
+          <button type="submit" class="primary" disabled={!sceneModal.name.trim()}>
+            {sceneModal.id ? 'Save' : 'Save scene'}
+          </button>
+        </div>
+      </form>
+    </div>
   </div>
 {/if}
 
 {#if addingLight}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (addingLight = false)}>
-    <form class="dialog" onsubmit={(e) => { e.preventDefault(); addLight(); }}>
-      <h2>Add light by IP</h2>
-      <p class="dialog-text">Use this if a light doesn't show up automatically. Find its IP address in your router's device list.</p>
-      <!-- svelte-ignore a11y_autofocus -->
-      <input class="field" bind:value={ipDraft} placeholder="192.168.1.50" autofocus />
-      <div class="dialog-actions">
-        <span class="spacer"></span>
-        <button type="button" class="ghost" onclick={() => (addingLight = false)}>Cancel</button>
-        <button type="submit" class="primary">Add</button>
-      </div>
-    </form>
+    <div
+      class="dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add light by IP"
+      use:modalFocusTrap
+    >
+      <form class="dialog-form" onsubmit={(e) => { e.preventDefault(); addLight(); }}>
+        <h2>Add light by IP</h2>
+        <p class="dialog-text">Use this if a light doesn't show up automatically. Find its IP address in your router's device list.</p>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input class="field" bind:value={ipDraft} placeholder="192.168.1.50" autofocus />
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button type="button" class="ghost" onclick={() => (addingLight = false)}>Cancel</button>
+          <button type="submit" class="primary">Add</button>
+        </div>
+      </form>
+    </div>
   </div>
 {/if}
 
 {#if configOpen}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (configOpen = false)}>
-    <div class="dialog config-dialog" role="dialog" aria-modal="true" aria-label="Configuration">
+    <div class="dialog config-dialog" role="dialog" aria-modal="true" aria-label="Configuration" use:modalFocusTrap>
       <div class="log-head">
         <h2>Configuration</h2>
         <button type="button" class="ghost icon-btn" title="Close" onclick={() => (configOpen = false)}>
@@ -948,7 +1025,42 @@
       </p>
 
       <div class="prefs-card">
-        <span class="path-label">Startup &amp; tray</span>
+        <span class="path-label">Appearance &amp; startup</span>
+        <div class="pref-row theme-row">
+          <div class="pref-copy">
+            <strong>Theme</strong>
+            <span>Match your system appearance or lock dark or light mode</span>
+          </div>
+          <div class="segmented theme-seg" role="radiogroup" aria-label="Theme">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={theme === 'system'}
+              class:sel={theme === 'system'}
+              onclick={() => selectTheme('system')}
+            >
+              System
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={theme === 'dark'}
+              class:sel={theme === 'dark'}
+              onclick={() => selectTheme('dark')}
+            >
+              Dark
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={theme === 'light'}
+              class:sel={theme === 'light'}
+              onclick={() => selectTheme('light')}
+            >
+              Light
+            </button>
+          </div>
+        </div>
         <label class="pref-row">
           <div class="pref-copy">
             <strong>Launch at login</strong>
@@ -1051,7 +1163,7 @@
 
 {#if logsOpen}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (logsOpen = false)}>
-    <div class="dialog log-dialog" role="dialog" aria-modal="true" aria-label="Activity & network log">
+    <div class="dialog log-dialog" role="dialog" aria-modal="true" aria-label="Activity & network log" use:modalFocusTrap>
       <div class="log-head">
         <h2>Activity &amp; network log</h2>
         <button type="button" class="ghost icon-btn" title="Close" onclick={() => (logsOpen = false)}>
@@ -1320,6 +1432,7 @@
     gap: 12px;
     box-shadow: 0 20px 60px #0007;
   }
+  .dialog-form { display: flex; flex-direction: column; gap: 12px; }
   .scene-dialog { width: min(420px, 92vw); }
   .dialog h2 { margin: 0; font-size: 16px; font-weight: 600; }
   .dialog-text { margin: -4px 0 0; color: var(--text-2); font-size: 13px; line-height: 1.45; }
@@ -1377,6 +1490,8 @@
   .pref-copy { display: flex; flex-direction: column; gap: 1px; }
   .pref-copy strong { font-size: 13px; font-weight: 550; color: var(--text); }
   .pref-copy span { font-size: 12px; color: var(--text-2); }
+  .theme-row { cursor: default; }
+  .theme-seg { min-width: 192px; flex-shrink: 0; }
   .path-card {
     display: flex;
     flex-direction: column;

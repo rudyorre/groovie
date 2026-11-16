@@ -24,6 +24,8 @@ jobs:
       release_id: ${{ steps.draft.outputs.release_id }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Verify version parity across manifests
         env:
           TAG: ${{ github.ref_name }}
@@ -42,7 +44,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          NOTES="Download the installer for your system below (\`grooviectl-*\` archives contain the standalone CLI). Already have Groovie? It will offer this update automatically."
+          PREV_TAG=$(git tag --list 'v*' --sort=-version:refname | grep -Fxv "$TAG" | head -n1 || true)
+          HEADER="Download the installer for your system below (\`grooviectl-*\` archives contain the standalone CLI). Already have Groovie? It will offer this update automatically."
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log --no-merges --pretty=format:'- %s (%h)' "${PREV_TAG}..${TAG}" || true)
+          else
+            CHANGES=$(git log --no-merges -n 15 --pretty=format:'- %s (%h)' "$TAG" || true)
+          fi
+          if [ -n "$CHANGES" ]; then
+            NOTES=$(printf "%s\n\n### What's Changed%s\n%s" "$HEADER" "${PREV_TAG:+ since $PREV_TAG}" "$CHANGES")
+          else
+            NOTES="$HEADER"
+          fi
           if VIEW=$(gh release view "$TAG" --json databaseId,isDraft 2>/dev/null); then
             IS_DRAFT=$(printf '%s' "$VIEW" | jq -r '.isDraft')
             if [ "$IS_DRAFT" != "true" ]; then
@@ -75,6 +88,7 @@ jobs:
           - name: Windows
             os: windows-latest
             args: --bundles nsis
+            rust-targets: aarch64-pc-windows-msvc
           - name: macOS
             os: macos-latest
             args: --target universal-apple-darwin
@@ -82,6 +96,7 @@ jobs:
           - name: Linux
             os: ubuntu-22.04
             args: --bundles deb,appimage
+            rust-targets: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -89,7 +104,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf gcc-aarch64-linux-gnu
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-targets }}
@@ -108,7 +123,9 @@ jobs:
             Windows)
               cargo build --release --locked -p grooviectl
               7z a -tzip grooviectl-windows-x64.zip ./target/release/grooviectl.exe
-              ASSET=grooviectl-windows-x64.zip
+              cargo build --release --locked -p grooviectl --target aarch64-pc-windows-msvc
+              7z a -tzip grooviectl-windows-arm64.zip ./target/aarch64-pc-windows-msvc/release/grooviectl.exe
+              ASSETS=(grooviectl-windows-x64.zip grooviectl-windows-arm64.zip)
               ;;
             macOS)
               cargo build --release --locked -p grooviectl --target aarch64-apple-darwin
@@ -119,15 +136,18 @@ jobs:
                 target/x86_64-apple-darwin/release/grooviectl
               chmod +x dist-cli/grooviectl
               tar -C dist-cli -czf grooviectl-macos-universal.tar.gz grooviectl
-              ASSET=grooviectl-macos-universal.tar.gz
+              ASSETS=(grooviectl-macos-universal.tar.gz)
               ;;
             Linux)
               cargo build --release --locked -p grooviectl
               tar -C target/release -czf grooviectl-linux-x64.tar.gz grooviectl
-              ASSET=grooviectl-linux-x64.tar.gz
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+                cargo build --release --locked -p grooviectl --target aarch64-unknown-linux-gnu
+              tar -C target/aarch64-unknown-linux-gnu/release -czf grooviectl-linux-arm64.tar.gz grooviectl
+              ASSETS=(grooviectl-linux-x64.tar.gz grooviectl-linux-arm64.tar.gz)
               ;;
           esac
-          gh release upload "$TAG" "$ASSET" --clobber
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber
       - uses: actions/setup-node@v7
         with:
           node-version: 24

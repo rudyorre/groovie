@@ -165,6 +165,7 @@ export type UpdateProgress =
 
 export type Update = {
   version: string;
+  notes?: string;
   install: (onProgress?: (p: UpdateProgress) => void) => Promise<void>;
 };
 
@@ -220,6 +221,7 @@ async function tauriApi(): Promise<Api> {
       if (!u) return null;
       return {
         version: u.version,
+        notes: u.body || undefined,
         async install(onProgress) {
           let total: number | undefined;
           let received = 0;

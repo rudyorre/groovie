@@ -22,6 +22,7 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - run: npm ci && npm run check && npm run build
         working-directory: ui
+      - run: node --test .github/scripts/generate-latest-json.test.mjs
 
   desktop:
     name: Desktop app (${{ matrix.name }})
@@ -33,6 +34,7 @@ jobs:
           - name: Windows
             os: windows-latest
             args: --bundles nsis
+            rust-targets: aarch64-pc-windows-msvc
           - name: macOS
             os: macos-latest
             # One .dmg that runs on both Apple Silicon and Intel Macs.
@@ -41,6 +43,7 @@ jobs:
           - name: Linux
             os: ubuntu-22.04
             args: --bundles deb
+            rust-targets: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -48,13 +51,33 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf gcc-aarch64-linux-gnu
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-targets }}
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: apps/desktop/src-tauri
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+      - name: Verify grooviectl CLI targets
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows)
+              cargo build --release --locked -p grooviectl
+              cargo build --release --locked -p grooviectl --target aarch64-pc-windows-msvc
+              ;;
+            macOS)
+              cargo build --release --locked -p grooviectl --target aarch64-apple-darwin
+              cargo build --release --locked -p grooviectl --target x86_64-apple-darwin
+              ;;
+            Linux)
+              cargo build --release --locked -p grooviectl
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+                cargo build --release --locked -p grooviectl --target aarch64-unknown-linux-gnu
+              ;;
+          esac
       - uses: actions/setup-node@v7
         with:
           node-version: 24

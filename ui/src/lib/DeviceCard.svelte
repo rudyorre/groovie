@@ -138,13 +138,29 @@
   );
 
   const target = $derived({ type: 'device' as const, id: device.id });
-  const send = (a: Action) => api.then((x) => x.apply(target, a)).catch(console.error);
+  let waking = false;
+  const send = async (a: Action) => {
+    try {
+      const x = await api;
+      if (a.type !== 'power' && a.type !== 'toggle' && s && !s.on && !waking) {
+        waking = true;
+        try {
+          await x.apply(target, { type: 'power', value: true });
+        } finally {
+          waking = false;
+        }
+      }
+      await x.apply(target, a);
+    } catch (e) {
+      console.error(e);
+    }
+  };
   const sendThrottled = throttle(send);
 
   function setMode(m: 'color' | 'white') {
     if (m === mode) return;
     picked = m;
-    if (!s) return;
+    if (!s || !s.on) return;
     if (m === 'white' && !s.kelvin) send({ type: 'kelvin', value: rememberedKelvin });
     if (m === 'color' && s.kelvin) send({ type: 'color', value: rememberedColor });
   }
@@ -519,18 +535,21 @@
   .on .bri { --fill: var(--lit); }
   .bri-label {
     position: absolute;
-    right: 10px;
+    right: 7px;
     top: 50%;
     transform: translateY(-50%);
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: 12px;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--surface) 84%, transparent);
+    backdrop-filter: blur(4px);
+    font-size: 11.5px;
+    font-weight: 500;
     font-variant-numeric: tabular-nums;
-    color: var(--text-2);
+    color: var(--text);
     pointer-events: none;
-    mix-blend-mode: difference;
-    filter: grayscale(1);
   }
 
   .swatches { display: flex; gap: 8px; flex-wrap: wrap; }
