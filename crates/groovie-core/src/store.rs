@@ -377,6 +377,48 @@ pub fn default_ipc_path() -> Option<PathBuf> {
     platform_config_dir().map(|d| d.join("daemon.json"))
 }
 
+/// Per-machine desktop startup preferences persisted in `platform_config_dir()/desktop.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredDesktopPrefs {
+    #[serde(default)]
+    pub start_minimized: bool,
+}
+
+pub fn default_desktop_prefs_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("GROOVIE_DESKTOP_PREFS").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    platform_config_dir().map(|d| d.join("desktop.json"))
+}
+
+pub fn read_desktop_prefs() -> StoredDesktopPrefs {
+    default_desktop_prefs_path()
+        .and_then(|p| read_desktop_prefs_at(&p))
+        .unwrap_or_default()
+}
+
+pub fn read_desktop_prefs_at(path: &Path) -> Option<StoredDesktopPrefs> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn write_desktop_prefs(prefs: &StoredDesktopPrefs) -> io::Result<()> {
+    let Some(path) = default_desktop_prefs_path() else {
+        return Ok(());
+    };
+    write_desktop_prefs_at(&path, prefs)
+}
+
+pub fn write_desktop_prefs_at(path: &Path, prefs: &StoredDesktopPrefs) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(prefs).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +484,17 @@ mod tests {
 
         assert!(s.reload_if_changed().unwrap());
         assert_eq!(s.data.nicknames.get("AA").map(String::as_str), Some("Floor Lamp"));
+    }
+
+    #[test]
+    fn roundtrips_desktop_prefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.json");
+        assert_eq!(read_desktop_prefs_at(&path), None);
+        write_desktop_prefs_at(&path, &StoredDesktopPrefs { start_minimized: true }).unwrap();
+        assert_eq!(
+            read_desktop_prefs_at(&path),
+            Some(StoredDesktopPrefs { start_minimized: true })
+        );
     }
 }

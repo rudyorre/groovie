@@ -5,6 +5,7 @@
     isTauri,
     toHex,
     type ConfigInfo,
+    type DesktopPrefs,
     type Device,
     type Group,
     type LogEntry,
@@ -47,6 +48,7 @@
   let logBox = $state<HTMLElement | null>(null);
   let configOpen = $state(false);
   let configInfo = $state<ConfigInfo | null>(null);
+  let desktopPrefs = $state<DesktopPrefs>({ launchAtLogin: false, startMinimized: false });
   let editingPath = $state(false);
   let pathDraft = $state('');
   let copiedPath = $state(false);
@@ -199,11 +201,25 @@
     editingPath = false;
     copiedPath = false;
     copiedConfig = false;
-    const info = await run((a) => a.getConfigInfo());
+    const [info, prefs] = await Promise.all([
+      run((a) => a.getConfigInfo()),
+      run((a) => a.getDesktopPrefs()),
+    ]);
     if (info) {
       configInfo = info;
       pathDraft = info.path ?? '';
     }
+    if (prefs) {
+      desktopPrefs = prefs;
+    }
+  }
+
+  async function updateDesktopPref(key: keyof DesktopPrefs, value: boolean) {
+    const prev = { ...desktopPrefs };
+    const optimistic = { ...desktopPrefs, [key]: value };
+    desktopPrefs = optimistic;
+    const saved = await run((a) => a.setDesktopPrefs(optimistic));
+    desktopPrefs = saved ?? prev;
   }
 
   async function copyConfigPath() {
@@ -616,6 +632,38 @@
         Nicknames, groups, and scenes live in a plain JSON file. Symlink it or point Groovie at your dotfiles repo — external edits reload automatically.
       </p>
 
+      <div class="prefs-card">
+        <span class="path-label">Startup &amp; tray</span>
+        <label class="pref-row">
+          <div class="pref-copy">
+            <strong>Launch at login</strong>
+            <span>Start Groovie automatically when you sign in</span>
+          </div>
+          <span class="switch">
+            <input
+              type="checkbox"
+              checked={desktopPrefs.launchAtLogin}
+              onchange={(e) => updateDesktopPref('launchAtLogin', e.currentTarget.checked)}
+            />
+            <span></span>
+          </span>
+        </label>
+        <label class="pref-row">
+          <div class="pref-copy">
+            <strong>Start minimized to tray</strong>
+            <span>Keep the main window hidden in the system tray on launch</span>
+          </div>
+          <span class="switch">
+            <input
+              type="checkbox"
+              checked={desktopPrefs.startMinimized}
+              onchange={(e) => updateDesktopPref('startMinimized', e.currentTarget.checked)}
+            />
+            <span></span>
+          </span>
+        </label>
+      </div>
+
       <div class="path-card">
         <div class="path-meta">
           <span class="path-label">{configInfo?.isCustom ? 'Custom path' : 'Config file'}</span>
@@ -957,7 +1005,27 @@
   .dialog-actions { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
   .spacer { flex: 1; }
 
-  .config-dialog { width: min(640px, 94vw); max-height: 86vh; }
+  .config-dialog { width: min(640px, 94vw); max-height: 88vh; overflow-y: auto; }
+  .prefs-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+  }
+  .pref-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .pref-copy { display: flex; flex-direction: column; gap: 1px; }
+  .pref-copy strong { font-size: 13px; font-weight: 550; color: var(--text); }
+  .pref-copy span { font-size: 12px; color: var(--text-2); }
   .path-card {
     display: flex;
     flex-direction: column;
@@ -1000,7 +1068,7 @@
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 10px 12px;
-    max-height: min(300px, 40vh);
+    max-height: min(240px, 34vh);
     overflow: auto;
     font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace;
     font-size: 11.5px;

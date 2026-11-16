@@ -30,6 +30,10 @@ export type ConfigInfo = {
   isCustom: boolean;
   json: string;
 };
+export type DesktopPrefs = {
+  launchAtLogin: boolean;
+  startMinimized: boolean;
+};
 export type Group = { id: string; name: string; members: string[] };
 export type SceneEntry = { device: string; on: boolean; brightness?: number; color?: Rgb; kelvin?: number };
 export type Scene = { id: string; name: string; entries: SceneEntry[] };
@@ -126,6 +130,8 @@ export interface Api {
   listLogs(): Promise<LogEntry[]>;
   clearLogs(): Promise<void>;
   setWindowActive(active: boolean, syncNow: boolean): Promise<void>;
+  getDesktopPrefs(): Promise<DesktopPrefs>;
+  setDesktopPrefs(prefs: DesktopPrefs): Promise<DesktopPrefs>;
   getConfigInfo(): Promise<ConfigInfo>;
   reloadConfig(): Promise<ConfigInfo>;
   setConfigPath(path: string | null): Promise<ConfigInfo>;
@@ -177,6 +183,8 @@ async function tauriApi(): Promise<Api> {
     listLogs: () => invoke('list_logs'),
     clearLogs: () => invoke('clear_logs'),
     setWindowActive: (active, syncNow) => invoke('set_window_active', { active, syncNow }),
+    getDesktopPrefs: () => invoke('get_desktop_prefs'),
+    setDesktopPrefs: (prefs) => invoke('set_desktop_prefs', { prefs }),
     getConfigInfo: () => invoke('get_config_info'),
     reloadConfig: () => invoke('reload_config'),
     setConfigPath: (path) => invoke('set_config_path', { path }),
@@ -270,6 +278,7 @@ function mockApi(): Api {
 
   let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['3A:14:D0:88:19:40:11:2B'] }];
   let scenes: Scene[] = [];
+  let desktopPrefs: DesktopPrefs = { launchAtLogin: false, startMinimized: false };
   const subs = new Set<(e: GroovieEvent) => void>();
   const emit = (e: GroovieEvent) => subs.forEach((cb) => cb(structuredClone(e)));
   const config = () => emit({ type: 'configChanged' });
@@ -498,6 +507,11 @@ function mockApi(): Api {
     listLogs: async () => structuredClone(logs),
     clearLogs: async () => { logs = []; },
     setWindowActive: async () => {},
+    getDesktopPrefs: async () => ({ ...desktopPrefs }),
+    async setDesktopPrefs(prefs) {
+      desktopPrefs = { ...prefs };
+      return { ...desktopPrefs };
+    },
     async getConfigInfo() {
       const nicknames = Object.fromEntries(devices.map((d) => [d.id, d.name]));
       const known_devices = devices.map((d) => ({ id: d.id, ip: d.ip, sku: d.sku }));

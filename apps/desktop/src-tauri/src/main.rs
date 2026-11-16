@@ -5,15 +5,17 @@ mod capture;
 
 use capture::CaptureManager;
 use groovie_core::{
-    Action, Config, ConfigInfo, Device, DisplayInfo, Group, Groovie, LogEntry, Scene, SyncConfig,
-    SyncStatus, Target,
+    Action, Config, ConfigInfo, DesktopPrefs, Device, DisplayInfo, Group, Groovie, LogEntry, Scene,
+    SyncConfig, SyncStatus, Target,
 };
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_window_state::{AppHandleExt as WindowStateAppExt, StateFlags};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
 
@@ -22,6 +24,23 @@ const ACTIVE_POLL: Duration = Duration::from_millis(2500);
 const IDLE_POLL: Duration = Duration::from_secs(45);
 const GITHUB_URL: &str = "https://github.com/rudyorre/groovie";
 
+fn window_state_flags() -> StateFlags {
+    // Exclude VISIBLE so closing to tray or launching with `--minimized` never
+    // overrides startup visibility preferences.
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+fn has_minimized_arg<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| {
+        let s = a.as_ref();
+        s == "--minimized" || s == "--hidden"
+    })
+}
+
 /// Holds the running engine, or the startup error if UDP port 4002 was busy so
 /// the window can still open and tell the user what's holding it.
 struct AppState(RwLock<Result<Groovie, String>>);
@@ -29,7 +48,16 @@ struct AppState(RwLock<Result<Groovie, String>>);
 /// Owns the loopback IPC server so `grooviectl` can share the running tray engine.
 struct IpcHandle(tokio::sync::Mutex<Option<groovie_core::ipc::IpcServer>>);
 
-struct TraySyncItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
+#[derive(Clone, Default, PartialEq, Eq)]
+struct TraySnapshot {
+    sync_active: bool,
+    /// `(group_id, group_name, any_online_member_on)`
+    groups: Vec<(String, String, bool)>,
+    /// `(scene_id, scene_name)`
+    scenes: Vec<(String, String)>,
+}
+
+struct TrayState(Mutex<Option<TraySnapshot>>);
 
 struct DesktopSyncController(AppHandle);
 
@@ -44,9 +72,7 @@ impl groovie_core::ipc::SyncController for DesktopSyncController {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncStatus, String>> + Send + 'a>> {
         Box::pin(async move {
             let payload = set_or_toggle_sync(&self.0, desired).await?;
-            if let Some(item) = self.0.state::<TraySyncItem>().0.lock().unwrap().clone() {
-                let _ = item.set_checked(payload.active);
-            }
+            refresh_tray_menu(&self.0, false).await;
             Ok(SyncStatus {
                 active: payload.active,
                 active_devices: payload.active_devices,
@@ -82,9 +108,9 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-async fn start_engine(app: &AppHandle) -> R<Groovie> {
+async fn start_engine(app: &AppHandle, start_active: bool) -> R<Groovie> {
     let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
-    groovie.set_poll_interval(ACTIVE_POLL);
+    groovie.set_poll_interval(if start_active { ACTIVE_POLL } else { IDLE_POLL });
     let sync_ctl: std::sync::Arc<dyn groovie_core::ipc::SyncController> =
         std::sync::Arc::new(DesktopSyncController(app.clone()));
     if let Ok(ipc) = groovie_core::ipc::IpcServer::start_default(groovie.clone(), Some(sync_ctl)).await {
@@ -96,17 +122,26 @@ async fn start_engine(app: &AppHandle) -> R<Groovie> {
         loop {
             match rx.recv().await {
                 Ok(ev) => {
+                    let tray_relevant = matches!(
+                        ev,
+                        groovie_core::Event::DeviceUpdated { .. }
+                            | groovie_core::Event::ConfigChanged
+                            | groovie_core::Event::SyncChanged { .. }
+                    );
                     if let groovie_core::Event::SyncChanged { ref status } = ev {
                         if !status.active {
                             handle.state::<CaptureManager>().stop();
                         }
-                        if let Some(item) = handle.state::<TraySyncItem>().0.lock().unwrap().clone() {
-                            let _ = item.set_checked(status.active);
-                        }
                     }
                     let _ = handle.emit("groovie://event", ev);
+                    if tray_relevant {
+                        refresh_tray_menu(&handle, false).await;
+                    }
                 }
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => {
+                    refresh_tray_menu(&handle, false).await;
+                    continue;
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -165,10 +200,14 @@ async fn list_devices(s: State<'_, AppState>) -> R<Vec<Device>> {
 async fn discover(app: AppHandle, s: State<'_, AppState>) -> R<()> {
     // If startup failed because the port was busy (or an update was cancelled), Retry comes through here.
     if s.0.read().await.is_err() {
-        let g = start_engine(&app).await?;
+        let g = start_engine(&app, true).await?;
         *s.0.write().await = Ok(g);
+        let snap = collect_tray_snapshot(&app).await;
         if app.tray_by_id("main").is_none() {
-            let _ = build_tray(&app);
+            *app.state::<TrayState>().0.lock().unwrap() = Some(snap.clone());
+            let _ = build_tray(&app, &snap);
+        } else {
+            refresh_tray_menu(&app, true).await;
         }
         let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
         return Ok(());
@@ -304,14 +343,47 @@ async fn clear_logs(s: State<'_, AppState>) -> R<()> {
 }
 
 #[tauri::command]
-async fn set_window_active(s: State<'_, AppState>, active: bool, sync_now: bool) -> R<()> {
+async fn set_window_active(app: AppHandle, s: State<'_, AppState>, active: bool, sync_now: bool) -> R<()> {
+    let win_visible = app
+        .get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
+        .unwrap_or(false);
+    let effective_active = active && win_visible;
     if let Ok(g) = s.0.read().await.clone() {
-        let changed = g.set_poll_interval(if active { ACTIVE_POLL } else { IDLE_POLL });
-        if active && (sync_now || changed) {
+        let changed = g.set_poll_interval(if effective_active { ACTIVE_POLL } else { IDLE_POLL });
+        if effective_active && (sync_now || changed) {
             g.sync_now().await;
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn get_desktop_prefs(app: AppHandle) -> R<DesktopPrefs> {
+    let stored = groovie_core::store::read_desktop_prefs();
+    let launch_at_login = app.autolaunch().is_enabled().unwrap_or(false);
+    Ok(DesktopPrefs {
+        launch_at_login,
+        start_minimized: stored.start_minimized,
+    })
+}
+
+#[tauri::command]
+fn set_desktop_prefs(app: AppHandle, prefs: DesktopPrefs) -> R<DesktopPrefs> {
+    let auto = app.autolaunch();
+    let cur_auto = auto.is_enabled().unwrap_or(false);
+    if prefs.launch_at_login != cur_auto {
+        if prefs.launch_at_login {
+            auto.enable().map_err(err)?;
+        } else {
+            auto.disable().map_err(err)?;
+        }
+    }
+    groovie_core::store::write_desktop_prefs(&groovie_core::store::StoredDesktopPrefs {
+        start_minimized: prefs.start_minimized,
+    })
+    .map_err(err)?;
+    get_desktop_prefs(app)
 }
 
 #[tauri::command]
@@ -356,9 +428,10 @@ async fn get_config_info(s: State<'_, AppState>) -> R<ConfigInfo> {
 #[tauri::command]
 async fn reload_config(app: AppHandle, s: State<'_, AppState>) -> R<ConfigInfo> {
     if s.0.read().await.is_err() {
-        let g = start_engine(&app).await?;
+        let g = start_engine(&app, true).await?;
         let info = g.config_info().await;
         *s.0.write().await = Ok(g);
+        refresh_tray_menu(&app, true).await;
         let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
         return Ok(info);
     }
@@ -371,9 +444,10 @@ async fn set_config_path(app: AppHandle, s: State<'_, AppState>, path: Option<St
         let cleaned = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
         let target = cleaned.map(groovie_core::store::normalize_user_store_path);
         groovie_core::store::write_custom_store_path(target.as_deref()).map_err(err)?;
-        let g = start_engine(&app).await?;
+        let g = start_engine(&app, true).await?;
         let info = g.config_info().await;
         *s.0.write().await = Ok(g);
+        refresh_tray_menu(&app, true).await;
         let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
         return Ok(info);
     }
@@ -427,6 +501,7 @@ async fn prepare_update_install(app: AppHandle, before_install: bool) -> R<()> {
     // On macOS and Linux, `install()` returns to JS (and `.deb` prompts via `pkexec`
     // first), so teardown happens *after* `install()` right before `relaunch()`.
     if before_install == cfg!(windows) {
+        let _ = app.save_window_state(window_state_flags());
         shutdown_engine_cleanly(&app, "restarting to finish update").await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -485,27 +560,123 @@ fn all_power(app: &AppHandle, on: bool) {
 }
 
 fn remove_tray_icon(app: &AppHandle) {
-    *app.state::<TraySyncItem>().0.lock().unwrap() = None;
+    *app.state::<TrayState>().0.lock().unwrap() = None;
     if let Some(tray) = app.remove_tray_by_id("main") {
         let _ = tray.set_visible(false);
     }
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    // Tray icon: left-click opens Groovie; right-click opens the menu.
+async fn collect_tray_snapshot(app: &AppHandle) -> TraySnapshot {
+    let Ok(g) = app.state::<AppState>().0.read().await.clone() else {
+        return TraySnapshot::default();
+    };
+    let (devices, groups, scenes, sync) =
+        tokio::join!(g.devices(), g.groups(), g.scenes(), g.sync_status());
+    let group_items = groups
+        .into_iter()
+        .map(|grp| {
+            let any_on = devices.iter().any(|d| {
+                d.online
+                    && grp.members.iter().any(|m| m == &d.id)
+                    && d.state.map(|s| s.on).unwrap_or(false)
+            });
+            (grp.id, grp.name, any_on)
+        })
+        .collect();
+    let scene_items = scenes.into_iter().map(|sc| (sc.id, sc.name)).collect();
+    TraySnapshot {
+        sync_active: sync.active,
+        groups: group_items,
+        scenes: scene_items,
+    }
+}
+
+fn build_tray_menu(app: &AppHandle, snap: &TraySnapshot) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+
+    if CaptureManager::is_supported() {
+        let sync_item = CheckMenuItem::with_id(
+            app,
+            "sync",
+            "Screen sync",
+            true,
+            snap.sync_active,
+            None::<&str>,
+        )?;
+        let sep = PredefinedMenuItem::separator(app)?;
+        menu.append(&sync_item)?;
+        menu.append(&sep)?;
+    }
+
     let on = MenuItem::with_id(app, "on", "All on", true, None::<&str>)?;
     let off = MenuItem::with_id(app, "off", "All off", true, None::<&str>)?;
+    menu.append(&on)?;
+    menu.append(&off)?;
+
+    if !snap.groups.is_empty() || !snap.scenes.is_empty() {
+        let sep = PredefinedMenuItem::separator(app)?;
+        menu.append(&sep)?;
+
+        if !snap.groups.is_empty() {
+            let groups_sub = Submenu::new(app, "Groups", true)?;
+            for (id, name, any_on) in &snap.groups {
+                let item = CheckMenuItem::with_id(
+                    app,
+                    format!("group:{id}"),
+                    name,
+                    true,
+                    *any_on,
+                    None::<&str>,
+                )?;
+                groups_sub.append(&item)?;
+            }
+            menu.append(&groups_sub)?;
+        }
+
+        if !snap.scenes.is_empty() {
+            let scenes_sub = Submenu::new(app, "Scenes", true)?;
+            for (id, name) in &snap.scenes {
+                let item = MenuItem::with_id(app, format!("scene:{id}"), name, true, None::<&str>)?;
+                scenes_sub.append(&item)?;
+            }
+            menu.append(&scenes_sub)?;
+        }
+    }
+
+    let sep_bottom = PredefinedMenuItem::separator(app)?;
     let show = MenuItem::with_id(app, "show", "Show Groovie", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    menu.append(&sep_bottom)?;
+    menu.append(&show)?;
+    menu.append(&quit)?;
 
-    let menu = if CaptureManager::is_supported() {
-        let sync_item = CheckMenuItem::with_id(app, "sync", "Screen sync", true, false, None::<&str>)?;
-        let sep = PredefinedMenuItem::separator(app)?;
-        *app.state::<TraySyncItem>().0.lock().unwrap() = Some(sync_item.clone());
-        Menu::with_items(app, &[&sync_item, &sep, &on, &off, &show, &quit])?
-    } else {
-        Menu::with_items(app, &[&on, &off, &show, &quit])?
+    Ok(menu)
+}
+
+async fn refresh_tray_menu(app: &AppHandle, force: bool) {
+    let snap = collect_tray_snapshot(app).await;
+    let should_update = {
+        let mut guard = app.state::<TrayState>().0.lock().unwrap();
+        if !force && guard.as_ref() == Some(&snap) {
+            false
+        } else {
+            *guard = Some(snap.clone());
+            true
+        }
     };
+    if !should_update {
+        return;
+    }
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(menu) = build_tray_menu(app, &snap) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
+fn build_tray(app: &AppHandle, initial_snap: &TraySnapshot) -> tauri::Result<()> {
+    // Tray icon: left-click opens Groovie; right-click opens the menu.
+    let menu = build_tray_menu(app, initial_snap)?;
 
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("Groovie")
@@ -521,37 +692,54 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_main(tray.app_handle());
             }
         })
-        .on_menu_event(|app, ev| match ev.id.as_ref() {
-            "sync" => {
+        .on_menu_event(|app, ev| {
+            let id = ev.id.as_ref();
+            if let Some(group_id) = id.strip_prefix("group:") {
                 let app = app.clone();
+                let group_id = group_id.to_string();
                 tauri::async_runtime::spawn(async move {
-                    match set_or_toggle_sync(&app, None).await {
-                        Ok(st) => {
-                            if let Some(item) = app.state::<TraySyncItem>().0.lock().unwrap().clone() {
-                                let _ = item.set_checked(st.active);
-                            }
-                        }
-                        Err(_) => {
-                            if let Some(item) = app.state::<TraySyncItem>().0.lock().unwrap().clone() {
-                                let _ = item.set_checked(false);
-                            }
+                    if let Ok(g) = app.state::<AppState>().0.read().await.clone() {
+                        let _ = g.apply(&Target::Group(group_id), Action::Toggle).await;
+                    }
+                    refresh_tray_menu(&app, true).await;
+                });
+                return;
+            }
+            if let Some(scene_id) = id.strip_prefix("scene:") {
+                let app = app.clone();
+                let scene_id = scene_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(g) = app.state::<AppState>().0.read().await.clone() {
+                        let _ = g.apply_scene(&scene_id).await;
+                    }
+                    refresh_tray_menu(&app, false).await;
+                });
+                return;
+            }
+            match id {
+                "sync" => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if set_or_toggle_sync(&app, None).await.is_err() {
                             show_main(&app);
                         }
-                    }
-                });
+                        refresh_tray_menu(&app, true).await;
+                    });
+                }
+                "on" => all_power(app, true),
+                "off" => all_power(app, false),
+                "show" => show_main(app),
+                "quit" => {
+                    let _ = app.save_window_state(window_state_flags());
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        shutdown_engine_cleanly(&app, "quitting").await;
+                        remove_tray_icon(&app);
+                        app.exit(0);
+                    });
+                }
+                _ => {}
             }
-            "on" => all_power(app, true),
-            "off" => all_power(app, false),
-            "show" => show_main(app),
-            "quit" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    shutdown_engine_cleanly(&app, "quitting").await;
-                    remove_tray_icon(&app);
-                    app.exit(0);
-                });
-            }
-            _ => {}
         });
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
@@ -564,9 +752,20 @@ fn main() {
     tauri::Builder::default()
         // Must come first: if Groovie is already running in the tray, focus its
         // window and exit before touching UDP port 4002.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !has_minimized_arg(&args) {
+                show_main(app);
+            }
         }))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin({
             let builder = tauri_plugin_updater::Builder::new();
             builder.build()
@@ -574,18 +773,26 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
+            let start_hidden = has_minimized_arg(std::env::args())
+                || groovie_core::store::read_desktop_prefs().start_minimized;
             app.manage(CaptureManager::new());
             app.manage(IpcHandle(tokio::sync::Mutex::new(None)));
-            app.manage(TraySyncItem(Mutex::new(None)));
-            let initial = tauri::async_runtime::block_on(start_engine(&handle));
+            app.manage(TrayState(Mutex::new(None)));
+            let initial = tauri::async_runtime::block_on(start_engine(&handle, !start_hidden));
             app.manage(AppState(RwLock::new(initial)));
-            build_tray(&handle)?;
+            let snap = tauri::async_runtime::block_on(collect_tray_snapshot(&handle));
+            *handle.state::<TrayState>().0.lock().unwrap() = Some(snap.clone());
+            build_tray(&handle, &snap)?;
+            if !start_hidden {
+                show_main(&handle);
+            }
             Ok(())
         })
         // Closing the window keeps Groovie in the tray; use the tray's Quit to exit.
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
+                let _ = window.app_handle().save_window_state(window_state_flags());
                 let _ = window.hide();
                 update_poll_mode(window.app_handle(), false, false);
             }
@@ -624,6 +831,8 @@ fn main() {
             list_logs,
             clear_logs,
             set_window_active,
+            get_desktop_prefs,
+            set_desktop_prefs,
             get_config_info,
             reload_config,
             set_config_path,
@@ -633,4 +842,26 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Groovie");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimized_cli_flags() {
+        assert!(!has_minimized_arg(["groovie"]));
+        assert!(has_minimized_arg(["groovie", "--minimized"]));
+        assert!(has_minimized_arg(["groovie", "--hidden"]));
+        assert!(!has_minimized_arg(["groovie", "--other"]));
+    }
+
+    #[test]
+    fn window_state_flags_exclude_visibility() {
+        let flags = window_state_flags();
+        assert!(flags.contains(StateFlags::SIZE));
+        assert!(flags.contains(StateFlags::POSITION));
+        assert!(flags.contains(StateFlags::MAXIMIZED));
+        assert!(!flags.contains(StateFlags::VISIBLE));
+    }
 }
