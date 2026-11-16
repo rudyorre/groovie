@@ -517,27 +517,76 @@ impl Groovie {
 
     /// Snapshot the current state of `devices` (or every device) as a scene.
     pub async fn save_scene(&self, name: &str, devices: Option<Vec<String>>) -> Result<Scene> {
-        let entries: Vec<SceneEntry> = {
-            let all = self.inner.devices.read().await;
-            let ids: Vec<String> = devices.unwrap_or_else(|| all.keys().cloned().collect());
-            ids.iter()
-                .filter_map(|id| all.get(id))
-                .filter_map(|e| {
-                    let s = e.device.state?;
-                    Some(SceneEntry {
-                        device: e.device.id.clone(),
-                        on: s.on,
-                        brightness: Some(s.brightness),
-                        color: (s.kelvin == 0).then_some(s.color),
-                        kelvin: (s.kelvin > 0).then_some(s.kelvin),
-                    })
-                })
-                .collect()
-        };
+        let entries = self.inner.capture_scene_entries(devices).await;
         let scene = Scene { id: new_id("s"), name: name.trim().to_string(), entries };
         self.inner
             .mutate_store(|s| {
                 s.data.scenes.push(scene.clone());
+                Ok(())
+            })
+            .await?;
+        Ok(scene)
+    }
+
+    /// Rename an existing scene (matched by id or case-insensitive name).
+    pub async fn rename_scene(&self, id: &str, name: &str) -> Result<Scene> {
+        let trimmed = name.trim().to_string();
+        let mut updated = None;
+        self.inner
+            .mutate_store(|s| {
+                let sc = s
+                    .data
+                    .scenes
+                    .iter_mut()
+                    .find(|x| x.id == id || x.name.eq_ignore_ascii_case(id))
+                    .ok_or_else(|| Error::UnknownScene(id.into()))?;
+                sc.name = trimmed.clone();
+                updated = Some(sc.clone());
+                Ok(())
+            })
+            .await?;
+        Ok(updated.expect("scene updated"))
+    }
+
+    /// Overwrite an existing scene's saved entries with the current state of `devices`
+    /// (or all devices when `devices` is `None`), optionally updating its name as well.
+    pub async fn update_scene(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        devices: Option<Vec<String>>,
+    ) -> Result<Scene> {
+        let entries = self.inner.capture_scene_entries(devices).await;
+        let next_name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        let mut updated = None;
+        self.inner
+            .mutate_store(|s| {
+                let sc = s
+                    .data
+                    .scenes
+                    .iter_mut()
+                    .find(|x| x.id == id || x.name.eq_ignore_ascii_case(id))
+                    .ok_or_else(|| Error::UnknownScene(id.into()))?;
+                if let Some(n) = &next_name {
+                    sc.name = n.clone();
+                }
+                sc.entries = entries.clone();
+                updated = Some(sc.clone());
+                Ok(())
+            })
+            .await?;
+        Ok(updated.expect("scene updated"))
+    }
+
+    /// Restore a previously deleted scene (used by UI undo).
+    pub async fn restore_scene(&self, scene: Scene) -> Result<Scene> {
+        self.inner
+            .mutate_store(|s| {
+                if let Some(existing) = s.data.scenes.iter_mut().find(|x| x.id == scene.id) {
+                    *existing = scene.clone();
+                } else {
+                    s.data.scenes.push(scene.clone());
+                }
                 Ok(())
             })
             .await?;
@@ -713,6 +762,28 @@ impl Inner {
     fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
+    }
+
+    async fn capture_scene_entries(&self, devices: Option<Vec<String>>) -> Vec<SceneEntry> {
+        let all = self.devices.read().await;
+        let ids: Vec<String> = devices.unwrap_or_else(|| {
+            let mut k: Vec<String> = all.keys().cloned().collect();
+            k.sort();
+            k
+        });
+        ids.iter()
+            .filter_map(|id| all.get(id))
+            .filter_map(|e| {
+                let s = e.device.state?;
+                Some(SceneEntry {
+                    device: e.device.id.clone(),
+                    on: s.on,
+                    brightness: Some(s.brightness),
+                    color: (s.kelvin == 0).then_some(s.color),
+                    kelvin: (s.kelvin > 0).then_some(s.kelvin),
+                })
+            })
+            .collect()
     }
 
     async fn device_label_for_ip(&self, ip: IpAddr) -> Option<String> {

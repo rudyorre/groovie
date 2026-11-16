@@ -118,7 +118,10 @@ export interface Api {
   updateGroup(group: Group): Promise<void>;
   deleteGroup(id: string): Promise<void>;
   listScenes(): Promise<Scene[]>;
-  saveScene(name: string): Promise<Scene>;
+  saveScene(name: string, devices?: string[]): Promise<Scene>;
+  renameScene(id: string, name: string): Promise<Scene>;
+  updateScene(id: string, name: string | null, devices?: string[]): Promise<Scene>;
+  restoreScene(scene: Scene): Promise<Scene>;
   applyScene(id: string): Promise<void>;
   deleteScene(id: string): Promise<void>;
   getSyncState(): Promise<SyncState>;
@@ -171,7 +174,10 @@ async function tauriApi(): Promise<Api> {
     updateGroup: (group) => invoke('update_group', { group }),
     deleteGroup: (id) => invoke('delete_group', { id }),
     listScenes: () => invoke('list_scenes'),
-    saveScene: (name) => invoke('save_scene', { name }),
+    saveScene: (name, devices) => invoke('save_scene', { name, devices: devices ?? null }),
+    renameScene: (id, name) => invoke('rename_scene', { id, name }),
+    updateScene: (id, name, devices) => invoke('update_scene', { id, name, devices: devices ?? null }),
+    restoreScene: (scene) => invoke('restore_scene', { scene }),
     applyScene: (id) => invoke('apply_scene', { id }),
     deleteScene: (id) => invoke('delete_scene', { id }),
     getSyncState: () => invoke('get_sync_state'),
@@ -422,14 +428,48 @@ function mockApi(): Api {
     async updateGroup(g) { groups = groups.map((x) => (x.id === g.id ? g : x)); config(); },
     async deleteGroup(id) { groups = groups.filter((g) => g.id !== id); config(); },
     listScenes: async () => structuredClone(scenes),
-    async saveScene(name) {
-      const entries = devices.filter((d) => d.state).map((d) => ({
-        device: d.id, on: d.state!.on, brightness: d.state!.brightness,
-        ...(d.state!.kelvin ? { kelvin: d.state!.kelvin } : { color: d.state!.color }),
-      }));
-      const s = { id: `s${++n}`, name, entries };
+    async saveScene(name, devIds) {
+      const captureEntries = (ids?: string[]) =>
+        devices
+          .filter((d) => d.state && (!ids || ids.includes(d.id)))
+          .map((d) => ({
+            device: d.id,
+            on: d.state!.on,
+            brightness: d.state!.brightness,
+            ...(d.state!.kelvin ? { kelvin: d.state!.kelvin } : { color: d.state!.color }),
+          }));
+      const s = { id: `s${++n}`, name, entries: captureEntries(devIds) };
       scenes.push(s); config();
-      return s;
+      return structuredClone(s);
+    },
+    async renameScene(id, name) {
+      const s = scenes.find((x) => x.id === id);
+      if (!s) throw new Error('Scene not found');
+      s.name = name;
+      config();
+      return structuredClone(s);
+    },
+    async updateScene(id, name, devIds) {
+      const s = scenes.find((x) => x.id === id);
+      if (!s) throw new Error('Scene not found');
+      if (name != null && name.trim()) s.name = name.trim();
+      s.entries = devices
+        .filter((d) => d.state && (!devIds || devIds.includes(d.id)))
+        .map((d) => ({
+          device: d.id,
+          on: d.state!.on,
+          brightness: d.state!.brightness,
+          ...(d.state!.kelvin ? { kelvin: d.state!.kelvin } : { color: d.state!.color }),
+        }));
+      config();
+      return structuredClone(s);
+    },
+    async restoreScene(scene) {
+      const idx = scenes.findIndex((x) => x.id === scene.id);
+      if (idx >= 0) scenes[idx] = structuredClone(scene);
+      else scenes.push(structuredClone(scene));
+      config();
+      return structuredClone(scene);
     },
     async applyScene(id) {
       if (syncActive) {

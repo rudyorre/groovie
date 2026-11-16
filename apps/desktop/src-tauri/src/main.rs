@@ -260,8 +260,32 @@ async fn list_scenes(s: State<'_, AppState>) -> R<Vec<Scene>> {
 }
 
 #[tauri::command]
-async fn save_scene(s: State<'_, AppState>, name: String) -> R<Scene> {
-    engine(&s).await?.save_scene(&name, None).await.map_err(err)
+async fn save_scene(s: State<'_, AppState>, name: String, devices: Option<Vec<String>>) -> R<Scene> {
+    engine(&s).await?.save_scene(&name, devices).await.map_err(err)
+}
+
+#[tauri::command]
+async fn rename_scene(s: State<'_, AppState>, id: String, name: String) -> R<Scene> {
+    engine(&s).await?.rename_scene(&id, &name).await.map_err(err)
+}
+
+#[tauri::command]
+async fn update_scene(
+    s: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    devices: Option<Vec<String>>,
+) -> R<Scene> {
+    engine(&s)
+        .await?
+        .update_scene(&id, name.as_deref(), devices)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn restore_scene(s: State<'_, AppState>, scene: Scene) -> R<Scene> {
+    engine(&s).await?.restore_scene(scene).await.map_err(err)
 }
 
 #[tauri::command]
@@ -821,6 +845,9 @@ fn main() {
             delete_group,
             list_scenes,
             save_scene,
+            rename_scene,
+            update_scene,
+            restore_scene,
             apply_scene,
             delete_scene,
             get_sync_state,

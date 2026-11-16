@@ -19,7 +19,17 @@
   } from './lib/api';
   import DeviceCard from './lib/DeviceCard.svelte';
   import Icon from './lib/Icon.svelte';
+  import MasterControlBar from './lib/MasterControlBar.svelte';
   import ScreenSyncView from './lib/ScreenSyncView.svelte';
+
+  type SceneScope = 'all' | 'group' | 'custom';
+  type SceneModalState = {
+    id: string;
+    name: string;
+    scope: SceneScope;
+    groupId: string;
+    members: string[];
+  };
 
   let devices = $state<Device[]>([]);
   let groups = $state<Group[]>([]);
@@ -29,6 +39,7 @@
   /** 'all', 'sync', or a group id */
   let view = $state('all');
   let toast = $state('');
+  let toastAction = $state<{ label: string; run: () => void } | null>(null);
   let startupError = $state('');
   let version = $state('');
   let update = $state<Update | null>(null);
@@ -36,10 +47,9 @@
 
   // Dialogs / inline editors
   let editing = $state<Group | null>(null); // id '' = new group
+  let sceneModal = $state<SceneModalState | null>(null);
   let addingLight = $state(false);
   let ipDraft = $state('');
-  let namingScene = $state(false);
-  let sceneDraft = $state('');
   let scanning = $state(false);
   let logsOpen = $state(false);
   let logs = $state<LogEntry[]>([]);
@@ -76,10 +86,14 @@
   );
 
   let toastTimer: ReturnType<typeof setTimeout>;
-  function showToast(msg: string) {
+  function showToast(msg: string, action?: { label: string; run: () => void }, durationMs = 4000) {
     toast = msg;
+    toastAction = action ?? null;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (toast = ''), 4000);
+    toastTimer = setTimeout(() => {
+      toast = '';
+      toastAction = null;
+    }, durationMs);
   }
 
   async function run<T>(f: (a: Awaited<typeof api>) => Promise<T>) {
@@ -345,11 +359,142 @@
     }
   }
 
-  async function saveScene() {
-    const name = sceneDraft.trim();
-    namingScene = false;
-    sceneDraft = '';
-    if (name) await run((a) => a.saveScene(name));
+  function openCreateScene() {
+    if (group && group.members.length > 0) {
+      sceneModal = {
+        id: '',
+        name: '',
+        scope: 'group',
+        groupId: group.id,
+        members: [...group.members],
+      };
+    } else {
+      sceneModal = {
+        id: '',
+        name: '',
+        scope: 'all',
+        groupId: groups[0]?.id ?? '',
+        members: devices.map((d) => d.id),
+      };
+    }
+  }
+
+  function openEditScene(sc: Scene) {
+    const entryIds = sc.entries.map((e) => e.device);
+    const matchingGroup = groups.find(
+      (g) =>
+        g.members.length > 0 &&
+        g.members.length === entryIds.length &&
+        g.members.every((m) => entryIds.includes(m)),
+    );
+    const isAll =
+      devices.length > 0 &&
+      entryIds.length === devices.length &&
+      devices.every((d) => entryIds.includes(d.id));
+    sceneModal = {
+      id: sc.id,
+      name: sc.name,
+      scope: matchingGroup ? 'group' : isAll ? 'all' : 'custom',
+      groupId: matchingGroup?.id ?? group?.id ?? groups[0]?.id ?? '',
+      members: [...entryIds],
+    };
+  }
+
+  function resolveSceneModalDeviceIds(modal: SceneModalState): string[] | undefined {
+    if (modal.scope === 'all') return undefined;
+    if (modal.scope === 'group') {
+      const g = groups.find((x) => x.id === modal.groupId);
+      return g ? [...g.members] : [];
+    }
+    return [...modal.members];
+  }
+
+  async function submitSceneModal() {
+    if (!sceneModal) return;
+    const modal = $state.snapshot(sceneModal);
+    const name = modal.name.trim();
+    if (!name) return;
+    const devIds = resolveSceneModalDeviceIds(modal);
+    if (devIds && devIds.length === 0) {
+      showToast('Choose at least one light for this scene');
+      return;
+    }
+    sceneModal = null;
+
+    if (!modal.id) {
+      const saved = await run((a) => a.saveScene(name, devIds));
+      if (saved) {
+        showToast(
+          `Saved scene "${saved.name}" (${saved.entries.length} ${saved.entries.length === 1 ? 'light' : 'lights'})`,
+        );
+      }
+      return;
+    }
+
+    const existing = scenes.find((s) => s.id === modal.id);
+    if (!existing) return;
+    const targetIds = devIds ?? devices.map((d) => d.id);
+    const prevIds = existing.entries.map((e) => e.device);
+    const sameScope = targetIds.length === prevIds.length && targetIds.every((id) => prevIds.includes(id));
+
+    if (sameScope) {
+      if (name !== existing.name) {
+        await run((a) => a.renameScene(modal.id, name));
+      }
+    } else {
+      const nextEntries = targetIds.flatMap((id) => {
+        const prev = existing.entries.find((e) => e.device === id);
+        if (prev) return [structuredClone($state.snapshot(prev))];
+        const d = devices.find((x) => x.id === id);
+        if (!d?.state) return [];
+        return [
+          {
+            device: d.id,
+            on: d.state.on,
+            brightness: d.state.brightness,
+            ...(d.state.kelvin ? { kelvin: d.state.kelvin } : { color: d.state.color }),
+          },
+        ];
+      });
+      await run((a) => a.restoreScene({ id: modal.id, name, entries: nextEntries }));
+    }
+  }
+
+  async function captureSceneCurrentLook() {
+    if (!sceneModal || !sceneModal.id) return;
+    const modal = $state.snapshot(sceneModal);
+    const name = modal.name.trim();
+    if (!name) return;
+    const devIds = resolveSceneModalDeviceIds(modal);
+    if (devIds && devIds.length === 0) {
+      showToast('Choose at least one light for this scene');
+      return;
+    }
+    sceneModal = null;
+    const updated = await run((a) => a.updateScene(modal.id, name, devIds));
+    if (updated) {
+      showToast(
+        `Updated "${updated.name}" (${updated.entries.length} ${updated.entries.length === 1 ? 'light' : 'lights'})`,
+      );
+    }
+  }
+
+  async function deleteSceneWithUndo(sc: Scene) {
+    const backup = structuredClone($state.snapshot(sc));
+    await run((a) => a.deleteScene(backup.id));
+    showToast(
+      `Deleted scene "${backup.name}"`,
+      {
+        label: 'Undo',
+        run: () => {
+          toast = '';
+          toastAction = null;
+          clearTimeout(toastTimer);
+          run((a) => a.restoreScene(backup));
+        },
+      },
+      6000,
+    );
   }
 
   async function addLight() {
@@ -420,34 +565,26 @@
 
       <div class="section">
         <span>Scenes</span>
-        <button class="ghost icon-btn" title="Save current look as a scene" onclick={() => (namingScene = true)}>
+        <button class="ghost icon-btn" title="Save current look as a scene" onclick={openCreateScene}>
           <Icon name="plus" size={14} />
         </button>
       </div>
-      {#if namingScene}
-        <form onsubmit={(e) => { e.preventDefault(); saveScene(); }}>
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="field"
-            bind:value={sceneDraft}
-            placeholder="Scene name, then Enter"
-            autofocus
-            onblur={() => (namingScene = false)}
-            onkeydown={(e) => e.key === 'Escape' && (namingScene = false)}
-          />
-        </form>
-      {/if}
       {#each scenes as sc (sc.id)}
         <div class="scene">
-          <button class="nav-item" title="Apply scene" onclick={() => run((a) => a.applyScene(sc.id))}>
-            <Icon name="sparkle" /> <span>{sc.name}</span>
+          <button class="nav-item" title="Apply scene ({sc.entries.length} {sc.entries.length === 1 ? 'light' : 'lights'})" onclick={() => run((a) => a.applyScene(sc.id))}>
+            <Icon name="sparkle" /> <span>{sc.name}</span> <small class="scene-count">{sc.entries.length}</small>
           </button>
-          <button class="ghost icon-btn del" title="Delete scene" onclick={() => run((a) => a.deleteScene(sc.id))}>
-            <Icon name="x" size={14} />
-          </button>
+          <div class="scene-actions">
+            <button class="ghost icon-btn" title="Edit scene" onclick={() => openEditScene(sc)}>
+              <Icon name="pencil" size={13} />
+            </button>
+            <button class="ghost icon-btn" title="Delete scene" onclick={() => deleteSceneWithUndo(sc)}>
+              <Icon name="x" size={14} />
+            </button>
+          </div>
         </div>
       {:else}
-        {#if !namingScene}<p class="empty-hint">Save the current look with +.</p>{/if}
+        <p class="empty-hint">Save the current look with +.</p>
       {/each}
     </nav>
 
@@ -529,6 +666,11 @@
               <Icon name="pencil" size={14} /> Edit group
             </button>
           {/if}
+          {#if shown.length > 0}
+            <button class="ghost" title="Save current look as a scene" onclick={openCreateScene}>
+              <Icon name="sparkle" size={14} /> Save scene
+            </button>
+          {/if}
           <button class="ghost icon-btn" title="Add light by IP" onclick={() => (addingLight = true)}><Icon name="plus" /></button>
           <button class="ghost icon-btn" class:spin={scanning} title="Search for lights" onclick={rescan}><Icon name="refresh" /></button>
           <button onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))} disabled={!shown.length}>
@@ -545,6 +687,10 @@
           </div>
           <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
         </div>
+      {/if}
+
+      {#if group ? shown.length > 0 : shown.length > 1}
+        <MasterControlBar {target} devices={shown} groupName={group?.name} />
       {/if}
 
       <section class="grid">
@@ -597,6 +743,115 @@
         <span class="spacer"></span>
         <button type="button" class="ghost" onclick={() => (editing = null)}>Cancel</button>
         <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </div>
+{/if}
+
+{#if sceneModal}
+  <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (sceneModal = null)}>
+    <form class="dialog scene-dialog" onsubmit={(e) => { e.preventDefault(); submitSceneModal(); }}>
+      <h2>{sceneModal.id ? 'Edit scene' : 'Save scene'}</h2>
+      <p class="dialog-text">
+        {sceneModal.id
+          ? 'Rename this scene, adjust which lights it controls, or overwrite it with your current room look.'
+          : 'Snapshot the current power, brightness, colour, or white temperature of the selected lights.'}
+      </p>
+
+      <!-- svelte-ignore a11y_autofocus -->
+      <input class="field" bind:value={sceneModal.name} placeholder="Name, e.g. Late night" autofocus />
+
+      <div class="scope-block">
+        <span class="path-label">Lights in scene</span>
+        <div class="segmented" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sceneModal.scope === 'all'}
+            class:sel={sceneModal.scope === 'all'}
+            onclick={() => (sceneModal!.scope = 'all')}
+          >
+            All lights
+          </button>
+          {#if groups.length > 0}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sceneModal.scope === 'group'}
+              class:sel={sceneModal.scope === 'group'}
+              onclick={() => {
+                if (!sceneModal!.groupId && groups[0]) sceneModal!.groupId = groups[0].id;
+                sceneModal!.scope = 'group';
+              }}
+            >
+              Group
+            </button>
+          {/if}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sceneModal.scope === 'custom'}
+            class:sel={sceneModal.scope === 'custom'}
+            onclick={() => (sceneModal!.scope = 'custom')}
+          >
+            Choose lights
+          </button>
+        </div>
+
+        {#if sceneModal.scope === 'group'}
+          <select class="field" bind:value={sceneModal.groupId} aria-label="Scene group">
+            {#each groups as g (g.id)}
+              <option value={g.id}>{g.name} ({g.members.length} {g.members.length === 1 ? 'light' : 'lights'})</option>
+            {/each}
+          </select>
+        {:else if sceneModal.scope === 'custom'}
+          <div class="checks">
+            {#each devices as d (d.id)}
+              <label class="check">
+                <input type="checkbox" value={d.id} bind:group={sceneModal.members} />
+                <span>{d.name}</span>
+                <small>{d.sku}</small>
+              </label>
+            {/each}
+          </div>
+        {:else}
+          <p class="scope-hint">
+            Includes {devices.length === 1 ? '1 discovered light' : `all ${devices.length} discovered lights`}.
+          </p>
+        {/if}
+      </div>
+
+      {#if sceneModal.id}
+        <button
+          type="button"
+          class="capture-btn"
+          disabled={!sceneModal.name.trim()}
+          onclick={captureSceneCurrentLook}
+        >
+          <Icon name="sparkle" size={14} />
+          <span>Overwrite with current look</span>
+        </button>
+      {/if}
+
+      <div class="dialog-actions">
+        {#if sceneModal.id}
+          <button
+            type="button"
+            class="ghost danger"
+            onclick={() => {
+              const sc = scenes.find((s) => s.id === sceneModal?.id);
+              sceneModal = null;
+              if (sc) deleteSceneWithUndo(sc);
+            }}
+          >
+            <Icon name="trash" size={14} /> Delete
+          </button>
+        {/if}
+        <span class="spacer"></span>
+        <button type="button" class="ghost" onclick={() => (sceneModal = null)}>Cancel</button>
+        <button type="submit" class="primary" disabled={!sceneModal.name.trim()}>
+          {sceneModal.id ? 'Save' : 'Save scene'}
+        </button>
       </div>
     </form>
   </div>
@@ -797,13 +1052,21 @@
     if (e.key !== 'Escape') return;
     if (logsOpen) logsOpen = false;
     else if (configOpen) configOpen = false;
+    else if (sceneModal) sceneModal = null;
     else if (editing) editing = null;
     else if (addingLight) addingLight = false;
   }}
 />
 
 {#if toast}
-  <div class="toast" role="status">{toast}</div>
+  <div class="toast" role="status">
+    <span>{toast}</span>
+    {#if toastAction}
+      <button type="button" class="toast-btn" onclick={() => toastAction?.run()}>
+        {toastAction.label}
+      </button>
+    {/if}
+  </div>
 {/if}
 
 <style>
@@ -881,10 +1144,11 @@
     color: var(--text-3);
   }
   .empty-hint { margin: 2px 10px 4px; font-size: 12.5px; color: var(--text-3); line-height: 1.4; }
-  .scene { display: flex; align-items: center; }
-  .scene .del { opacity: 0; }
-  .scene:hover .del, .scene .del:focus-visible { opacity: 1; }
-  nav form { padding: 2px 0 4px; }
+  .scene { display: flex; align-items: center; border-radius: 7px; }
+  .scene .nav-item { flex: 1; width: auto; min-width: 0; }
+  .scene-actions { display: flex; align-items: center; gap: 1px; opacity: 0; }
+  .scene:hover .scene-actions, .scene-actions:focus-within { opacity: 1; }
+  .scene:hover .scene-count, .scene:focus-within .scene-count { display: none; }
 
   footer { display: flex; flex-direction: column; gap: 8px; padding: 10px 4px 0 3px; }
   .foot-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
@@ -995,9 +1259,35 @@
     gap: 12px;
     box-shadow: 0 20px 60px #0007;
   }
+  .scene-dialog { width: min(420px, 92vw); }
   .dialog h2 { margin: 0; font-size: 16px; font-weight: 600; }
   .dialog-text { margin: -4px 0 0; color: var(--text-2); font-size: 13px; line-height: 1.45; }
-  .checks { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+  .scope-block {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .scope-hint {
+    margin: 2px 0 0;
+    font-size: 12.5px;
+    color: var(--text-2);
+  }
+  .capture-btn {
+    width: 100%;
+    justify-content: center;
+    background: #ffb02016;
+    border-color: #ffb0204d;
+    color: var(--accent);
+    font-weight: 550;
+  }
+  .capture-btn:hover:not(:disabled) {
+    background: #ffb02026;
+  }
+  .checks { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto; }
   .check { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 7px; cursor: pointer; }
   .check:hover { background: var(--hover); }
   .check span { flex: 1; }
@@ -1132,6 +1422,9 @@
     bottom: 18px;
     left: 50%;
     transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 10px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     padding: 9px 14px;
@@ -1140,6 +1433,19 @@
     box-shadow: 0 10px 30px #0006;
     max-width: min(520px, 90vw);
     animation: fade 0.15s ease-out;
+  }
+  .toast-btn {
+    height: 24px;
+    padding: 0 9px;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 6px;
+    background: #ffb02024;
+    border-color: #ffb02055;
+    color: var(--accent);
+  }
+  .toast-btn:hover:not(:disabled) {
+    background: #ffb02036;
   }
   @keyframes fade { from { opacity: 0; } }
 

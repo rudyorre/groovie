@@ -100,6 +100,17 @@ pub enum IpcRequest {
         name: String,
         lights: Vec<String>,
     },
+    SceneRename {
+        scene: String,
+        name: String,
+    },
+    SceneUpdate {
+        scene: String,
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        lights: Vec<String>,
+    },
     SceneApply {
         scene: String,
     },
@@ -355,6 +366,32 @@ async fn dispatch(
                 Some(resolve_device_list(g, &lights).await?)
             };
             let sc: Scene = g.save_scene(&name, ids).await.map_err(|e| e.to_string())?;
+            to_val(serde_json::to_value(sc))
+        }
+        IpcRequest::SceneRename { scene, name } => {
+            let sc = g.rename_scene(&scene, &name).await.map_err(|e| e.to_string())?;
+            to_val(serde_json::to_value(sc))
+        }
+        IpcRequest::SceneUpdate { scene, all, lights } => {
+            let existing = g
+                .scenes()
+                .await
+                .into_iter()
+                .find(|s| s.id == scene || s.name.eq_ignore_ascii_case(&scene))
+                .ok_or_else(|| format!("no scene called '{scene}'"))?;
+            let ids = if all {
+                None
+            } else if !lights.is_empty() {
+                Some(resolve_device_list(g, &lights).await?)
+            } else if !existing.entries.is_empty() {
+                Some(existing.entries.into_iter().map(|e| e.device).collect())
+            } else {
+                None
+            };
+            let sc = g
+                .update_scene(&existing.id, None, ids)
+                .await
+                .map_err(|e| e.to_string())?;
             to_val(serde_json::to_value(sc))
         }
         IpcRequest::SceneApply { scene } => {
