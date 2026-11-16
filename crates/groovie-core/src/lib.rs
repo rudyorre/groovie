@@ -14,12 +14,15 @@
 //! ```
 
 pub mod engine;
+pub mod ipc;
 pub mod model;
 pub mod protocol;
 pub mod store;
 pub mod sync;
 
-pub use engine::{Config, Error, Groovie, Result};
+pub use engine::{
+    new_store_id, send_ephemeral_action, send_ephemeral_scene, Config, Error, Groovie, Result,
+};
 pub use model::*;
 pub use protocol::Rgb;
 pub use sync::*;

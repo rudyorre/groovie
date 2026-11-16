@@ -11,6 +11,11 @@ authors.workspace = true
 groovie-core = { path = "../groovie-core" }
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+groovie-sim = { path = "../groovie-sim" }
+tempfile = "3"

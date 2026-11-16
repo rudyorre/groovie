@@ -292,9 +292,89 @@ pub fn default_auto_store_path() -> Option<PathBuf> {
     platform_config_dir().map(|d| d.join("groovie.json"))
 }
 
+impl StoreData {
+    pub fn display_name(&self, id: &str, sku: &str) -> String {
+        self.nicknames
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| crate::model::friendly_sku_name(sku))
+    }
+
+    /// Resolve a human query (`"all"`, device id/nickname/SKU-name/IP, or group id/name)
+    /// against persisted `known_devices` and `groups`. Returns `None` when a target
+    /// cannot be satisfied purely from cached store metadata.
+    pub fn resolve_target(&self, query: &str) -> Option<crate::model::Target> {
+        use crate::model::Target;
+        let q = query.trim();
+        if q.eq_ignore_ascii_case("all") {
+            return (!self.known_devices.is_empty()).then_some(Target::All);
+        }
+        for d in &self.known_devices {
+            let name = self.display_name(&d.id, &d.sku);
+            if d.id.eq_ignore_ascii_case(q)
+                || name.eq_ignore_ascii_case(q)
+                || d.ip.to_string() == q
+            {
+                return Some(Target::Device(d.id.clone()));
+            }
+        }
+        if let Some(g) = self
+            .groups
+            .iter()
+            .find(|g| g.id == q || g.name.eq_ignore_ascii_case(q))
+        {
+            let all_known = g
+                .members
+                .iter()
+                .all(|m| self.known_devices.iter().any(|d| &d.id == m));
+            if all_known {
+                return Some(Target::Group(g.id.clone()));
+            }
+        }
+        None
+    }
+
+    /// Resolve `(device_id, ip)` pairs for `target` if all referenced devices are in `known_devices`.
+    pub fn resolve_known_ips(&self, target: &crate::model::Target) -> Option<Vec<(String, Ipv4Addr)>> {
+        use crate::model::Target;
+        match target {
+            Target::All => {
+                if self.known_devices.is_empty() {
+                    return None;
+                }
+                Some(self.known_devices.iter().map(|d| (d.id.clone(), d.ip)).collect())
+            }
+            Target::Device(id) => self
+                .known_devices
+                .iter()
+                .find(|d| &d.id == id)
+                .map(|d| vec![(d.id.clone(), d.ip)]),
+            Target::Group(gid) => {
+                let g = self.groups.iter().find(|g| &g.id == gid)?;
+                let mut out = Vec::with_capacity(g.members.len());
+                for m in &g.members {
+                    let d = self.known_devices.iter().find(|k| &k.id == m)?;
+                    out.push((d.id.clone(), d.ip));
+                }
+                Some(out)
+            }
+        }
+    }
+}
+
 /// Active default config file location (honoring any custom path pointer).
 pub fn default_store_path() -> Option<PathBuf> {
     read_custom_store_path().or_else(default_auto_store_path)
+}
+
+/// Runtime IPC descriptor location for `grooviectl` <-> desktop coordination.
+/// Lives in the OS config dir (never inside a symlinked dotfiles repo) unless
+/// overridden via `GROOVIE_IPC_FILE`.
+pub fn default_ipc_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("GROOVIE_IPC_FILE").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    platform_config_dir().map(|d| d.join("daemon.json"))
 }
 
 #[cfg(test)]

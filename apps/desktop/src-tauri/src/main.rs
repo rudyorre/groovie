@@ -26,7 +26,35 @@ const GITHUB_URL: &str = "https://github.com/rudyorre/groovie";
 /// the window can still open and tell the user what's holding it.
 struct AppState(RwLock<Result<Groovie, String>>);
 
+/// Owns the loopback IPC server so `grooviectl` can share the running tray engine.
+struct IpcHandle(tokio::sync::Mutex<Option<groovie_core::ipc::IpcServer>>);
+
 struct TraySyncItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
+
+struct DesktopSyncController(AppHandle);
+
+impl groovie_core::ipc::SyncController for DesktopSyncController {
+    fn is_supported(&self) -> bool {
+        CaptureManager::is_supported()
+    }
+
+    fn set_or_toggle<'a>(
+        &'a self,
+        desired: Option<bool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncStatus, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let payload = set_or_toggle_sync(&self.0, desired).await?;
+            if let Some(item) = self.0.state::<TraySyncItem>().0.lock().unwrap().clone() {
+                let _ = item.set_checked(payload.active);
+            }
+            Ok(SyncStatus {
+                active: payload.active,
+                active_devices: payload.active_devices,
+                config: payload.config,
+            })
+        })
+    }
+}
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +85,11 @@ fn err(e: impl std::fmt::Display) -> String {
 async fn start_engine(app: &AppHandle) -> R<Groovie> {
     let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
     groovie.set_poll_interval(ACTIVE_POLL);
+    let sync_ctl: std::sync::Arc<dyn groovie_core::ipc::SyncController> =
+        std::sync::Arc::new(DesktopSyncController(app.clone()));
+    if let Ok(ipc) = groovie_core::ipc::IpcServer::start_default(groovie.clone(), Some(sync_ctl)).await {
+        *app.state::<IpcHandle>().0.lock().await = ipc;
+    }
     let mut rx = groovie.subscribe();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -86,6 +119,7 @@ async fn engine(s: &State<'_, AppState>) -> R<Groovie> {
 }
 
 async fn shutdown_engine_cleanly(app: &AppHandle, reason: &str) {
+    *app.state::<IpcHandle>().0.lock().await = None;
     app.state::<CaptureManager>().stop();
     let prev = {
         let state = app.state::<AppState>();
@@ -541,6 +575,7 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(CaptureManager::new());
+            app.manage(IpcHandle(tokio::sync::Mutex::new(None)));
             app.manage(TraySyncItem(Mutex::new(None)));
             let initial = tauri::async_runtime::block_on(start_engine(&handle));
             app.manage(AppState(RwLock::new(initial)));

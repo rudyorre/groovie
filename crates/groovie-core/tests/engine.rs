@@ -628,3 +628,140 @@ async fn screen_sync_identify_sweeps_and_restores_when_idle() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn ipc_coexists_with_running_daemon_and_toggles_sync() {
+    use groovie_core::ipc::{try_call_at, IpcOutcome, IpcRequest, IpcServer, SyncStatusInfo};
+    use groovie_core::{Device, Group, Scene};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ipc_path = dir.path().join("daemon.json");
+    let r = spawn_custom_sims(18, 41170, &["H6056", "H6076"]).await;
+    let bars_id = r.sims[0].config.id.clone();
+
+    let server = IpcServer::start(r.g.clone(), ipc_path.clone(), None).await.unwrap();
+    assert!(ipc_path.is_file());
+
+    // List devices through IPC while `r.g` owns the UDP reply port.
+    let IpcOutcome::Ok(devs) =
+        try_call_at::<Vec<Device>>(&ipc_path, IpcRequest::ListDevices { scan: false, wait_ms: 0 }).await
+    else {
+        panic!("expected IPC ListDevices to succeed");
+    };
+    assert_eq!(devs.len(), 2);
+
+    // Toggle and colour commands through IPC update both hardware and live engine state.
+    let IpcOutcome::Ok(()) = try_call_at::<()>(
+        &ipc_path,
+        IpcRequest::Apply { target: bars_id.clone(), action: Action::Toggle },
+    )
+    .await
+    else {
+        panic!("expected IPC Apply(Toggle) to succeed");
+    };
+    eventually("IPC toggle turned bars on", || async { r.sims[0].state().on }).await;
+
+    // Group + Scene + Sync operations over IPC.
+    let IpcOutcome::Ok(gr) = try_call_at::<Group>(
+        &ipc_path,
+        IpcRequest::GroupCreate { name: "Desk".into(), lights: vec![bars_id.clone()] },
+    )
+    .await
+    else {
+        panic!("expected IPC GroupCreate to succeed");
+    };
+    assert_eq!(gr.name, "Desk");
+
+    let IpcOutcome::Ok(sc) = try_call_at::<Scene>(
+        &ipc_path,
+        IpcRequest::SceneSave { name: "Focus".into(), lights: vec![bars_id] },
+    )
+    .await
+    else {
+        panic!("expected IPC SceneSave to succeed");
+    };
+    assert_eq!(sc.entries.len(), 1);
+
+    let IpcOutcome::Ok(sync_on) =
+        try_call_at::<SyncStatusInfo>(&ipc_path, IpcRequest::SyncSet { enabled: Some(true) }).await
+    else {
+        panic!("expected IPC SyncSet(true) to succeed");
+    };
+    assert!(sync_on.active);
+
+    let IpcOutcome::Ok(sync_toggled) =
+        try_call_at::<SyncStatusInfo>(&ipc_path, IpcRequest::SyncSet { enabled: None }).await
+    else {
+        panic!("expected IPC SyncSet(toggle) to succeed");
+    };
+    assert!(!sync_toggled.active);
+
+    // Dropping the server removes `daemon.json` and causes try_call_at to report Unavailable.
+    drop(server);
+    assert!(!ipc_path.exists());
+    assert!(matches!(
+        try_call_at::<Vec<Device>>(&ipc_path, IpcRequest::ListDevices { scan: false, wait_ms: 0 }).await,
+        IpcOutcome::Unavailable
+    ));
+}
+
+#[tokio::test]
+async fn ephemeral_fast_path_works_without_binding_reply_port() {
+    use groovie_core::store::Store;
+    use groovie_core::{send_ephemeral_action, send_ephemeral_scene};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("groovie.json");
+    let (net, base) = (19, 41180);
+    let sims = spawn_sims(net, base, 2).await;
+    let lamp_id = sims[0].config.id.clone();
+
+    // Seed `groovie.json` with known devices and a saved scene, then hold the reply port open
+    // with `holder` to prove the ephemeral path never touches the reply port (`base + 2`).
+    let holder = Groovie::start(config(net, base, 2, Some(store_path.clone()))).await.unwrap();
+    let g2 = holder.clone();
+    eventually("discovered and persisted", || {
+        let g = g2.clone();
+        async move { g.devices().await.len() == 2 && g.devices().await.iter().all(|d| d.state.is_some()) }
+    })
+    .await;
+    holder.rename_device(&lamp_id, "Study Lamp").await.unwrap();
+    holder.apply(&Target::Device(lamp_id.clone()), Action::Power(true)).await.unwrap();
+    holder
+        .apply(&Target::Device(lamp_id.clone()), Action::Color(Rgb::new(12, 200, 90)))
+        .await
+        .unwrap();
+    holder.save_scene("Mint", Some(vec![lamp_id.clone()])).await.unwrap();
+    holder.apply(&Target::Device(lamp_id), Action::Power(false)).await.unwrap();
+    eventually("lamp off before ephemeral test", || async { !sims[0].state().on }).await;
+
+    // Open the persisted store directly while `holder` still binds `(127.0.19.1, 41182)`.
+    let store = Store::open(&store_path).unwrap();
+    let target = store.data.resolve_target("study lamp").expect("study lamp resolved");
+    assert!(send_ephemeral_action(&store, &target, Action::Power(true), base + 1).await.unwrap());
+    eventually("ephemeral power on", || async { sims[0].state().on }).await;
+
+    assert!(
+        send_ephemeral_action(&store, &Target::All, Action::Brightness(42), base + 1)
+            .await
+            .unwrap()
+    );
+    eventually("ephemeral brightness 42", || async {
+        sims[0].state().brightness == 42 && sims[1].state().brightness == 42
+    })
+    .await;
+
+    // Reset colour then apply scene via ephemeral UDP.
+    assert!(
+        send_ephemeral_action(&store, &target, Action::Color(Rgb::new(255, 0, 0)), base + 1)
+            .await
+            .unwrap()
+    );
+    eventually("ephemeral red", || async { sims[0].state().color == Rgb::new(255, 0, 0) }).await;
+
+    assert!(send_ephemeral_scene(&store, "mint", base + 1).await.unwrap());
+    eventually("ephemeral scene restored mint", || async {
+        sims[0].state().on && sims[0].state().color == Rgb::new(12, 200, 90)
+    })
+    .await;
+}
