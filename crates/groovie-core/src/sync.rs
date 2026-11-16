@@ -288,37 +288,7 @@ pub enum SkuSyncShape {
 }
 
 pub fn sku_sync_shape(sku: &str) -> SkuSyncShape {
-    match sku.trim().to_ascii_uppercase().as_str() {
-        // Flow Plus / Flow Pro 2-bar kits: 6 segments per bar (slots 0..6 and 6..12).
-        "H6056" | "H6043" => SkuSyncShape::DualBars { segments_per_bar: 6 },
-        // Gaming / TV Light Bars 2-bar kits: 10 segments per bar (slots 0..10 and 10..20).
-        "H6046" | "H6047" | "H6048" => SkuSyncShape::DualBars { segments_per_bar: 10 },
-        // Razer-capable RGBIC Floor Lamps.
-        "H6072" | "H6079" | "H607C" | "H6078" | "H6672" => SkuSyncShape::LinearRazer {
-            segments: 15,
-            orientation: Orientation::Vertical,
-            corner_lamp: true,
-        },
-        // Non-Razer Floor Lamps (solid fallback by default).
-        "H6076" | "H6073" => SkuSyncShape::SingleSolid { corner_lamp: true },
-        // Glide / Neon / Wall bars.
-        "H6061" | "H6062" | "H6065" | "H6066" | "H6067" | "H610A" | "H610B" => {
-            SkuSyncShape::LinearRazer {
-                segments: 10,
-                orientation: Orientation::Horizontal,
-                corner_lamp: false,
-            }
-        }
-        // RGBIC LED strips & COB strips.
-        "H619A" | "H619B" | "H619C" | "H619D" | "H619E" | "H619Z" | "H618A" | "H618C"
-        | "H61A0" | "H61A1" | "H61A2" | "H61A3" | "H61BA" | "H61BC" | "H61BE" | "H612F"
-        | "H61E5" => SkuSyncShape::LinearRazer {
-            segments: 15,
-            orientation: Orientation::Horizontal,
-            corner_lamp: false,
-        },
-        _ => SkuSyncShape::SingleSolid { corner_lamp: false },
-    }
+    crate::model::sku_metadata(sku).sync_shape
 }
 
 pub fn placement_id(device_id: &str, part: PlacementPart) -> String {

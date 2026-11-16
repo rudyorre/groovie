@@ -67,6 +67,7 @@
   const group = $derived(groups.find((g) => g.id === view));
   const shown = $derived(group ? devices.filter((d) => group.members.includes(d.id)) : devices);
   const target = $derived<Target>(group ? { type: 'group', id: group.id } : { type: 'all' });
+  const isInvalidConfigError = $derived(startupError.startsWith('Invalid config file'));
   const peerConflict = $derived(syncState && !syncState.active ? (syncState.conflict ?? null) : null);
   const peerSyncedIds = $derived(peerConflict?.deviceIds ?? []);
   const peerSyncedSet = $derived(new Set(peerSyncedIds));
@@ -460,12 +461,15 @@
         if (prev) return [structuredClone($state.snapshot(prev))];
         const d = devices.find((x) => x.id === id);
         if (!d?.state) return [];
+        const hasColor = d.state.color.r !== 0 || d.state.color.g !== 0 || d.state.color.b !== 0;
         return [
           {
             device: d.id,
             on: d.state.on,
             brightness: d.state.brightness,
-            ...(d.state.kelvin ? { kelvin: d.state.kelvin } : { color: d.state.color }),
+            ...(d.state.kelvin
+              ? { kelvin: d.state.kelvin }
+              : { color: hasColor ? d.state.color : (d.lastColor ?? { r: 255, g: 180, b: 100 }) }),
           },
         ];
       });
@@ -673,10 +677,15 @@
       {#if startupError}
         <div class="banner" role="alert">
           <div>
-            <strong>Could not start local network listener</strong>
+            <strong>{isInvalidConfigError ? 'Configuration file has invalid JSON' : 'Could not start local network listener'}</strong>
             <p>{startupError}</p>
           </div>
-          <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+          <div class="banner-actions">
+            {#if isInvalidConfigError}
+              <button class="ghost" onclick={openConfig}><Icon name="sliders" size={14} /> Open config</button>
+            {/if}
+            <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+          </div>
         </div>
       {/if}
       <ScreenSyncView
@@ -720,10 +729,15 @@
       {#if startupError}
         <div class="banner" role="alert">
           <div>
-            <strong>Could not start local network listener</strong>
+            <strong>{isInvalidConfigError ? 'Configuration file has invalid JSON' : 'Could not start local network listener'}</strong>
             <p>{startupError}</p>
           </div>
-          <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+          <div class="banner-actions">
+            {#if isInvalidConfigError}
+              <button class="ghost" onclick={openConfig}><Icon name="sliders" size={14} /> Open config</button>
+            {/if}
+            <button onclick={rescan}><Icon name="refresh" size={14} /> Retry</button>
+          </div>
         </div>
       {/if}
 
@@ -1276,6 +1290,7 @@
     margin-bottom: 16px;
   }
   .banner p { margin: 3px 0 0; color: var(--text-2); font-size: 13px; }
+  .banner-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .empty {
     grid-column: 1 / -1;
     max-width: 440px;

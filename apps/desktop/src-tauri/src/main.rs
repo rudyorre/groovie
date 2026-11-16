@@ -9,11 +9,12 @@ use groovie_core::{
     SyncConfig, SyncPeerConflict, SyncStatus, Target,
 };
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_window_state::{AppHandleExt as WindowStateAppExt, StateFlags};
 use tokio::sync::broadcast::error::RecvError;
@@ -47,6 +48,9 @@ struct AppState(RwLock<Result<Groovie, String>>);
 
 /// Owns the loopback IPC server so `grooviectl` can share the running tray engine.
 struct IpcHandle(tokio::sync::Mutex<Option<groovie_core::ipc::IpcServer>>);
+
+/// Guards exit teardown so Screen Sync restoration runs at most once across tray Quit and OS Exit.
+struct ShuttingDown(AtomicBool);
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct TraySnapshot {
@@ -115,6 +119,7 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 async fn start_engine(app: &AppHandle, start_active: bool) -> R<Groovie> {
+    app.state::<ShuttingDown>().0.store(false, Ordering::SeqCst);
     let groovie = Groovie::start(Config::default().with_env_overrides()).await.map_err(err)?;
     groovie.set_poll_interval(if start_active { ACTIVE_POLL } else { IDLE_POLL });
     let sync_ctl: std::sync::Arc<dyn groovie_core::ipc::SyncController> =
@@ -799,11 +804,13 @@ fn build_tray(app: &AppHandle, initial_snap: &TraySnapshot) -> tauri::Result<()>
                 "off" => all_power(app, false),
                 "show" => show_main(app),
                 "quit" => {
-                    let _ = app.save_window_state(window_state_flags());
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        shutdown_engine_cleanly(&app, "quitting").await;
-                        remove_tray_icon(&app);
+                        if !app.state::<ShuttingDown>().0.swap(true, Ordering::SeqCst) {
+                            let _ = app.save_window_state(window_state_flags());
+                            shutdown_engine_cleanly(&app, "quitting").await;
+                            remove_tray_icon(&app);
+                        }
                         app.exit(0);
                     });
                 }
@@ -815,6 +822,15 @@ fn build_tray(app: &AppHandle, initial_snap: &TraySnapshot) -> tauri::Result<()>
     }
     tray.build(app)?;
     Ok(())
+}
+
+fn teardown_for_exit(app: &AppHandle, reason: &str) {
+    if app.state::<ShuttingDown>().0.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.save_window_state(window_state_flags());
+    tauri::async_runtime::block_on(shutdown_engine_cleanly(app, reason));
+    remove_tray_icon(app);
 }
 
 fn main() {
@@ -846,6 +862,7 @@ fn main() {
                 || groovie_core::store::read_desktop_prefs().start_minimized;
             app.manage(CaptureManager::new());
             app.manage(IpcHandle(tokio::sync::Mutex::new(None)));
+            app.manage(ShuttingDown(AtomicBool::new(false)));
             app.manage(TrayState(Mutex::new(None)));
             let initial = tauri::async_runtime::block_on(start_engine(&handle, !start_hidden));
             app.manage(AppState(RwLock::new(initial)));
@@ -913,8 +930,13 @@ fn main() {
             open_github,
             prepare_update_install,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Groovie");
+        .build(tauri::generate_context!())
+        .expect("error while building Groovie")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                teardown_for_exit(app, "exiting");
+            }
+        });
 }
 
 #[cfg(test)]

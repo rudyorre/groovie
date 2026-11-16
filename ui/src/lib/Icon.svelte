@@ -14,6 +14,7 @@
     download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
     lamp: '<path d="M9 3h6l3 7H6Z"/><path d="M12 10v11M9 21h6"/>',
     bars: '<rect x="5.5" y="3" width="4" height="18" rx="2"/><rect x="14.5" y="3" width="4" height="18" rx="2"/>',
+    strip: '<path d="M4 7h11a3 3 0 0 1 0 6H9a3 3 0 0 0 0 6h11"/><circle cx="7" cy="7" r="1"/><circle cx="12" cy="7" r="1"/><circle cx="12" cy="13" r="1"/><circle cx="12" cy="19" r="1"/><circle cx="17" cy="19" r="1"/>',
     bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3Z"/>',
     sun: '<circle cx="12" cy="12" r="3.5"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4"/>',
     terminal: '<path d="m5 7 5 5-5 5M12 19h7"/>',

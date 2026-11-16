@@ -37,6 +37,8 @@ const KNOWN_PEER_TTL: Duration = Duration::from_secs(600);
 pub enum Error {
     #[error("network error: {0}")]
     Io(#[from] io::Error),
+    #[error("Invalid config file ({path}): {message}")]
+    InvalidConfig { path: String, message: String },
     #[error("unknown device '{0}'")]
     UnknownDevice(String),
     #[error("unknown group '{0}'")]
@@ -55,6 +57,19 @@ pub enum Error {
     SyncConflict { host_name: String },
     #[error("{device} is currently controlled by Screen Sync on {host_name}")]
     DeviceSyncedByPeer { device: String, host_name: String },
+}
+
+fn map_store_err(err: io::Error, path: Option<&std::path::Path>) -> Error {
+    if err.kind() == io::ErrorKind::InvalidData {
+        let path_str = path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "groovie.json".to_string());
+        let raw = err.to_string();
+        let prefix = format!("invalid JSON in {path_str}: ");
+        let message = raw.strip_prefix(&prefix).unwrap_or(&raw).to_string();
+        return Error::InvalidConfig { path: path_str, message };
+    }
+    Error::Io(err)
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -263,11 +278,11 @@ impl Groovie {
     /// Bind the socket, load config, start background tasks and kick off
     /// discovery.
     pub async fn start(cfg: Config) -> Result<Self> {
-        let sock = bind_socket(cfg.listen)?;
         let store = match &cfg.store_path {
-            Some(p) => Store::open(p)?,
+            Some(p) => Store::open(p).map_err(|e| map_store_err(e, Some(p.as_path())))?,
             None => Store::in_memory(),
         };
+        let sock = bind_socket(cfg.listen)?;
 
         // Show previously seen devices immediately (offline until they answer).
         let mut devices = HashMap::new();
@@ -276,17 +291,7 @@ impl Groovie {
             devices.insert(
                 k.id.clone(),
                 Entry {
-                    device: Device {
-                        id: k.id.clone(),
-                        ip: k.ip,
-                        sku: k.sku.clone(),
-                        name,
-                        online: false,
-                        state: None,
-                        firmware: None,
-                        last_color: None,
-                        last_kelvin: None,
-                    },
+                    device: Device::new(k.id.clone(), k.ip, k.sku.clone(), name),
                     last_seen: None,
                     last_command: None,
                     missed_polls: 0,
@@ -864,19 +869,30 @@ impl Groovie {
 
     /// Re-read `groovie.json` from disk and reconcile device nicknames/groups/scenes.
     pub async fn reload_config(&self) -> Result<ConfigInfo> {
-        let mut store = self.inner.store.lock().await;
-        store.reload()?;
-        self.inner.apply_store_to_devices(&store).await;
-        Ok(build_config_info(&store))
+        let (data, info) = {
+            let mut store = self.inner.store.lock().await;
+            let path = store.path().map(PathBuf::from);
+            store
+                .reload()
+                .map_err(|e| map_store_err(e, path.as_deref()))?;
+            (store.data.clone(), build_config_info(&store))
+        };
+        self.inner.apply_store_to_devices(&data).await;
+        Ok(info)
     }
 
     /// Switch the engine's config file to `path` (adopting existing JSON if
     /// `path` exists, or seeding `path` with the current config otherwise).
     pub async fn switch_store_path(&self, path: PathBuf) -> Result<ConfigInfo> {
-        let mut store = self.inner.store.lock().await;
-        store.set_path(path)?;
-        self.inner.apply_store_to_devices(&store).await;
-        Ok(build_config_info(&store))
+        let (data, info) = {
+            let mut store = self.inner.store.lock().await;
+            store
+                .set_path(path.clone())
+                .map_err(|e| map_store_err(e, Some(path.as_path())))?;
+            (store.data.clone(), build_config_info(&store))
+        };
+        self.inner.apply_store_to_devices(&data).await;
+        Ok(info)
     }
 
     /// Set or clear a persistent custom `groovie.json` location for dotfiles.
@@ -933,6 +949,17 @@ impl Inner {
     }
 
     async fn capture_scene_entries(&self, devices: Option<Vec<String>>) -> Vec<SceneEntry> {
+        let sync_snapshots: HashMap<String, DeviceState> = {
+            let rt = self.sync_rt.lock().await;
+            if rt.active {
+                rt.sessions
+                    .iter()
+                    .map(|(id, sess)| (id.clone(), sess.snapshot))
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        };
         let all = self.devices.read().await;
         let ids: Vec<String> = devices.unwrap_or_else(|| {
             let mut k: Vec<String> = all.keys().cloned().collect();
@@ -942,7 +969,17 @@ impl Inner {
         ids.iter()
             .filter_map(|id| all.get(id))
             .filter_map(|e| {
-                let s = e.device.state?;
+                let s = match sync_snapshots.get(&e.device.id) {
+                    Some(&snap) => snap,
+                    None => {
+                        let raw = e.device.state?;
+                        if raw.kelvin == 0 && raw.color == Rgb::new(0, 0, 0) {
+                            snapshot_for_device(&e.device)
+                        } else {
+                            raw
+                        }
+                    }
+                };
                 Some(SceneEntry {
                     device: e.device.id.clone(),
                     on: s.on,
@@ -1014,40 +1051,72 @@ impl Inner {
     }
 
     async fn reload_store_if_changed(&self) {
-        let mut store = self.store.lock().await;
-        match store.reload_if_changed() {
-            Ok(true) => {
-                self.apply_store_to_devices(&store).await;
+        let snapshot = {
+            let mut store = self.store.lock().await;
+            match store.reload_if_changed() {
+                Ok(true) => Some(store.data.clone()),
+                Ok(false) => None,
+                Err(e) => {
+                    warn!(error = %e, "ignoring unreadable external config file");
+                    None
+                }
             }
-            Ok(false) => {}
-            Err(e) => warn!(error = %e, "ignoring unreadable external config file"),
+        };
+        if let Some(data) = snapshot {
+            self.apply_store_to_devices(&data).await;
         }
     }
 
-    async fn apply_store_to_devices(&self, store: &Store) {
+    async fn apply_store_to_devices(&self, data: &crate::store::StoreData) {
+        let known_by_id: HashMap<&str, &KnownDevice> = data
+            .known_devices
+            .iter()
+            .map(|k| (k.id.as_str(), k))
+            .collect();
         let mut updated = Vec::new();
         {
             let mut devices = self.devices.write().await;
+            devices.retain(|id, e| e.device.online || known_by_id.contains_key(id.as_str()));
             for (id, e) in devices.iter_mut() {
-                let next_name = display_name(store, id, &e.device.sku);
+                let mut changed = false;
+                if !e.device.online {
+                    if let Some(k) = known_by_id.get(id.as_str()) {
+                        if e.device.ip != k.ip {
+                            e.device.ip = k.ip;
+                            changed = true;
+                        }
+                        if e.device.sku != k.sku {
+                            e.device.sku = k.sku.clone();
+                            changed = true;
+                        }
+                    }
+                }
+                let meta = sku_metadata(&e.device.sku);
+                if e.device.icon != meta.icon {
+                    e.device.icon = meta.icon;
+                    changed = true;
+                }
+                if e.device.kelvin_range != meta.kelvin_range {
+                    e.device.kelvin_range = meta.kelvin_range;
+                    changed = true;
+                }
+                let next_name = data.display_name(id, &e.device.sku);
                 if e.device.name != next_name {
                     e.device.name = next_name;
+                    changed = true;
+                }
+                if changed {
                     updated.push(e.device.clone());
                 }
             }
-            for k in &store.data.known_devices {
+            for k in &data.known_devices {
                 if !devices.contains_key(&k.id) {
-                    let dev = Device {
-                        id: k.id.clone(),
-                        ip: k.ip,
-                        sku: k.sku.clone(),
-                        name: display_name(store, &k.id, &k.sku),
-                        online: false,
-                        state: None,
-                        firmware: None,
-                        last_color: None,
-                        last_kelvin: None,
-                    };
+                    let dev = Device::new(
+                        k.id.clone(),
+                        k.ip,
+                        k.sku.clone(),
+                        data.display_name(&k.id, &k.sku),
+                    );
                     updated.push(dev.clone());
                     devices.insert(
                         k.id.clone(),
@@ -1062,9 +1131,22 @@ impl Inner {
                 }
             }
         }
+
+        let is_sync_active = {
+            let mut rt = self.sync_rt.lock().await;
+            rt.preview_dirty = true;
+            rt.active
+        };
+        if is_sync_active {
+            let cfg = self.reconciled_sync_config().await;
+            self.reconcile_live_sync_sessions(&cfg).await;
+        }
+
         for device in updated {
             self.emit(Event::DeviceUpdated { device });
         }
+        let status = self.current_sync_status().await;
+        self.emit(Event::SyncChanged { status });
         self.emit(Event::ConfigChanged);
     }
 
@@ -1083,6 +1165,18 @@ impl Inner {
     }
 
     async fn send_scan(&self) -> Result<()> {
+        let mut unicast_offline: Vec<SocketAddr> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| !e.device.online)
+            .map(|e| SocketAddr::from((e.device.ip, self.cfg.scan_port)))
+            .filter(|addr| !self.cfg.scan_targets.contains(addr))
+            .collect();
+        unicast_offline.sort();
+        unicast_offline.dedup();
+
         {
             let _guard = self.scan_lock.lock().await;
             let json = Command::Scan.to_json().to_string();
@@ -1111,6 +1205,11 @@ impl Inner {
                     }
                 }
                 self.log("tx", target.to_string(), None, json.clone(), false).await;
+            }
+            for target in unicast_offline {
+                if self.sock.send_to(bytes, target).await.is_ok() {
+                    self.log("tx", target.to_string(), None, json.clone(), false).await;
+                }
             }
         }
         self.send_peer_query().await;
@@ -1299,7 +1398,16 @@ impl Inner {
             Action::Power(on) => Command::Turn(on),
             Action::Brightness(b) => Command::Brightness(b.clamp(1, 100)),
             Action::Color(c) => Command::Color(c),
-            Action::Kelvin(k) => Command::ColorTemp(k.clamp(KELVIN_MIN, KELVIN_MAX)),
+            Action::Kelvin(k) => {
+                let range = self
+                    .devices
+                    .read()
+                    .await
+                    .get(id)
+                    .map(|e| e.device.kelvin_range)
+                    .unwrap_or_default();
+                Command::ColorTemp(range.clamp(k))
+            }
             Action::Toggle => {
                 let on = self
                     .devices
@@ -2268,23 +2376,14 @@ impl Inner {
             },
         };
         let fw = format_firmware(&info);
+        let meta = sku_metadata(&info.sku);
         let mut store = self.store.lock().await;
         let (dev, needs_status) = {
             let mut devices = self.devices.write().await;
             let e = devices.entry(info.device.clone()).or_insert_with(|| {
                 info!(id = %info.device, sku = %info.sku, %ip, "discovered device");
                 Entry {
-                    device: Device {
-                        id: info.device.clone(),
-                        ip,
-                        sku: info.sku.clone(),
-                        name: String::new(),
-                        online: false,
-                        state: None,
-                        firmware: None,
-                        last_color: None,
-                        last_kelvin: None,
-                    },
+                    device: Device::new(info.device.clone(), ip, info.sku.clone(), String::new()),
                     last_seen: None,
                     last_command: None,
                     missed_polls: 0,
@@ -2294,6 +2393,8 @@ impl Inner {
             let needs_status = !e.device.online || e.device.state.is_none();
             e.device.ip = ip;
             e.device.sku = info.sku.clone();
+            e.device.icon = meta.icon;
+            e.device.kelvin_range = meta.kelvin_range;
             e.device.name = display_name(&store, &info.device, &info.sku);
             if fw.is_some() {
                 e.device.firmware = fw;
@@ -2317,16 +2418,21 @@ impl Inner {
             let status = self.current_sync_status().await;
             self.emit(Event::SyncChanged { status });
         }
-        if needs_status {
-            let is_synced = {
-                let now = Instant::now();
-                let mut rt = self.sync_rt.lock().await;
-                rt.prune_expired_peers(now);
-                rt.sessions.contains_key(&dev.id) || rt.peer_host_for_device(&dev.id, now).is_some()
-            };
-            if !is_synced {
-                let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
+        let is_synced = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            if let Some(sess) = rt.sessions.get_mut(&dev.id) {
+                sess.ip = ip;
+                sess.sku = dev.sku.clone();
             }
+            if let Some(pulse) = rt.identify.as_mut().filter(|p| p.device_id == dev.id) {
+                pulse.ip = ip;
+            }
+            rt.sessions.contains_key(&dev.id) || rt.peer_host_for_device(&dev.id, now).is_some()
+        };
+        if needs_status && !is_synced {
+            let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
         }
     }
 
@@ -2770,20 +2876,34 @@ pub async fn send_ephemeral_action(
     action: Action,
     command_port: u16,
 ) -> Result<bool> {
-    let cmd = match action {
-        Action::Power(on) => Command::Turn(on),
-        Action::Brightness(b) => Command::Brightness(b.clamp(1, 100)),
-        Action::Color(c) => Command::Color(c),
-        Action::Kelvin(k) => Command::ColorTemp(k.clamp(KELVIN_MIN, KELVIN_MAX)),
-        Action::Toggle => return Ok(false),
-    };
+    if matches!(action, Action::Toggle) {
+        return Ok(false);
+    }
     let Some(targets) = store.data.resolve_known_ips(target) else {
         return Ok(false);
     };
+    let sku_by_id: HashMap<&str, &str> = store
+        .data
+        .known_devices
+        .iter()
+        .map(|d| (d.id.as_str(), d.sku.as_str()))
+        .collect();
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-    let bytes = cmd.to_bytes();
-    for (_, ip) in targets {
-        sock.send_to(&bytes, SocketAddr::from((ip, command_port))).await?;
+    for (id, ip) in targets {
+        let cmd = match action {
+            Action::Power(on) => Command::Turn(on),
+            Action::Brightness(b) => Command::Brightness(b.clamp(1, 100)),
+            Action::Color(c) => Command::Color(c),
+            Action::Kelvin(k) => {
+                let range = sku_by_id
+                    .get(id.as_str())
+                    .map(|sku| sku_metadata(sku).kelvin_range)
+                    .unwrap_or_default();
+                Command::ColorTemp(range.clamp(k))
+            }
+            Action::Toggle => unreachable!(),
+        };
+        sock.send_to(&cmd.to_bytes(), SocketAddr::from((ip, command_port))).await?;
     }
     Ok(true)
 }
@@ -2806,21 +2926,21 @@ pub async fn send_ephemeral_scene(
     if store.data.known_devices.is_empty() {
         return Ok(false);
     }
-    let ip_by_id: HashMap<&str, Ipv4Addr> = store
+    let known_by_id: HashMap<&str, &KnownDevice> = store
         .data
         .known_devices
         .iter()
-        .map(|d| (d.id.as_str(), d.ip))
+        .map(|d| (d.id.as_str(), d))
         .collect();
-    if scene.entries.iter().any(|e| !ip_by_id.contains_key(e.device.as_str())) {
+    if scene.entries.iter().any(|e| !known_by_id.contains_key(e.device.as_str())) {
         return Ok(false);
     }
 
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     let gap = Duration::from_millis(40);
     for e in &scene.entries {
-        let Some(&ip) = ip_by_id.get(e.device.as_str()) else { continue };
-        let addr = SocketAddr::from((ip, command_port));
+        let Some(&kd) = known_by_id.get(e.device.as_str()) else { continue };
+        let addr = SocketAddr::from((kd.ip, command_port));
         sock.send_to(&Command::Turn(e.on).to_bytes(), addr).await?;
         if !e.on {
             continue;
@@ -2830,12 +2950,9 @@ pub async fn send_ephemeral_scene(
             sock.send_to(&Command::Brightness(b.clamp(1, 100)).to_bytes(), addr).await?;
         }
         if let Some(k) = e.kelvin {
+            let clamped = sku_metadata(&kd.sku).kelvin_range.clamp(k);
             tokio::time::sleep(gap).await;
-            sock.send_to(
-                &Command::ColorTemp(k.clamp(KELVIN_MIN, KELVIN_MAX)).to_bytes(),
-                addr,
-            )
-            .await?;
+            sock.send_to(&Command::ColorTemp(clamped).to_bytes(), addr).await?;
         } else if let Some(c) = e.color {
             tokio::time::sleep(gap).await;
             sock.send_to(&Command::Color(c).to_bytes(), addr).await?;

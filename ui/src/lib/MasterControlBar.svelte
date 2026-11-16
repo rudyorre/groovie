@@ -74,10 +74,22 @@
     uniformHex || (colorDevices[0]?.state ? toHex(colorDevices[0].state.color) : '#ff9f0a'),
   );
 
+  const kelvinSpanDevices = $derived(controllableDevices.length > 0 ? controllableDevices : devices);
+  const kelvinMin = $derived(
+    kelvinSpanDevices.length > 0
+      ? Math.min(...kelvinSpanDevices.map((d) => d.kelvinRange?.min ?? 2000))
+      : 2000,
+  );
+  const kelvinMax = $derived(
+    kelvinSpanDevices.length > 0
+      ? Math.max(...kelvinSpanDevices.map((d) => d.kelvinRange?.max ?? 9000))
+      : 9000,
+  );
+
   const activeKelvin = $derived.by(() => {
-    if (!whiteDevices.length) return 4000;
+    if (!whiteDevices.length) return Math.min(kelvinMax, Math.max(kelvinMin, 4000));
     const avg = whiteDevices.reduce((sum, d) => sum + (d.state?.kelvin ?? 4000), 0) / whiteDevices.length;
-    return Math.round(avg / 100) * 100;
+    return Math.min(kelvinMax, Math.max(kelvinMin, Math.round(avg / 100) * 100));
   });
   const uniformKelvin = $derived.by(() => {
     if (!basisDevices.length || whiteDevices.length !== basisDevices.length) return 0;
@@ -192,22 +204,23 @@
           <Slider
             variant="kelvin"
             label={groupName ? `${groupName} colour temperature` : 'All lights colour temperature'}
-            min={2000}
-            max={9000}
+            min={kelvinMin}
+            max={kelvinMax}
             step={100}
-            value={activeKelvin}
+            value={Math.min(kelvinMax, Math.max(kelvinMin, activeKelvin))}
             {disabled}
             oninput={(v) => sendThrottled({ type: 'kelvin', value: v })}
           />
         </div>
         <div class="chips">
           {#each WHITES as w (w.k)}
+            {@const wk = Math.min(kelvinMax, Math.max(kelvinMin, w.k))}
             <button
               type="button"
               class="chip"
-              class:sel={uniformKelvin === w.k}
+              class:sel={uniformKelvin === wk}
               {disabled}
-              onclick={() => send({ type: 'kelvin', value: w.k })}
+              onclick={() => send({ type: 'kelvin', value: wk })}
             >
               {w.label}
             </button>

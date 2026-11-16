@@ -106,9 +106,13 @@
     saved = color || kelvin ? writeMemory(id, { color, kelvin }) : readMemory(id);
   });
 
+  const kelvinMin = $derived(device.kelvinRange?.min ?? 2000);
+  const kelvinMax = $derived(device.kelvinRange?.max ?? 9000);
+  const clampKelvin = (k: number) => Math.min(kelvinMax, Math.max(kelvinMin, k));
+
   const rememberedColor = $derived<Rgb>(device.lastColor ?? saved.color ?? { r: 255, g: 159, b: 10 });
-  const rememberedKelvin = $derived<number>(device.lastKelvin ?? saved.kelvin ?? 4000);
-  const activeKelvin = $derived<number>(s?.kelvin || rememberedKelvin);
+  const rememberedKelvin = $derived<number>(clampKelvin(device.lastKelvin ?? saved.kelvin ?? 4000));
+  const activeKelvin = $derived<number>(clampKelvin(s?.kelvin || rememberedKelvin));
 
   // Follow the light's real mode, including external changes from the Govee app.
   const actualMode = $derived<'color' | 'white'>(s?.kelvin ? 'white' : 'color');
@@ -119,12 +123,7 @@
     picked = null;
   });
 
-  const icon: IconName = $derived.by(() => {
-    const sku = device.sku.toUpperCase();
-    if (['H6072', 'H6076', 'H6079', 'H607C'].includes(sku)) return 'lamp';
-    if (['H6046', 'H6047', 'H6056', 'H6043'].includes(sku)) return 'bars';
-    return 'bulb';
-  });
+  const icon: IconName = $derived(device.icon ?? 'bulb');
 
   const status = $derived(
     !device.online
@@ -367,15 +366,16 @@
           <Slider
             variant="kelvin"
             label="Colour temperature"
-            min={2000}
-            max={9000}
+            min={kelvinMin}
+            max={kelvinMax}
             step={100}
             value={activeKelvin}
             oninput={(v) => sendThrottled({ type: 'kelvin', value: v })}
           />
           <div class="chips">
             {#each WHITES as w (w.k)}
-              <button class="chip" class:sel={activeKelvin === w.k} onclick={() => send({ type: 'kelvin', value: w.k })}>
+              {@const wk = clampKelvin(w.k)}
+              <button class="chip" class:sel={activeKelvin === wk} onclick={() => send({ type: 'kelvin', value: wk })}>
                 {w.label}
               </button>
             {/each}

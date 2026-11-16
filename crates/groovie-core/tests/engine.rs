@@ -1061,4 +1061,190 @@ async fn multi_device_screen_sync_conflict_and_takeover() {
     mac.apply(&Target::Device(bars_id), Action::Power(true)).await.unwrap();
 }
 
+#[tokio::test]
+async fn start_and_reload_report_invalid_config_instead_of_socket_error() {
+    use groovie_core::Error;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("groovie.json");
+    std::fs::write(&path, "{ broken json: true ").unwrap();
+
+    let mut cfg = config(24, 41230, 0, Some(path.clone()));
+    cfg.scan_targets.clear();
+
+    match Groovie::start(cfg.clone()).await.err().expect("invalid config must fail") {
+        Error::InvalidConfig { path: p, message } => {
+            assert!(p.ends_with("groovie.json"));
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected Error::InvalidConfig, got {other:?}"),
+    }
+
+    // Once fixed on disk, the engine starts cleanly without port bind conflict (socket was never leaked).
+    std::fs::write(&path, "{\n  \"version\": 1\n}\n").unwrap();
+    let g = Groovie::start(cfg).await.unwrap();
+
+    // Writing invalid JSON later and calling reload_config also returns Error::InvalidConfig cleanly.
+    std::fs::write(&path, "{ invalid ").unwrap();
+    let err = g.reload_config().await.unwrap_err();
+    assert!(
+        err.to_string().starts_with("Invalid config file"),
+        "expected Invalid config file prefix, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn save_scene_uses_presync_snapshot_and_effect_mode_fallback() {
+    use groovie_core::{SyncFrame, SYNC_GRID_H, SYNC_GRID_W};
+
+    let r = spawn_custom_sims(25, 41240, &["H6056", "H6072"]).await;
+    let bars_id = r.sims[0].config.id.clone();
+    let lamp_id = r.sims[1].config.id.clone();
+
+    // Set bars to 42% @ 3100K white before Screen Sync starts.
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Brightness(42)).await.unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Kelvin(3100)).await.unwrap();
+
+    // Set lamp to purple first (populates last_color), then simulate hardware effect/DIY mode `(0,0,0)`.
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Brightness(65)).await.unwrap();
+    r.g.apply(&Target::Device(lamp_id.clone()), Action::Color(Rgb::new(180, 40, 220))).await.unwrap();
+
+    eventually("initial states settled", || async {
+        r.sims[0].state().kelvin == 3100 && r.sims[1].state().color == Rgb::new(180, 40, 220)
+    })
+    .await;
+
+    // Exclude lamp from Screen Sync so only bars enter Razer streaming mode; put lamp into `(0,0,0)` effect mode.
+    let mut sync_cfg = r.g.sync_status().await.config;
+    for p in &mut sync_cfg.placements {
+        if p.device_id == lamp_id {
+            p.excluded = true;
+        }
+    }
+    sync_cfg.brightness = 100;
+    r.g.update_sync_config(sync_cfg).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    {
+        let mut s = r.sims[1].state.lock().unwrap();
+        s.color = Rgb::new(0, 0, 0);
+        s.kelvin = 0;
+    }
+    r.g.refresh_all().await;
+    let g2 = r.g.clone();
+    let lamp_check = lamp_id.clone();
+    eventually("lamp reported (0,0,0) effect mode", || {
+        let g = g2.clone();
+        let id = lamp_check.clone();
+        async move {
+            g.device(&id)
+                .await
+                .and_then(|d| d.state)
+                .map(|st| st.color == Rgb::new(0, 0, 0) && st.kelvin == 0)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    // Start Screen Sync on bars (which sets bars hardware brightness to 100 and Razer `(0,0,0)`).
+    r.g.push_sync_frame(SyncFrame::solid(SYNC_GRID_W, SYNC_GRID_H, Rgb::new(10, 200, 50))).await;
+    r.g.start_sync().await.unwrap();
+    eventually("bars in Razer sync at 100%", || async {
+        r.sims[0].is_razer_enabled() && r.sims[0].state().brightness == 100
+    })
+    .await;
+
+    // Saving a scene right now must capture bars' pre-sync 42% @ 3100K snapshot AND lamp's remembered purple!
+    let scene = r.g.save_scene("Cozy Snapshot", None).await.unwrap();
+    let bars_entry = scene.entries.iter().find(|e| e.device == bars_id).unwrap();
+    assert!(bars_entry.on);
+    assert_eq!(bars_entry.brightness, Some(42));
+    assert_eq!(bars_entry.kelvin, Some(3100));
+    assert_eq!(bars_entry.color, None);
+
+    let lamp_entry = scene.entries.iter().find(|e| e.device == lamp_id).unwrap();
+    assert!(lamp_entry.on);
+    assert_eq!(lamp_entry.brightness, Some(65));
+    assert_eq!(lamp_entry.color, Some(Rgb::new(180, 40, 220)));
+
+    r.g.stop_sync(Some("done")).await;
+}
+
+#[tokio::test]
+async fn reload_config_prunes_removed_offline_devices_and_updates_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("groovie.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 1,
+  "nicknames": {
+    "AA:01": "Desk Lamp",
+    "BB:02": "Old Strip"
+  },
+  "known_devices": [
+    { "id": "AA:01", "ip": "127.0.26.10", "sku": "H6072" },
+    { "id": "BB:02", "ip": "127.0.26.11", "sku": "H619A" }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let mut cfg = config(26, 41250, 0, Some(path.clone()));
+    cfg.scan_targets.clear();
+    let g = Groovie::start(cfg).await.unwrap();
+
+    let initial = g.devices().await;
+    assert_eq!(initial.len(), 2);
+    let strip = initial.iter().find(|d| d.id == "BB:02").unwrap();
+    assert_eq!(strip.icon, groovie_core::DeviceIcon::Strip);
+    assert_eq!(strip.name, "Old Strip");
+
+    // Edit groovie.json externally: remove BB:02 and rename AA:01.
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 1,
+  "nicknames": {
+    "AA:01": "Reading Lamp"
+  },
+  "known_devices": [
+    { "id": "AA:01", "ip": "127.0.26.10", "sku": "H6072" }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    g.reload_config().await.unwrap();
+    let after = g.devices().await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, "AA:01");
+    assert_eq!(after[0].name, "Reading Lamp");
+}
+
+#[tokio::test]
+async fn clamps_kelvin_commands_to_sku_bounds() {
+    let r = spawn_custom_sims(27, 41260, &["H6008"]).await;
+    let bulb_id = r.sims[0].config.id.clone();
+    let dev = r.g.device(&bulb_id).await.unwrap();
+    assert_eq!(dev.icon, groovie_core::DeviceIcon::Bulb);
+    assert_eq!(dev.kelvin_range.min, 2700);
+    assert_eq!(dev.kelvin_range.max, 6500);
+
+    // Requesting 2000K on an H6008 bulb clamps to 2700K both optimistically and on the wire.
+    r.g.apply(&Target::Device(bulb_id.clone()), Action::Kelvin(2000)).await.unwrap();
+    assert_eq!(r.g.device(&bulb_id).await.unwrap().state.unwrap().kelvin, 2700);
+    eventually("sim received clamped 2700K", || async { r.sims[0].state().kelvin == 2700 }).await;
+    assert!(r.sims[0].received().contains(&Command::ColorTemp(2700)));
+
+    // Requesting 9000K clamps to 6500K.
+    r.g.apply(&Target::Device(bulb_id.clone()), Action::Kelvin(9000)).await.unwrap();
+    assert_eq!(r.g.device(&bulb_id).await.unwrap().state.unwrap().kelvin, 6500);
+    eventually("sim received clamped 6500K", || async { r.sims[0].state().kelvin == 6500 }).await;
+    assert!(r.sims[0].received().contains(&Command::ColorTemp(6500)));
+}
+
+
 
