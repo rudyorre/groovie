@@ -4,6 +4,8 @@
 
 export type Rgb = { r: number; g: number; b: number };
 export type DeviceState = { on: boolean; brightness: number; color: Rgb; kelvin: number };
+export type DeviceIcon = 'lamp' | 'bars' | 'strip' | 'bulb';
+export type KelvinRange = { min: number; max: number };
 export type Device = {
   id: string;
   ip: string;
@@ -11,6 +13,8 @@ export type Device = {
   name: string;
   online: boolean;
   state: DeviceState | null;
+  icon?: DeviceIcon;
+  kelvinRange?: KelvinRange;
   firmware?: string;
   lastColor?: Rgb;
   lastKelvin?: number;
@@ -254,20 +258,37 @@ async function tauriApi(): Promise<Api> {
 
 function mockApi(): Api {
   const white: Rgb = { r: 255, g: 255, b: 255 };
-  const mk = (id: string, ip: string, sku: string, name: string, on: boolean, color: Rgb): Device => ({
+  const mk = (
+    id: string,
+    ip: string,
+    sku: string,
+    name: string,
+    icon: DeviceIcon,
+    kelvinRange: KelvinRange,
+    on: boolean,
+    color: Rgb,
+  ): Device => ({
     id,
     ip,
     sku,
     name,
+    icon,
+    kelvinRange,
     online: true,
     state: { on, brightness: 80, color, kelvin: 0 },
     firmware: 'wifi 1.02.03 · ble 1.03.01',
     lastColor: color,
   });
   const devices: Device[] = [
-    mk('1F:80:C5:32:32:36:72:4E', '10.0.0.182', 'H6072', 'Floor Lamp', true, { r: 255, g: 120, b: 30 }),
-    mk('3A:14:D0:88:19:40:11:2B', '10.0.0.64', 'H6056', 'Light Bars', true, { r: 120, g: 60, b: 255 }),
-    { ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', false, white), online: false, state: null, firmware: undefined, lastColor: undefined },
+    mk('1F:80:C5:32:32:36:72:4E', '10.0.0.182', 'H6072', 'Floor Lamp', 'lamp', { min: 2200, max: 6500 }, true, { r: 255, g: 120, b: 30 }),
+    mk('3A:14:D0:88:19:40:11:2B', '10.0.0.64', 'H6056', 'Light Bars', 'bars', { min: 2000, max: 9000 }, true, { r: 120, g: 60, b: 255 }),
+    {
+      ...mk('AA:03:00:00:00:00:00:03', '10.0.0.99', 'H6008', 'Bulb', 'bulb', { min: 2700, max: 6500 }, false, white),
+      online: false,
+      state: null,
+      firmware: undefined,
+      lastColor: undefined,
+    },
   ];
   const mockDisplays: DisplayInfo[] = [
     { id: '\\\\.\\DISPLAY1', name: 'Display 1 · LG ULTRAGEAR', width: 2560, height: 1440, isPrimary: true },

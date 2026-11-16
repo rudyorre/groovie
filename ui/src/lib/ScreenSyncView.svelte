@@ -154,10 +154,7 @@
   }
 
   function placementIcon(p: SyncPlacement): IconName {
-    const sku = (deviceMap.get(p.deviceId)?.sku ?? '').toUpperCase();
-    if (['H6072', 'H6076', 'H6079', 'H607C'].includes(sku)) return 'lamp';
-    if (['H6046', 'H6047', 'H6056', 'H6043'].includes(sku)) return 'bars';
-    return 'bulb';
+    return deviceMap.get(p.deviceId)?.icon ?? 'bulb';
   }
 
   function tokenCells(p: SyncPlacement): string[] {
