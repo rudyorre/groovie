@@ -129,6 +129,7 @@ export interface Api {
   getConfigInfo(): Promise<ConfigInfo>;
   reloadConfig(): Promise<ConfigInfo>;
   setConfigPath(path: string | null): Promise<ConfigInfo>;
+  saveConfigJson(json: string): Promise<ConfigInfo>;
   openConfigFolder(): Promise<void>;
   openGithub(): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
@@ -148,6 +149,10 @@ export type Update = {
 };
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export const isIos =
+  typeof navigator !== 'undefined' &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
 
 // ---- Tauri ---------------------------------------------------------------
 
@@ -180,14 +185,22 @@ async function tauriApi(): Promise<Api> {
     getConfigInfo: () => invoke('get_config_info'),
     reloadConfig: () => invoke('reload_config'),
     setConfigPath: (path) => invoke('set_config_path', { path }),
+    saveConfigJson: (json) => invoke('save_config_json', { json }),
     openConfigFolder: () => invoke('open_config_folder'),
-    openGithub: () => invoke('open_github'),
+    openGithub: async () => {
+      if (isIos) {
+        window.open('https://github.com/rudyorre/groovie', '_blank', 'noopener,noreferrer');
+        return;
+      }
+      await invoke('open_github');
+    },
     onEvent(cb) {
       const un = listen<GroovieEvent>('groovie://event', (e) => cb(e.payload));
       return () => void un.then((f) => f());
     },
     appVersion: async () => (await import('@tauri-apps/api/app')).getVersion(),
     async checkUpdate() {
+      if (isIos) return null;
       const { check } = await import('@tauri-apps/plugin-updater');
       const u = await check();
       if (!u) return null;
@@ -518,6 +531,44 @@ function mockApi(): Api {
         path: path?.trim() || base.defaultPath,
         isCustom: Boolean(path?.trim()),
       };
+    },
+    async saveConfigJson(raw) {
+      const parsed = JSON.parse(raw) as {
+        nicknames?: Record<string, string>;
+        groups?: Group[];
+        scenes?: Scene[];
+        known_devices?: Array<{ id: string; ip: string; sku: string }>;
+        sync?: SyncConfig;
+      };
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('invalid JSON: expected a JSON object');
+      }
+      if (Array.isArray(parsed.groups)) groups = structuredClone(parsed.groups);
+      if (Array.isArray(parsed.scenes)) scenes = structuredClone(parsed.scenes);
+      if (parsed.sync && typeof parsed.sync === 'object') syncConfig = structuredClone(parsed.sync);
+      const nicks = parsed.nicknames && typeof parsed.nicknames === 'object' ? parsed.nicknames : {};
+      for (const d of devices) {
+        if (typeof nicks[d.id] === 'string' && nicks[d.id].trim()) {
+          d.name = nicks[d.id].trim();
+        }
+      }
+      if (Array.isArray(parsed.known_devices)) {
+        for (const k of parsed.known_devices) {
+          if (!k?.id || !k?.ip || !k?.sku) continue;
+          if (!devices.some((d) => d.id === k.id)) {
+            devices.push({
+              id: k.id,
+              ip: k.ip,
+              sku: k.sku,
+              name: nicks[k.id]?.trim() || k.sku,
+              online: false,
+              state: null,
+            });
+          }
+        }
+      }
+      config();
+      return this.getConfigInfo();
     },
     openConfigFolder: async () => {},
     openGithub: async () => {

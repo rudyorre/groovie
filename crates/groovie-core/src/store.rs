@@ -139,6 +139,23 @@ impl Store {
         }
     }
 
+    /// Parse and validate `raw_json` as [`StoreData`], preserve any currently-online
+    /// `live_known` devices (keeping their live verified IPs), and atomically save.
+    pub fn replace_json(&mut self, raw_json: &str, live_known: &[KnownDevice]) -> io::Result<()> {
+        let mut next: StoreData = serde_json::from_str(raw_json).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid JSON: {e}"))
+        })?;
+        if next.version == 0 {
+            next.version = 1;
+        }
+        self.data = next;
+        for dev in live_known {
+            self.upsert_known(dev.clone());
+        }
+        self.data.known_devices.sort_by(|a, b| a.id.cmp(&b.id));
+        self.save()
+    }
+
     pub fn upsert_known(&mut self, dev: KnownDevice) -> bool {
         match self.data.known_devices.iter_mut().find(|d| d.id == dev.id) {
             Some(existing) if *existing == dev => false,
@@ -225,7 +242,7 @@ pub fn normalize_user_store_path(raw: &str) -> PathBuf {
 fn platform_config_dir() -> Option<PathBuf> {
     let base = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
         home_dir().map(|h| h.join("Library/Application Support"))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
@@ -279,11 +296,16 @@ pub fn write_custom_store_path(custom: Option<&Path>) -> io::Result<Option<PathB
 }
 
 /// Automatic config file location (ignoring custom pointer overrides):
-/// prefers an existing `~/.config/groovie/groovie.json` on all platforms for
-/// cross-OS dotfiles repos, otherwise falls back to the OS config directory
-/// (`%APPDATA%\groovie\groovie.json`, `~/Library/Application Support/groovie/groovie.json`,
-/// or `~/.config/groovie/groovie.json`).
+/// on iOS uses `~/Documents/groovie.json` so it is directly accessible in the
+/// Files app (*On My iPhone → Groovie*); on desktop prefers an existing
+/// `~/.config/groovie/groovie.json` for cross-OS dotfiles repos, otherwise falls
+/// back to `%APPDATA%\groovie\groovie.json`,
+/// `~/Library/Application Support/groovie/groovie.json`, or
+/// `~/.config/groovie/groovie.json`.
 pub fn default_auto_store_path() -> Option<PathBuf> {
+    if cfg!(target_os = "ios") {
+        return home_dir().map(|h| h.join("Documents").join("groovie.json"));
+    }
     if let Some(xdg) = xdg_store_path() {
         if std::fs::symlink_metadata(&xdg).is_ok() {
             return Some(xdg);
@@ -362,5 +384,44 @@ mod tests {
 
         assert!(s.reload_if_changed().unwrap());
         assert_eq!(s.data.nicknames.get("AA").map(String::as_str), Some("Floor Lamp"));
+    }
+
+    #[test]
+    fn replace_json_validates_and_preserves_live_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groovie.json");
+        let mut s = Store::open(&path).unwrap();
+        s.data.nicknames.insert("OLD".into(), "Before".into());
+        s.save().unwrap();
+
+        let live = vec![KnownDevice {
+            id: "LIVE1".into(),
+            ip: Ipv4Addr::new(192, 168, 1, 42),
+            sku: "H6072".into(),
+        }];
+
+        // Invalid JSON is rejected without mutating state or disk.
+        let err = s.replace_json("{ not valid json", &live).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(s.data.nicknames.get("OLD").map(String::as_str), Some("Before"));
+
+        // Valid JSON replaces config while keeping live online devices & updating stale live IPs.
+        let raw = r#"{
+          "nicknames": { "LIVE1": "Corner Lamp", "OFF1": "Bedroom" },
+          "groups": [{ "id": "g1", "name": "Main", "members": ["LIVE1", "OFF1"] }],
+          "known_devices": [
+            { "id": "LIVE1", "ip": "192.168.1.9", "sku": "H6072" },
+            { "id": "OFF1", "ip": "192.168.1.77", "sku": "H6056" }
+          ]
+        }"#;
+        s.replace_json(raw, &live).unwrap();
+        assert_eq!(s.data.version, 1);
+        assert!(!s.data.nicknames.contains_key("OLD"));
+        assert_eq!(s.data.nicknames.get("LIVE1").map(String::as_str), Some("Corner Lamp"));
+        assert_eq!(s.data.groups.len(), 1);
+        let live_saved = s.data.known_devices.iter().find(|d| d.id == "LIVE1").unwrap();
+        assert_eq!(live_saved.ip, Ipv4Addr::new(192, 168, 1, 42));
+        let off_saved = s.data.known_devices.iter().find(|d| d.id == "OFF1").unwrap();
+        assert_eq!(off_saved.ip, Ipv4Addr::new(192, 168, 1, 77));
     }
 }

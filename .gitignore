@@ -3,3 +3,5 @@ node_modules/
 dist/
 *.json.tmp
 apps/desktop/src-tauri/gen/
+apps/ios/src-tauri/gen/
+*.ipa

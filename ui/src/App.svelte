@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import {
     api,
+    isIos,
     isTauri,
     toHex,
     type ConfigInfo,
@@ -33,11 +34,13 @@
   let update = $state<Update | null>(null);
   let updateProgress = $state<UpdateProgress | null>(null);
 
-  // Dialogs / inline editors
+  // Dialogs / inline editors / mobile sheet
+  let drawerOpen = $state(false);
   let editing = $state<Group | null>(null); // id '' = new group
   let addingLight = $state(false);
   let ipDraft = $state('');
   let namingScene = $state(false);
+  let savingSceneModal = $state(false);
   let sceneDraft = $state('');
   let scanning = $state(false);
   let logsOpen = $state(false);
@@ -51,6 +54,10 @@
   let pathDraft = $state('');
   let copiedPath = $state(false);
   let copiedConfig = $state(false);
+  let editingJson = $state(false);
+  let jsonDraft = $state('');
+  let jsonError = $state('');
+  const canShareConfig = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
   const group = $derived(groups.find((g) => g.id === view));
   const shown = $derived(group ? devices.filter((d) => group.members.includes(d.id)) : devices);
@@ -195,14 +202,18 @@
   }
 
   async function openConfig() {
+    drawerOpen = false;
     configOpen = true;
     editingPath = false;
+    editingJson = false;
+    jsonError = '';
     copiedPath = false;
     copiedConfig = false;
     const info = await run((a) => a.getConfigInfo());
     if (info) {
       configInfo = info;
       pathDraft = info.path ?? '';
+      jsonDraft = info.json;
     }
   }
 
@@ -228,11 +239,79 @@
     }
   }
 
+  async function shareConfigJson() {
+    if (!configInfo || !canShareConfig) return;
+    try {
+      const file =
+        typeof File !== 'undefined'
+          ? new File([configInfo.json + '\n'], 'groovie.json', { type: 'application/json' })
+          : null;
+      if (file && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'groovie.json' });
+      } else {
+        await navigator.share({ title: 'groovie.json', text: configInfo.json });
+      }
+    } catch (e) {
+      if ((e as { name?: string })?.name !== 'AbortError') {
+        showToast(`Could not share: ${e}`);
+      }
+    }
+  }
+
+  function startEditJson() {
+    jsonDraft = configInfo?.json ?? '{\n  "version": 1\n}';
+    jsonError = '';
+    editingJson = true;
+  }
+
+  async function pasteClipboardJson() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text.trim()) {
+        jsonDraft = text;
+        jsonError = '';
+      } else {
+        showToast('Clipboard is empty');
+      }
+    } catch {
+      showToast('Tap inside the editor and use Paste');
+    }
+  }
+
+  async function saveEditedJson() {
+    jsonError = '';
+    try {
+      const parsed = JSON.parse(jsonDraft);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        jsonError = 'Root value must be a JSON object.';
+        return;
+      }
+    } catch (e) {
+      jsonError = e instanceof Error ? e.message : String(e);
+      return;
+    }
+    try {
+      const a = await api;
+      const info = await a.saveConfigJson(jsonDraft);
+      configInfo = info;
+      jsonDraft = info.json;
+      pathDraft = info.path ?? '';
+      editingJson = false;
+      await reload();
+      showToast('Saved configuration');
+    } catch (e) {
+      jsonError = String(e);
+    }
+  }
+
   async function reloadConfigFromDisk() {
     const info = await run((a) => a.reloadConfig());
     if (info) {
       configInfo = info;
       pathDraft = info.path ?? '';
+      jsonDraft = info.json;
+      editingJson = false;
+      jsonError = '';
       await reload();
       showToast('Reloaded configuration from disk');
     }
@@ -245,6 +324,7 @@
     if (info) {
       configInfo = info;
       pathDraft = info.path ?? '';
+      jsonDraft = info.json;
       editingPath = false;
       await reload();
       showToast('Updated config file location');
@@ -256,6 +336,7 @@
     if (info) {
       configInfo = info;
       pathDraft = info.path ?? '';
+      jsonDraft = info.json;
       editingPath = false;
       await reload();
       showToast('Restored default config location');
@@ -332,8 +413,12 @@
   async function saveScene() {
     const name = sceneDraft.trim();
     namingScene = false;
+    savingSceneModal = false;
     sceneDraft = '';
-    if (name) await run((a) => a.saveScene(name));
+    if (name) {
+      const created = await run((a) => a.saveScene(name));
+      if (created) showToast(`Saved scene "${created.name}"`);
+    }
   }
 
   async function addLight() {
@@ -358,23 +443,33 @@
 </script>
 
 <div class="app">
-  <aside>
-    <div class="brand">
-      <svg viewBox="0 0 1024 1024" aria-hidden="true">
-        <path d="M768 466.9A260 260 0 1 1 557.1 255.9" fill="none" stroke="currentColor" stroke-width="120" stroke-linecap="round" />
-        <circle cx="695.8" cy="328.2" r="60" fill="#FFB020" />
-      </svg>
-      Groovie
+  {#if drawerOpen}
+    <div class="drawer-backdrop" role="presentation" onclick={() => (drawerOpen = false)}></div>
+  {/if}
+
+  <aside class:open={drawerOpen}>
+    <div class="drawer-grab" aria-hidden="true"></div>
+    <div class="brand-row">
+      <div class="brand">
+        <svg viewBox="0 0 1024 1024" aria-hidden="true">
+          <path d="M768 466.9A260 260 0 1 1 557.1 255.9" fill="none" stroke="currentColor" stroke-width="120" stroke-linecap="round" />
+          <circle cx="695.8" cy="328.2" r="60" fill="#FFB020" />
+        </svg>
+        Groovie
+      </div>
+      <button type="button" class="ghost icon-btn drawer-close" aria-label="Close menu" onclick={() => (drawerOpen = false)}>
+        <Icon name="x" size={16} />
+      </button>
     </div>
 
     <nav>
-      <button class="nav-item" class:active={view === 'all'} onclick={() => (view = 'all')}>
+      <button class="nav-item" class:active={view === 'all'} onclick={() => { view = 'all'; drawerOpen = false; }}>
         <Icon name="grid" /> <span>All lights</span> <small>{devices.length}</small>
       </button>
 
       {#if syncState?.supported}
         <div class="sync-nav" class:active={view === 'sync'} class:live={syncState.active}>
-          <button class="nav-item" onclick={() => (view = 'sync')}>
+          <button class="nav-item" onclick={() => { view = 'sync'; drawerOpen = false; }}>
             <Icon name="monitor" /> <span>Screen sync</span>
           </button>
           <label class="switch nav-switch" title={syncState.active ? 'Stop screen sync' : 'Start screen sync'}>
@@ -390,12 +485,12 @@
 
       <div class="section">
         <span>Groups</span>
-        <button class="ghost icon-btn" title="New group" onclick={() => (editing = { id: '', name: '', members: [] })}>
+        <button class="ghost icon-btn" title="New group" onclick={() => { drawerOpen = false; editing = { id: '', name: '', members: [] }; }}>
           <Icon name="plus" size={14} />
         </button>
       </div>
       {#each groups as g (g.id)}
-        <button class="nav-item" class:active={view === g.id} onclick={() => (view = g.id)}>
+        <button class="nav-item" class:active={view === g.id} onclick={() => { view = g.id; drawerOpen = false; }}>
           <Icon name="folder" /> <span>{g.name}</span> <small>{g.members.length}</small>
         </button>
       {:else}
@@ -423,7 +518,7 @@
       {/if}
       {#each scenes as sc (sc.id)}
         <div class="scene">
-          <button class="nav-item" title="Apply scene" onclick={() => run((a) => a.applyScene(sc.id))}>
+          <button class="nav-item" title="Apply scene" onclick={() => { drawerOpen = false; run((a) => a.applyScene(sc.id)); }}>
             <Icon name="sparkle" /> <span>{sc.name}</span>
           </button>
           <button class="ghost icon-btn del" title="Delete scene" onclick={() => run((a) => a.deleteScene(sc.id))}>
@@ -433,6 +528,19 @@
       {:else}
         {#if !namingScene}<p class="empty-hint">Save the current look with +.</p>{/if}
       {/each}
+
+      <div class="drawer-only">
+        <div class="section"><span>Tools</span></div>
+        <button class="nav-item" onclick={() => { drawerOpen = false; addingLight = true; }}>
+          <Icon name="plus" /> <span>Add light by IP</span>
+        </button>
+        <button class="nav-item" onclick={openConfig}>
+          <Icon name="sliders" /> <span>Configuration (groovie.json)</span>
+        </button>
+        <button class="nav-item" onclick={() => { drawerOpen = false; openLogs(); }}>
+          <Icon name="terminal" /> <span>Activity &amp; network log</span>
+        </button>
+      </div>
     </nav>
 
     <footer>
@@ -500,7 +608,75 @@
         onIdentify={identifyPlacement}
       />
     {:else}
-      <header>
+      <div class="mobile-top">
+        <div class="mobile-bar">
+          <div class="mobile-title">
+            <svg class="mobile-logo" viewBox="0 0 1024 1024" aria-hidden="true">
+              <path d="M768 466.9A260 260 0 1 1 557.1 255.9" fill="none" stroke="currentColor" stroke-width="120" stroke-linecap="round" />
+              <circle cx="695.8" cy="328.2" r="60" fill="#FFB020" />
+            </svg>
+            <div class="mobile-heading">
+              <h1>{group?.name ?? 'All lights'}</h1>
+              <p class="sub">
+                {shown.length} {shown.length === 1 ? 'light' : 'lights'}{#if shown.length}{' · '}{onCount} on{/if}
+              </p>
+            </div>
+          </div>
+          <div class="mobile-actions">
+            <button class="ghost icon-btn" class:spin={scanning} title="Scan for lights" aria-label="Scan for lights" onclick={rescan}>
+              <Icon name="refresh" size={16} />
+            </button>
+            <button
+              class="mobile-power"
+              onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))}
+              disabled={!shown.length}
+            >
+              <Icon name="power" size={14} /> {onCount ? 'All off' : 'All on'}
+            </button>
+            <button class="ghost icon-btn" title="Menu & tools" aria-label="Menu & tools" onclick={() => (drawerOpen = true)}>
+              <Icon name="menu" size={17} />
+            </button>
+          </div>
+        </div>
+
+        <div class="mobile-strips">
+          <div class="pill-strip" role="tablist" aria-label="Light groups">
+            <button role="tab" aria-selected={view === 'all'} class="pill" class:sel={view === 'all'} onclick={() => (view = 'all')}>
+              All <small>{devices.length}</small>
+            </button>
+            {#each groups as g (g.id)}
+              <button role="tab" aria-selected={view === g.id} class="pill" class:sel={view === g.id} onclick={() => (view = g.id)}>
+                {g.name} <small>{g.members.length}</small>
+              </button>
+            {/each}
+            {#if group}
+              <button class="pill ghost-pill" onclick={() => (editing = structuredClone($state.snapshot(group)))}>
+                <Icon name="pencil" size={12} /> Edit
+              </button>
+            {/if}
+            <button class="pill ghost-pill" onclick={() => (editing = { id: '', name: '', members: [] })}>
+              <Icon name="plus" size={12} /> Group
+            </button>
+          </div>
+
+          {#if scenes.length || devices.some((d) => d.state)}
+            <div class="pill-strip scene-strip" aria-label="Scenes">
+              {#each scenes as sc (sc.id)}
+                <button class="pill scene-pill" onclick={() => run((a) => a.applyScene(sc.id))}>
+                  <Icon name="sparkle" size={12} /> {sc.name}
+                </button>
+              {/each}
+              {#if devices.some((d) => d.state)}
+                <button class="pill ghost-pill" onclick={() => { sceneDraft = ''; savingSceneModal = true; }}>
+                  <Icon name="plus" size={12} /> Save scene
+                </button>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </div>
+
+      <header class="desktop-header">
         <div>
           <h1>{group?.name ?? 'All lights'}</h1>
           <p class="sub">
@@ -546,7 +722,12 @@
             {:else}
               <p class="empty-title">Looking for lights…</p>
               <p>Turn on <b>LAN Control</b> for each light in the Govee app (device settings), and make sure this
-                computer is on the same Wi‑Fi. You can also add a light by its IP address with <b>+</b>.</p>
+                device is on the same Wi‑Fi.{#if isIos} Allow <b>Local Network</b> access if iOS prompts.{/if} You can
+                also add a light by its IP address{#if isIos} or paste your desktop <code>groovie.json</code> in Configuration{/if}.</p>
+              <div class="empty-actions">
+                <button onclick={() => (addingLight = true)}><Icon name="plus" size={14} /> Add by IP</button>
+                <button class="ghost" onclick={openConfig}><Icon name="sliders" size={14} /> Configuration</button>
+              </div>
             {/if}
           </div>
         {/each}
@@ -586,13 +767,29 @@
   </div>
 {/if}
 
+{#if savingSceneModal}
+  <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (savingSceneModal = false)}>
+    <form class="dialog" onsubmit={(e) => { e.preventDefault(); saveScene(); }}>
+      <h2>Save scene</h2>
+      <p class="dialog-text">Capture the current power, brightness, and colour of your lights as a one-tap scene.</p>
+      <!-- svelte-ignore a11y_autofocus -->
+      <input class="field" bind:value={sceneDraft} placeholder="Scene name, e.g. Movie night" autofocus />
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" class="ghost" onclick={() => (savingSceneModal = false)}>Cancel</button>
+        <button type="submit" class="primary" disabled={!sceneDraft.trim()}>Save</button>
+      </div>
+    </form>
+  </div>
+{/if}
+
 {#if addingLight}
   <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (addingLight = false)}>
     <form class="dialog" onsubmit={(e) => { e.preventDefault(); addLight(); }}>
       <h2>Add light by IP</h2>
       <p class="dialog-text">Use this if a light doesn't show up automatically. Find its IP address in your router's device list.</p>
       <!-- svelte-ignore a11y_autofocus -->
-      <input class="field" bind:value={ipDraft} placeholder="192.168.1.50" autofocus />
+      <input class="field" bind:value={ipDraft} inputmode="decimal" placeholder="192.168.1.50" autofocus />
       <div class="dialog-actions">
         <span class="spacer"></span>
         <button type="button" class="ghost" onclick={() => (addingLight = false)}>Cancel</button>
@@ -613,12 +810,18 @@
       </div>
 
       <p class="dialog-text">
-        Nicknames, groups, and scenes live in a plain JSON file. Symlink it or point Groovie at your dotfiles repo — external edits reload automatically.
+        {#if isIos}
+          Nicknames, groups, and scenes live in <code>groovie.json</code> — accessible in the iOS <b>Files</b> app under
+          <b>On My iPhone → Groovie</b>, or paste/share JSON directly below to sync with your desktop dotfiles.
+        {:else}
+          Nicknames, groups, and scenes live in a plain JSON file. Symlink it or point Groovie at your dotfiles repo —
+          external edits reload automatically, or edit/paste JSON directly below.
+        {/if}
       </p>
 
       <div class="path-card">
         <div class="path-meta">
-          <span class="path-label">{configInfo?.isCustom ? 'Custom path' : 'Config file'}</span>
+          <span class="path-label">{isIos ? 'Files app location' : configInfo?.isCustom ? 'Custom path' : 'Config file'}</span>
           <div class="path-btns">
             {#if configInfo?.path}
               <button type="button" class="ghost sm-btn" onclick={copyConfigPath}>
@@ -626,25 +829,27 @@
                 {copiedPath ? 'Copied' : 'Copy path'}
               </button>
             {/if}
-            {#if isTauri && configInfo?.path}
+            {#if isTauri && !isIos && configInfo?.path}
               <button type="button" class="ghost sm-btn" onclick={() => run((a) => a.openConfigFolder())}>
                 <Icon name="folder" size={13} /> Open folder
               </button>
             {/if}
-            <button
-              type="button"
-              class="ghost sm-btn"
-              onclick={() => {
-                editingPath = !editingPath;
-                pathDraft = configInfo?.path ?? '';
-              }}
-            >
-              <Icon name="pencil" size={13} /> {editingPath ? 'Close' : 'Change…'}
-            </button>
+            {#if !isIos}
+              <button
+                type="button"
+                class="ghost sm-btn"
+                onclick={() => {
+                  editingPath = !editingPath;
+                  pathDraft = configInfo?.path ?? '';
+                }}
+              >
+                <Icon name="pencil" size={13} /> {editingPath ? 'Close' : 'Change…'}
+              </button>
+            {/if}
           </div>
         </div>
 
-        <code class="path-value">{configInfo?.path ?? 'In-memory'}</code>
+        <code class="path-value">{isIos ? 'On My iPhone › Groovie › groovie.json' : (configInfo?.path ?? 'In-memory')}</code>
         {#if configInfo?.symlinkTarget}
           <div class="symlink-note">→ <code>{configInfo.symlinkTarget}</code></div>
         {/if}
@@ -670,18 +875,57 @@
         {/if}
       </div>
 
-      <pre class="config-box">{configInfo?.json ?? ''}</pre>
+      {#if editingJson}
+        <div class="json-editor-wrap">
+          <div class="json-editor-bar">
+            <span class="path-label">Edit / Paste groovie.json</span>
+            <button type="button" class="ghost sm-btn" onclick={pasteClipboardJson}>
+              <Icon name="paste" size={13} /> Paste clipboard
+            </button>
+          </div>
+          <textarea
+            class="config-editor"
+            bind:value={jsonDraft}
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+            aria-label="groovie.json editor"
+          ></textarea>
+          {#if jsonError}
+            <p class="json-error" role="alert">{jsonError}</p>
+          {/if}
+        </div>
 
-      <div class="dialog-actions log-foot">
-        <button type="button" class="ghost" onclick={reloadConfigFromDisk}>
-          <Icon name="refresh" size={14} /> Reload from disk
-        </button>
-        <span class="spacer"></span>
-        <button type="button" class="primary" onclick={copyConfigJson}>
-          <Icon name={copiedConfig ? 'check' : 'copy'} size={14} />
-          {copiedConfig ? 'Copied' : 'Copy JSON'}
-        </button>
-      </div>
+        <div class="dialog-actions log-foot">
+          <span class="path-hint">Online lights stay active; newly added device IPs are probed right away.</span>
+          <span class="spacer"></span>
+          <button type="button" class="ghost" onclick={() => { editingJson = false; jsonError = ''; }}>Cancel</button>
+          <button type="button" class="primary" onclick={saveEditedJson}>
+            <Icon name="check" size={14} /> Save JSON
+          </button>
+        </div>
+      {:else}
+        <pre class="config-box">{configInfo?.json ?? ''}</pre>
+
+        <div class="dialog-actions log-foot">
+          <button type="button" class="ghost" onclick={reloadConfigFromDisk}>
+            <Icon name="refresh" size={14} /> Reload
+          </button>
+          <button type="button" class="ghost" onclick={startEditJson}>
+            <Icon name="pencil" size={14} /> Edit / Paste
+          </button>
+          <span class="spacer"></span>
+          {#if canShareConfig}
+            <button type="button" class="ghost" onclick={shareConfigJson}>
+              <Icon name="share" size={14} /> Share
+            </button>
+          {/if}
+          <button type="button" class="primary" onclick={copyConfigJson}>
+            <Icon name={copiedConfig ? 'check' : 'copy'} size={14} />
+            {copiedConfig ? 'Copied' : 'Copy JSON'}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -750,7 +994,9 @@
     if (logsOpen) logsOpen = false;
     else if (configOpen) configOpen = false;
     else if (editing) editing = null;
+    else if (savingSceneModal) savingSceneModal = false;
     else if (addingLight) addingLight = false;
+    else if (drawerOpen) drawerOpen = false;
   }}
 />
 
@@ -761,6 +1007,14 @@
 <style>
   .app { display: grid; grid-template-columns: 232px 1fr; height: 100vh; }
 
+  .drawer-backdrop,
+  .drawer-grab,
+  .drawer-close,
+  .drawer-only,
+  .mobile-top {
+    display: none;
+  }
+
   aside {
     background: var(--sidebar);
     border-right: 1px solid var(--border);
@@ -768,6 +1022,11 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+  }
+  .brand-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
   .brand {
     display: flex;
@@ -927,10 +1186,18 @@
     line-height: 1.5;
   }
   .empty-title { color: var(--text); font-weight: 550; font-size: 15px; }
+  .empty-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
 
   .backdrop {
     position: fixed;
     inset: 0;
+    z-index: 40;
     background: #0009;
     display: grid;
     place-items: center;
@@ -1007,6 +1274,39 @@
     line-height: 1.5;
     color: var(--text-2);
   }
+  .json-editor-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .json-editor-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .config-editor {
+    width: 100%;
+    min-height: 210px;
+    max-height: min(320px, 42vh);
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    outline: none;
+  }
+  .config-editor:focus { border-color: var(--focus); }
+  .json-error {
+    margin: 2px 0 0;
+    color: #ff6b6b;
+    font-size: 12px;
+    line-height: 1.4;
+  }
 
   .log-dialog { width: min(760px, 94vw); max-height: 86vh; }
   .log-head { display: flex; align-items: center; justify-content: space-between; margin: -2px -4px 0 0; }
@@ -1063,6 +1363,7 @@
     position: fixed;
     bottom: 18px;
     left: 50%;
+    z-index: 50;
     transform: translateX(-50%);
     background: var(--surface-2);
     border: 1px solid var(--border);
@@ -1075,9 +1376,180 @@
   }
   @keyframes fade { from { opacity: 0; } }
 
+  @media (hover: none) {
+    .scene .del { opacity: 0.7; }
+  }
+
   @media (max-width: 680px) {
-    .app { grid-template-columns: 1fr; height: auto; }
-    aside { border-right: 0; border-bottom: 1px solid var(--border); }
-    main { padding: 18px 16px 32px; }
+    .app {
+      grid-template-columns: 1fr;
+      height: 100dvh;
+    }
+
+    .desktop-header { display: none; }
+
+    .drawer-backdrop {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 25;
+      background: #0009;
+      animation: fade 0.14s ease-out;
+    }
+
+    aside {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 30;
+      max-height: 82dvh;
+      border-right: 0;
+      border-top: 1px solid var(--border);
+      border-radius: 18px 18px 0 0;
+      padding: 8px 12px calc(14px + env(safe-area-inset-bottom, 0px));
+      box-shadow: 0 -16px 48px #0009;
+      transform: translateY(105%);
+      transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.2, 1);
+      pointer-events: none;
+    }
+    aside.open {
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .drawer-grab {
+      display: block;
+      width: 36px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--track-strong);
+      margin: 2px auto 8px;
+      flex-shrink: 0;
+    }
+    .brand { padding: 2px 10px 10px; }
+    .drawer-close { display: inline-flex; }
+    .drawer-only { display: block; }
+    .nav-item {
+      padding: 10px 10px;
+      font-size: 14.5px;
+    }
+
+    main {
+      padding: 0 max(16px, env(safe-area-inset-right, 0px)) calc(32px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+    }
+
+    .mobile-top {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 90%, transparent);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      margin: 0 -16px 14px;
+      padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .mobile-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .mobile-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+    .mobile-logo {
+      width: 24px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+    .mobile-heading { min-width: 0; }
+    .mobile-heading h1 {
+      font-size: 17px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .mobile-heading .sub {
+      margin-top: 1px;
+      font-size: 12px;
+    }
+    .mobile-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+    .mobile-power {
+      height: 32px;
+      padding: 0 10px;
+      font-size: 12.5px;
+    }
+
+    .mobile-strips {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .pill-strip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      margin: 0 -16px;
+      padding: 0 16px;
+    }
+    .pill-strip::-webkit-scrollbar { display: none; }
+    .scene-strip { padding-top: 1px; }
+    .pill {
+      height: 30px;
+      padding: 0 11px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      background: var(--surface);
+      border-color: var(--border);
+      color: var(--text-2);
+    }
+    .pill small {
+      font-size: 11px;
+      color: var(--text-3);
+      font-variant-numeric: tabular-nums;
+    }
+    .pill.sel {
+      background: var(--active);
+      border-color: var(--border-2);
+      color: var(--text);
+      font-weight: 550;
+    }
+    .pill.sel small { color: var(--text-2); }
+    .scene-pill :global(svg) { color: var(--accent); }
+    .ghost-pill {
+      background: transparent;
+      border-style: dashed;
+      color: var(--text-3);
+    }
+
+    .grid { grid-template-columns: 1fr; }
+    .empty { margin: 44px auto; }
+
+    .backdrop {
+      padding: env(safe-area-inset-top, 12px) 12px env(safe-area-inset-bottom, 12px);
+    }
+    .config-dialog,
+    .log-dialog {
+      max-height: calc(100dvh - env(safe-area-inset-top, 12px) - env(safe-area-inset-bottom, 12px) - 16px);
+    }
+    .toast {
+      bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    }
   }
 </style>

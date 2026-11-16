@@ -347,6 +347,23 @@ async fn set_config_path(app: AppHandle, s: State<'_, AppState>, path: Option<St
 }
 
 #[tauri::command]
+async fn save_config_json(app: AppHandle, s: State<'_, AppState>, json: String) -> R<ConfigInfo> {
+    if s.0.read().await.is_err() {
+        let cfg = Config::default().with_env_overrides();
+        if let Some(p) = &cfg.store_path {
+            let mut store = groovie_core::store::Store::open(p).map_err(err)?;
+            store.replace_json(&json, &[]).map_err(err)?;
+        }
+        let g = start_engine(&app).await?;
+        let info = g.config_info().await;
+        *s.0.write().await = Ok(g);
+        let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
+        return Ok(info);
+    }
+    engine(&s).await?.save_config_json(&json).await.map_err(err)
+}
+
+#[tauri::command]
 async fn open_config_folder(s: State<'_, AppState>) -> R<()> {
     let path = match s.0.read().await.clone() {
         Ok(g) => g.ensure_config_saved().await.map_err(err)?,
@@ -592,6 +609,7 @@ fn main() {
             get_config_info,
             reload_config,
             set_config_path,
+            save_config_json,
             open_config_folder,
             open_github,
             prepare_update_install,

@@ -27,6 +27,17 @@
     if (!dragging) local = value;
   });
   const pct = $derived(((local - min) / (max - min)) * 100);
+
+  let touchState: { startX: number; startY: number; mode: 'undecided' | 'drag' | 'scroll' } | null = null;
+
+  function valueFromClientX(el: HTMLInputElement, clientX: number): number {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return local;
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const raw = min + ratio * (max - min);
+    const stepped = Math.round((raw - min) / step) * step + min;
+    return Math.max(min, Math.min(max, Number(stepped.toFixed(4))));
+  }
 </script>
 
 <input
@@ -39,10 +50,64 @@
   aria-label={label}
   value={local}
   style="--p: {pct}%"
-  onpointerdown={() => (dragging = true)}
+  onpointerdown={(e) => {
+    if (e.pointerType !== 'touch') dragging = true;
+  }}
   onpointerup={() => (dragging = false)}
   onpointercancel={() => (dragging = false)}
   onblur={() => (dragging = false)}
+  ontouchstart={(e) => {
+    if (disabled || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    touchState = { startX: t.clientX, startY: t.clientY, mode: 'undecided' };
+  }}
+  ontouchmove={(e) => {
+    if (!touchState || disabled || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - touchState.startX;
+    const dy = t.clientY - touchState.startY;
+    if (touchState.mode === 'undecided') {
+      if (Math.hypot(dx, dy) < 6) return;
+      if (Math.abs(dy) > Math.abs(dx)) {
+        touchState.mode = 'scroll';
+        dragging = false;
+        return;
+      }
+      touchState.mode = 'drag';
+      dragging = true;
+    }
+    if (touchState.mode === 'drag') {
+      if (e.cancelable) e.preventDefault();
+      const next = valueFromClientX(e.currentTarget, t.clientX);
+      if (next !== local) {
+        local = next;
+        oninput(next);
+      }
+    }
+  }}
+  ontouchend={(e) => {
+    if (!touchState || disabled) {
+      touchState = null;
+      dragging = false;
+      return;
+    }
+    if (touchState.mode === 'undecided' && e.changedTouches.length === 1) {
+      const t = e.changedTouches[0];
+      if (Math.hypot(t.clientX - touchState.startX, t.clientY - touchState.startY) < 6) {
+        const next = valueFromClientX(e.currentTarget, t.clientX);
+        if (next !== local) {
+          local = next;
+          oninput(next);
+        }
+      }
+    }
+    touchState = null;
+    dragging = false;
+  }}
+  ontouchcancel={() => {
+    touchState = null;
+    dragging = false;
+  }}
   oninput={(e) => {
     local = +e.currentTarget.value;
     oninput(local);
@@ -57,6 +122,7 @@
     margin: 0;
     background: transparent;
     cursor: pointer;
+    touch-action: pan-y;
   }
   input:disabled { cursor: not-allowed; opacity: 0.4; }
   input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 10px; }
