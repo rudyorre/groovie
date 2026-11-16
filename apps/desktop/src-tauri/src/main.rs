@@ -656,7 +656,8 @@ fn build_tray_menu(app: &AppHandle, snap: &TraySnapshot) -> tauri::Result<Menu<t
 async fn refresh_tray_menu(app: &AppHandle, force: bool) {
     let snap = collect_tray_snapshot(app).await;
     let should_update = {
-        let mut guard = app.state::<TrayState>().0.lock().unwrap();
+        let tray_state = app.state::<TrayState>();
+        let mut guard = tray_state.0.lock().unwrap();
         if !force && guard.as_ref() == Some(&snap) {
             false
         } else {
