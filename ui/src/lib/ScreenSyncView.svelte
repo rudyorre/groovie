@@ -30,7 +30,7 @@
     devices: Device[];
     syncState: SyncState;
     preview: SyncPreview | null;
-    onToggleSync: (enabled: boolean) => void;
+    onToggleSync: (enabled: boolean, force?: boolean) => void;
     onUpdateConfig: (cfg: SyncConfig) => void;
     onIdentify: (placementId: string) => void;
   } = $props();
@@ -55,6 +55,11 @@
   );
   const activePlacements = $derived(placements.filter((p) => !p.excluded));
   const excludedPlacements = $derived(placements.filter((p) => p.excluded));
+  const peerConflict = $derived(!syncState.active ? (syncState.conflict ?? null) : null);
+  const peerDeviceSet = $derived(new Set(peerConflict?.deviceIds ?? []));
+  const conflictOverlapsIncluded = $derived(
+    Boolean(peerConflict && activePlacements.some((p) => peerDeviceSet.has(p.deviceId))),
+  );
 
   $effect(() => {
     if (!activePlacements.length) {
@@ -190,7 +195,7 @@
     }
   }
 
-  function updateTuning(patch: Partial<Pick<SyncConfig, 'smoothing' | 'vibrance' | 'minGlow'>>) {
+  function updateTuning(patch: Partial<Pick<SyncConfig, 'brightness' | 'smoothing' | 'vibrance' | 'minGlow'>>) {
     pushConfigThrottled({ ...cfg, ...patch });
   }
 
@@ -253,6 +258,8 @@
       <p class="sub">
         {#if syncState.active}
           Syncing {syncState.activeDevices.length} {syncState.activeDevices.length === 1 ? 'light' : 'lights'}
+        {:else if peerConflict && conflictOverlapsIncluded}
+          Active on {peerConflict.hostName}
         {:else}
           {includedOnlineCount} of {includedDeviceIds.length} {includedDeviceIds.length === 1 ? 'light' : 'lights'} ready
         {/if}
@@ -288,6 +295,10 @@
         <button class="stop-btn" onclick={() => onToggleSync(false)}>
           <Icon name="stop" size={14} /> Stop sync
         </button>
+      {:else if conflictOverlapsIncluded}
+        <button class="primary" onclick={() => onToggleSync(true, true)} disabled={!includedOnlineCount}>
+          <Icon name="play" size={14} /> Take over sync
+        </button>
       {:else}
         <button class="primary" onclick={() => onToggleSync(true)} disabled={!includedOnlineCount}>
           <Icon name="play" size={14} /> Start sync
@@ -295,6 +306,34 @@
       {/if}
     </div>
   </header>
+
+  {#if peerConflict}
+    <div class="conflict-banner" role="status">
+      <div class="conflict-copy">
+        <strong>
+          <span class="conflict-dot"></span>
+          Screen Sync is active on {peerConflict.hostName}
+        </strong>
+        <p>
+          {#if conflictOverlapsIncluded}
+            {peerConflict.deviceIds.length === 1 ? '1 light is' : `${peerConflict.deviceIds.length} lights are`} currently streaming from {peerConflict.hostName}. Light controls are paused here to avoid conflicts.
+          {:else}
+            {peerConflict.hostName} is syncing other lights on your network — your included lights here don't overlap.
+          {/if}
+        </p>
+      </div>
+      {#if conflictOverlapsIncluded}
+        <button
+          type="button"
+          class="takeover-btn"
+          disabled={!includedOnlineCount}
+          onclick={() => onToggleSync(true, true)}
+        >
+          <Icon name="play" size={14} /> Take over sync
+        </button>
+      {/if}
+    </div>
+  {/if}
 
   <section class="stage-card">
     <div class="desk-canvas" bind:this={canvasEl} style="aspect-ratio: {canvasAspect}">
@@ -391,6 +430,7 @@
 
     {#if selected}
       {@const selDev = deviceMap.get(selected.deviceId)}
+      {@const selLockedByPeer = peerDeviceSet.has(selected.deviceId)}
       <div class="inspector">
         <div class="insp-title">
           <Icon name={placementIcon(selected)} size={16} />
@@ -404,8 +444,10 @@
           <button
             type="button"
             class="sm-ctl"
-            title="Sweep light to identify physical position & direction"
-            disabled={selDev ? !selDev.online : true}
+            title={selLockedByPeer
+              ? `Synced by ${peerConflict?.hostName ?? 'another host'}`
+              : 'Sweep light to identify physical position & direction'}
+            disabled={(selDev ? !selDev.online : true) || selLockedByPeer}
             onclick={() => triggerIdentify(selected.id)}
           >
             <Icon name="locate" size={13} /> Identify
@@ -508,6 +550,23 @@
   <section class="tuning-grid">
     <div class="tune-card">
       <div class="tune-top">
+        <span>Brightness</span>
+        <strong>{cfg.brightness ?? 100}%</strong>
+      </div>
+      <div class="tune-slider">
+        <Slider
+          label="Sync brightness"
+          min={1}
+          max={100}
+          value={cfg.brightness ?? 100}
+          oninput={(v) => updateTuning({ brightness: v })}
+        />
+      </div>
+      <p>Master ceiling for synced lights; pre-sync levels restore on stop.</p>
+    </div>
+
+    <div class="tune-card">
+      <div class="tune-top">
         <span>Smoothing</span>
         <strong>{cfg.smoothing}%</strong>
       </div>
@@ -577,6 +636,55 @@
   }
   h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
   .sub { margin: 3px 0 0; color: var(--text-2); font-size: 13px; }
+
+  .conflict-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    background: var(--surface);
+    border: 1px solid #ffb02055;
+    border-radius: 12px;
+    padding: 12px 15px;
+  }
+  .conflict-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 220px;
+    flex: 1;
+  }
+  .conflict-copy strong {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+  .conflict-copy p {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-2);
+    line-height: 1.4;
+  }
+  .conflict-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    flex: none;
+  }
+  .takeover-btn {
+    background: #ffb02022;
+    border-color: #ffb02066;
+    color: var(--accent);
+    font-weight: 550;
+  }
+  .takeover-btn:hover:not(:disabled) {
+    background: #ffb02033;
+  }
 
   .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .display-select {
@@ -891,7 +999,7 @@
 
   .tuning-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
     gap: 12px;
   }
   .tune-card {

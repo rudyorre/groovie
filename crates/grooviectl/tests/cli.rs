@@ -68,6 +68,7 @@ async fn cli_works_alongside_daemon_and_fast_path_when_daemon_closed() {
         poll_interval: Duration::from_secs(60),
         rescan_interval: Duration::from_secs(60),
         refresh_delay: Duration::from_millis(100),
+        ..Config::default()
     };
 
     let daemon = Groovie::start(cfg).await.unwrap();

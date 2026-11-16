@@ -82,12 +82,20 @@ enum Cmd {
 enum SyncCmd {
     /// Show Screen Sync state and configured lights.
     Status,
-    /// Start Screen Sync.
-    Start,
+    /// Start Screen Sync (pass `--force` to take over from another device on the LAN).
+    Start {
+        /// Take over Screen Sync if another computer on the LAN is currently streaming.
+        #[arg(long)]
+        force: bool,
+    },
     /// Stop Screen Sync.
     Stop,
     /// Toggle Screen Sync on or off.
-    Toggle,
+    Toggle {
+        /// Take over Screen Sync when toggling on if another computer is streaming.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -198,6 +206,7 @@ fn effective_ipc_path() -> Option<PathBuf> {
         "GROOVIE_SCAN_TARGETS",
         "GROOVIE_COMMAND_PORT",
         "GROOVIE_SCAN_PORT",
+        "GROOVIE_PEER_SYNC_TARGETS",
     ]
     .iter()
     .any(|k| non_empty(k).is_some());
@@ -426,9 +435,9 @@ async fn try_run_via_ipc(
             let sub = cmd.unwrap_or(SyncCmd::Status);
             let req = match sub {
                 SyncCmd::Status => IpcRequest::SyncStatus,
-                SyncCmd::Start => IpcRequest::SyncSet { enabled: Some(true) },
-                SyncCmd::Stop => IpcRequest::SyncSet { enabled: Some(false) },
-                SyncCmd::Toggle => IpcRequest::SyncSet { enabled: None },
+                SyncCmd::Start { force } => IpcRequest::SyncSet { enabled: Some(true), force },
+                SyncCmd::Stop => IpcRequest::SyncSet { enabled: Some(false), force: false },
+                SyncCmd::Toggle { force } => IpcRequest::SyncSet { enabled: None, force },
             };
             let Some(info) = call_daemon::<SyncStatusInfo>(ipc_path, req).await? else {
                 return Ok(false);
@@ -444,10 +453,11 @@ fn handle_offline_sync(cfg: &Config, cmd: SyncCmd, json: bool) -> Result<()> {
         SyncCmd::Status => {
             let store = open_store(cfg)?;
             let info = SyncStatusInfo {
-                supported: cfg!(target_os = "windows"),
+                supported: cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")),
                 active: false,
                 active_devices: Vec::new(),
                 config: store.data.sync,
+                conflict: None,
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&info)?);
@@ -456,7 +466,7 @@ fn handle_offline_sync(cfg: &Config, cmd: SyncCmd, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        SyncCmd::Start | SyncCmd::Stop | SyncCmd::Toggle => {
+        SyncCmd::Start { .. } | SyncCmd::Stop | SyncCmd::Toggle { .. } => {
             bail!("Screen Sync requires the Groovie desktop app to be running")
         }
     }
@@ -929,6 +939,8 @@ fn output_sync_status(info: &SyncStatusInfo, json: bool) -> Result<()> {
             info.active_devices.len(),
             if info.active_devices.len() == 1 { "light" } else { "lights" }
         );
+    } else if let Some(c) = &info.conflict {
+        println!("Screen Sync: off (active on {})", c.host_name);
     } else if !info.supported {
         println!("Screen Sync: unsupported on this platform");
     } else {

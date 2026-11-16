@@ -41,6 +41,7 @@ fn config(net: u8, base: u16, n: u8, store: Option<PathBuf>) -> Config {
         poll_interval: Duration::from_secs(60),
         rescan_interval: Duration::from_secs(60),
         refresh_delay: Duration::from_millis(100),
+        ..Config::default()
     }
 }
 
@@ -705,15 +706,21 @@ async fn ipc_coexists_with_running_daemon_and_toggles_sync() {
     assert_eq!(updated_sc.entries.len(), 1);
     assert_eq!(updated_sc.entries[0].brightness, Some(33));
 
-    let IpcOutcome::Ok(sync_on) =
-        try_call_at::<SyncStatusInfo>(&ipc_path, IpcRequest::SyncSet { enabled: Some(true) }).await
+    let IpcOutcome::Ok(sync_on) = try_call_at::<SyncStatusInfo>(
+        &ipc_path,
+        IpcRequest::SyncSet { enabled: Some(true), force: false },
+    )
+    .await
     else {
         panic!("expected IPC SyncSet(true) to succeed");
     };
     assert!(sync_on.active);
 
-    let IpcOutcome::Ok(sync_toggled) =
-        try_call_at::<SyncStatusInfo>(&ipc_path, IpcRequest::SyncSet { enabled: None }).await
+    let IpcOutcome::Ok(sync_toggled) = try_call_at::<SyncStatusInfo>(
+        &ipc_path,
+        IpcRequest::SyncSet { enabled: None, force: false },
+    )
+    .await
     else {
         panic!("expected IPC SyncSet(toggle) to succeed");
     };
@@ -882,4 +889,176 @@ async fn remove_device_detaches_sync_and_prunes_all_store_state() {
         Err(groovie_core::Error::UnknownDevice(_))
     ));
 }
+
+#[tokio::test]
+async fn screen_sync_applies_and_updates_master_brightness() {
+    use groovie_core::{SyncFrame, SYNC_GRID_H, SYNC_GRID_W};
+
+    let r = spawn_custom_sims(22, 41210, &["H6056"]).await;
+    let bars_id = r.sims[0].config.id.clone();
+
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Power(true)).await.unwrap();
+    r.g.apply(&Target::Device(bars_id.clone()), Action::Brightness(30)).await.unwrap();
+    eventually("pre-sync brightness 30", || async { r.sims[0].state().brightness == 30 }).await;
+
+    let mut sync_cfg = r.g.sync_status().await.config;
+    sync_cfg.brightness = 75;
+    sync_cfg.smoothing = 0;
+    r.g.update_sync_config(sync_cfg.clone()).await.unwrap();
+
+    r.g.push_sync_frame(SyncFrame::solid(SYNC_GRID_W, SYNC_GRID_H, Rgb::new(40, 120, 255))).await;
+    r.g.start_sync().await.unwrap();
+
+    eventually("sync started with master brightness 75", || async {
+        *r.sims[0].razer_enabled.lock().unwrap() && r.sims[0].state().brightness == 75
+    })
+    .await;
+
+    // Updating master sync brightness while active updates hardware brightness live without dropping Razer mode.
+    sync_cfg.brightness = 45;
+    r.g.update_sync_config(sync_cfg).await.unwrap();
+    eventually("live master sync brightness 45", || async {
+        *r.sims[0].razer_enabled.lock().unwrap() && r.sims[0].state().brightness == 45
+    })
+    .await;
+
+    // Stopping Screen Sync restores pre-sync 30% brightness.
+    r.g.stop_sync(Some("done")).await;
+    eventually("pre-sync brightness 30 restored", || async {
+        !*r.sims[0].razer_enabled.lock().unwrap() && r.sims[0].state().brightness == 30
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn multi_device_screen_sync_conflict_and_takeover() {
+    use groovie_core::{Error, SyncFrame, SYNC_GRID_H, SYNC_GRID_W};
+
+    let (net, base) = (23, 41220);
+    let mut sc = SimConfig::new(sim_ip(net, 0), "H6056");
+    sc.scan_port = base;
+    sc.command_port = base + 1;
+    sc.reply_port = base + 2;
+    let sim = SimDevice::spawn(sc).await.unwrap();
+    let bars_id = sim.config.id.clone();
+
+    let addr_mac = SocketAddr::from((Ipv4Addr::new(127, 0, net, 1), base + 2));
+    let addr_win = SocketAddr::from((Ipv4Addr::new(127, 0, net, 2), base + 2));
+    let scan_targets = vec![SocketAddr::from((sim_ip(net, 0), base))];
+
+    let mac = Groovie::start(Config {
+        listen: addr_mac,
+        scan_targets: scan_targets.clone(),
+        scan_port: base,
+        command_port: base + 1,
+        store_path: None,
+        poll_interval: Duration::from_secs(60),
+        rescan_interval: Duration::from_secs(60),
+        refresh_delay: Duration::from_millis(100),
+        peer_sync_targets: vec![addr_win],
+        host_name: Some("MacBook".into()),
+    })
+    .await
+    .unwrap();
+
+    let m2 = mac.clone();
+    eventually("mac discovered bars", || {
+        let g = m2.clone();
+        async move { g.devices().await.len() == 1 && g.devices().await[0].state.is_some() }
+    })
+    .await;
+
+    // 1. MacBook starts Screen Sync.
+    let mut mac_cfg = mac.sync_status().await.config;
+    mac_cfg.smoothing = 0;
+    mac.update_sync_config(mac_cfg).await.unwrap();
+    mac.push_sync_frame(SyncFrame::solid(SYNC_GRID_W, SYNC_GRID_H, Rgb::new(255, 20, 20))).await;
+    let mac_st = mac.start_sync().await.unwrap();
+    assert!(mac_st.active);
+
+    // 2. Windows PC starts up afterwards and immediately discovers MacBook's active Screen Sync lease via PeerSyncQuery!
+    let win = Groovie::start(Config {
+        listen: addr_win,
+        scan_targets,
+        scan_port: base,
+        command_port: base + 1,
+        store_path: None,
+        poll_interval: Duration::from_secs(60),
+        rescan_interval: Duration::from_secs(60),
+        refresh_delay: Duration::from_millis(100),
+        peer_sync_targets: vec![addr_mac],
+        host_name: Some("Windows-PC".into()),
+    })
+    .await
+    .unwrap();
+
+    let w2 = win.clone();
+    eventually("windows discovered bars and detected MacBook conflict", || {
+        let g = w2.clone();
+        let expected_id = bars_id.clone();
+        async move {
+            g.devices().await.len() == 1
+                && g.sync_status()
+                    .await
+                    .conflict
+                    .map(|c| c.host_name == "MacBook" && c.device_ids == vec![expected_id])
+                    .unwrap_or(false)
+        }
+    })
+    .await;
+
+    // 3. Normal `start_sync()` and direct light controls on Windows PC are blocked while MacBook is syncing!
+    match win.start_sync().await {
+        Err(Error::SyncConflict { host_name }) => assert_eq!(host_name, "MacBook"),
+        other => panic!("expected SyncConflict from MacBook, got {other:?}"),
+    }
+    match win.apply(&Target::Device(bars_id.clone()), Action::Color(Rgb::new(0, 255, 0))).await {
+        Err(Error::DeviceSyncedByPeer { host_name, .. }) => assert_eq!(host_name, "MacBook"),
+        other => panic!("expected DeviceSyncedByPeer from MacBook, got {other:?}"),
+    }
+
+    // 4. Explicit takeover (`start_sync_with_options(true)`) on Windows PC hands off cleanly without dropping Razer mode!
+    let mut win_cfg = win.sync_status().await.config;
+    win_cfg.smoothing = 0;
+    win.update_sync_config(win_cfg).await.unwrap();
+    win.push_sync_frame(SyncFrame::solid(SYNC_GRID_W, SYNC_GRID_H, Rgb::new(10, 240, 40))).await;
+
+    let win_st = win.start_sync_with_options(true).await.unwrap();
+    assert!(win_st.active);
+    assert!(win_st.conflict.is_none());
+
+    let m3 = mac.clone();
+    eventually("mac yielded sync to Windows-PC without disabling Razer", || {
+        let g = m3.clone();
+        async move {
+            let st = g.sync_status().await;
+            !st.active
+                && st
+                    .conflict
+                    .map(|c| c.host_name == "Windows-PC")
+                    .unwrap_or(false)
+        }
+    })
+    .await;
+    assert!(*sim.razer_enabled.lock().unwrap(), "Razer mode stayed enabled across handoff");
+
+    eventually("Windows-PC green Razer frame streamed to bars", || async {
+        sim.last_razer_frame()
+            .as_ref()
+            .map(|f| f.iter().all(|c| c.g > 180))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // 5. Stopping Screen Sync on Windows PC clears the conflict on MacBook so MacBook can control lights again.
+    win.stop_sync(Some("done")).await;
+    let m4 = mac.clone();
+    eventually("MacBook conflict cleared when Windows-PC stopped sync", || {
+        let g = m4.clone();
+        async move { g.sync_status().await.conflict.is_none() }
+    })
+    .await;
+    mac.apply(&Target::Device(bars_id), Action::Power(true)).await.unwrap();
+}
+
 

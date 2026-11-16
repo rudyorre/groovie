@@ -64,22 +64,29 @@ export type SyncPlacement = {
 export type SyncConfig = {
   displayId?: string;
   preset: SyncPreset;
+  brightness: number;
   smoothing: number;
   vibrance: number;
   minGlow: number;
   placements: SyncPlacement[];
+};
+export type SyncPeerConflict = {
+  hostName: string;
+  deviceIds: string[];
 };
 export type SampleRect = { x0: number; y0: number; x1: number; y1: number };
 export type SyncStatus = {
   active: boolean;
   activeDevices: string[];
   config: SyncConfig;
+  conflict?: SyncPeerConflict;
 };
 export type SyncState = {
   supported: boolean;
   active: boolean;
   activeDevices: string[];
   config: SyncConfig;
+  conflict?: SyncPeerConflict;
 };
 export type PlacementPreview = {
   id: string;
@@ -127,7 +134,7 @@ export interface Api {
   deleteScene(id: string): Promise<void>;
   getSyncState(): Promise<SyncState>;
   listDisplays(): Promise<DisplayInfo[]>;
-  setSyncEnabled(enabled: boolean): Promise<SyncState>;
+  setSyncEnabled(enabled: boolean, force?: boolean): Promise<SyncState>;
   updateSyncConfig(config: SyncConfig): Promise<SyncState>;
   identifySyncPlacement(placementId: string): Promise<void>;
   setSyncPreview(enabled: boolean): Promise<void>;
@@ -184,7 +191,7 @@ async function tauriApi(): Promise<Api> {
     deleteScene: (id) => invoke('delete_scene', { id }),
     getSyncState: () => invoke('get_sync_state'),
     listDisplays: () => invoke('list_displays'),
-    setSyncEnabled: (enabled) => invoke('set_sync_enabled', { enabled }),
+    setSyncEnabled: (enabled, force = false) => invoke('set_sync_enabled', { enabled, force }),
     updateSyncConfig: (config) => invoke('update_sync_config', { config }),
     identifySyncPlacement: (placementId) => invoke('identify_sync_placement', { placementId }),
     setSyncPreview: (enabled) => invoke('set_sync_preview', { enabled }),
@@ -268,6 +275,7 @@ function mockApi(): Api {
   ];
   let syncConfig: SyncConfig = {
     preset: 'game',
+    brightness: 100,
     smoothing: 32,
     vibrance: 65,
     minGlow: 0,
@@ -518,10 +526,11 @@ function mockApi(): Api {
         const includedIds = Array.from(new Set(syncConfig.placements.filter((p) => !p.excluded).map((p) => p.deviceId)));
         const onlineIds = includedIds.filter((id) => devices.find((d) => d.id === id)?.online);
         if (!onlineIds.length) throw new Error('No online lights are included in Screen Sync');
+        const bri = Math.max(1, Math.min(100, syncConfig.brightness ?? 100));
         for (const id of onlineIds) {
           const d = devices.find((x) => x.id === id);
           if (d?.state && !snapshots.has(id)) snapshots.set(id, structuredClone(d.state));
-          set(id, (s) => { s.on = true; });
+          set(id, (s) => { s.on = true; s.brightness = bri; });
         }
         syncActive = true;
         syncActiveDevices = onlineIds;
@@ -546,10 +555,14 @@ function mockApi(): Api {
           : next.smoothing === 68 && next.vibrance === 45 && next.minGlow === 15
             ? 'movie'
             : 'custom';
-      syncConfig = { ...structuredClone(next), preset };
+      const brightness = Math.max(1, Math.min(100, Math.round(next.brightness ?? 100)));
+      syncConfig = { ...structuredClone(next), brightness, preset };
       if (syncActive) {
         const includedIds = new Set(syncConfig.placements.filter((p) => !p.excluded).map((p) => p.deviceId));
         syncActiveDevices = syncActiveDevices.filter((id) => includedIds.has(id));
+        for (const id of syncActiveDevices) {
+          set(id, (s) => { s.brightness = brightness; });
+        }
         if (!syncActiveDevices.length) {
           syncActive = false;
         }

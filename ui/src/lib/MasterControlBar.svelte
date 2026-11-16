@@ -7,10 +7,14 @@
     target,
     devices,
     groupName,
+    peerSyncedIds = [],
+    peerSyncHost = null,
   }: {
     target: Target;
     devices: Device[];
     groupName?: string;
+    peerSyncedIds?: string[];
+    peerSyncHost?: string | null;
   } = $props();
 
   const PRESETS = ['#ff453a', '#ff9f0a', '#ffd60a', '#30d158', '#64d2ff', '#0a84ff', '#5e5ce6', '#ff375f'];
@@ -20,10 +24,13 @@
     { k: 6500, label: 'Daylight' },
   ];
 
+  const peerSet = $derived(new Set(peerSyncedIds));
   const onlineDevices = $derived(devices.filter((d) => d.online && d.state));
-  const litDevices = $derived(onlineDevices.filter((d) => d.state!.on));
-  const basisDevices = $derived(litDevices.length > 0 ? litDevices : onlineDevices);
-  const disabled = $derived(onlineDevices.length === 0);
+  const controllableDevices = $derived(onlineDevices.filter((d) => !peerSet.has(d.id)));
+  const allLockedByPeer = $derived(onlineDevices.length > 0 && controllableDevices.length === 0 && Boolean(peerSyncHost));
+  const litDevices = $derived(controllableDevices.filter((d) => d.state!.on));
+  const basisDevices = $derived(litDevices.length > 0 ? litDevices : controllableDevices.length > 0 ? controllableDevices : onlineDevices);
+  const disabled = $derived(controllableDevices.length === 0);
 
   const avgBrightness = $derived(
     basisDevices.length > 0
@@ -101,7 +108,11 @@
   <div class="col bri-col">
     <div class="bar-head">
       <span class="bar-title">{groupName ? `${groupName} master` : 'All lights master'}</span>
-      <span class="bar-value"><Icon name="sun" size={13} /> {avgBrightness}%</span>
+      {#if allLockedByPeer}
+        <span class="bar-value">Synced by {peerSyncHost}</span>
+      {:else}
+        <span class="bar-value"><Icon name="sun" size={13} /> {avgBrightness}%</span>
+      {/if}
     </div>
     <div class="bri-track">
       <Slider

@@ -6,7 +6,7 @@ mod capture;
 use capture::CaptureManager;
 use groovie_core::{
     Action, Config, ConfigInfo, DesktopPrefs, Device, DisplayInfo, Group, Groovie, LogEntry, Scene,
-    SyncConfig, SyncStatus, Target,
+    SyncConfig, SyncPeerConflict, SyncStatus, Target,
 };
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -51,6 +51,7 @@ struct IpcHandle(tokio::sync::Mutex<Option<groovie_core::ipc::IpcServer>>);
 #[derive(Clone, Default, PartialEq, Eq)]
 struct TraySnapshot {
     sync_active: bool,
+    sync_conflict_host: Option<String>,
     /// `(group_id, group_name, any_online_member_on)`
     groups: Vec<(String, String, bool)>,
     /// `(scene_id, scene_name)`
@@ -69,14 +70,16 @@ impl groovie_core::ipc::SyncController for DesktopSyncController {
     fn set_or_toggle<'a>(
         &'a self,
         desired: Option<bool>,
+        force: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncStatus, String>> + Send + 'a>> {
         Box::pin(async move {
-            let payload = set_or_toggle_sync(&self.0, desired).await?;
+            let payload = set_or_toggle_sync(&self.0, desired, force).await?;
             refresh_tray_menu(&self.0, false).await;
             Ok(SyncStatus {
                 active: payload.active,
                 active_devices: payload.active_devices,
                 config: payload.config,
+                conflict: payload.conflict,
             })
         })
     }
@@ -89,6 +92,8 @@ struct SyncStatePayload {
     active: bool,
     active_devices: Vec<String>,
     config: SyncConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conflict: Option<SyncPeerConflict>,
 }
 
 impl SyncStatePayload {
@@ -98,6 +103,7 @@ impl SyncStatePayload {
             active: st.active,
             active_devices: st.active_devices,
             config: st.config,
+            conflict: st.conflict,
         }
     }
 }
@@ -166,18 +172,33 @@ async fn shutdown_engine_cleanly(app: &AppHandle, reason: &str) {
     }
 }
 
-async fn set_or_toggle_sync(app: &AppHandle, desired: Option<bool>) -> R<SyncStatePayload> {
+async fn set_or_toggle_sync(app: &AppHandle, desired: Option<bool>, force: bool) -> R<SyncStatePayload> {
     let g = app.state::<AppState>().0.read().await.clone()?;
     let cur = g.sync_status().await;
     let enable = desired.unwrap_or(!cur.active);
 
     if enable {
         if !CaptureManager::is_supported() {
-            return Err("Screen Sync is currently supported on Windows only".into());
+            return Err("Screen Sync is not supported on this platform".into());
+        }
+        if !force {
+            if let Some(conflict) = &cur.conflict {
+                let overlaps = cur
+                    .config
+                    .placements
+                    .iter()
+                    .any(|p| !p.excluded && conflict.device_ids.iter().any(|id| id == &p.device_id));
+                if overlaps {
+                    return Err(format!(
+                        "Screen Sync is already active on {} — stop it there or take over sync",
+                        conflict.host_name
+                    ));
+                }
+            }
         }
         app.state::<CaptureManager>()
             .start(g.clone(), cur.config.display_id.clone())?;
-        match g.start_sync().await {
+        match g.start_sync_with_options(force).await {
             Ok(st) => Ok(SyncStatePayload::from_status(st)),
             Err(e) => {
                 app.state::<CaptureManager>().stop();
@@ -312,6 +333,7 @@ async fn get_sync_state(s: State<'_, AppState>) -> R<SyncStatePayload> {
             active: false,
             active_devices: Vec::new(),
             config: SyncConfig::default(),
+            conflict: None,
         }),
     }
 }
@@ -322,8 +344,8 @@ fn list_displays() -> Vec<DisplayInfo> {
 }
 
 #[tauri::command]
-async fn set_sync_enabled(app: AppHandle, enabled: bool) -> R<SyncStatePayload> {
-    set_or_toggle_sync(&app, Some(enabled)).await
+async fn set_sync_enabled(app: AppHandle, enabled: bool, force: Option<bool>) -> R<SyncStatePayload> {
+    set_or_toggle_sync(&app, Some(enabled), force.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -613,8 +635,21 @@ async fn collect_tray_snapshot(app: &AppHandle) -> TraySnapshot {
         })
         .collect();
     let scene_items = scenes.into_iter().map(|sc| (sc.id, sc.name)).collect();
+    let sync_conflict_host = if !sync.active {
+        sync.conflict.and_then(|c| {
+            let overlaps = sync
+                .config
+                .placements
+                .iter()
+                .any(|p| !p.excluded && c.device_ids.iter().any(|id| id == &p.device_id));
+            overlaps.then_some(c.host_name)
+        })
+    } else {
+        None
+    };
     TraySnapshot {
         sync_active: sync.active,
+        sync_conflict_host,
         groups: group_items,
         scenes: scene_items,
     }
@@ -624,10 +659,14 @@ fn build_tray_menu(app: &AppHandle, snap: &TraySnapshot) -> tauri::Result<Menu<t
     let menu = Menu::new(app)?;
 
     if CaptureManager::is_supported() {
+        let sync_label = match (&snap.sync_conflict_host, snap.sync_active) {
+            (Some(host), false) => format!("Screen sync (on {host})"),
+            _ => "Screen sync".to_string(),
+        };
         let sync_item = CheckMenuItem::with_id(
             app,
             "sync",
-            "Screen sync",
+            sync_label,
             true,
             snap.sync_active,
             None::<&str>,
@@ -750,7 +789,7 @@ fn build_tray(app: &AppHandle, initial_snap: &TraySnapshot) -> tauri::Result<()>
                 "sync" => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        if set_or_toggle_sync(&app, None).await.is_err() {
+                        if set_or_toggle_sync(&app, None, false).await.is_err() {
                             show_main(&app);
                         }
                         refresh_tray_menu(&app, true).await;

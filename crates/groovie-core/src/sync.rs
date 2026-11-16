@@ -146,6 +146,9 @@ impl SyncPlacement {
     }
 }
 
+fn default_sync_brightness() -> u8 {
+    100
+}
 fn default_smoothing() -> u8 {
     32
 }
@@ -164,6 +167,8 @@ pub struct SyncConfig {
     pub display_id: Option<String>,
     #[serde(default)]
     pub preset: SyncPreset,
+    #[serde(default = "default_sync_brightness")]
+    pub brightness: u8,
     #[serde(default = "default_smoothing")]
     pub smoothing: u8,
     #[serde(default = "default_vibrance")]
@@ -179,6 +184,7 @@ impl Default for SyncConfig {
         Self {
             display_id: None,
             preset: SyncPreset::Game,
+            brightness: default_sync_brightness(),
             smoothing: default_smoothing(),
             vibrance: default_vibrance(),
             min_glow: default_min_glow(),
@@ -194,6 +200,7 @@ impl SyncConfig {
 
     pub fn sanitized(mut self) -> Self {
         self.display_id = self.display_id.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.brightness = self.brightness.clamp(1, 100);
         self.smoothing = self.smoothing.min(100);
         self.vibrance = self.vibrance.min(100);
         self.min_glow = self.min_glow.min(100);
@@ -224,6 +231,14 @@ impl Default for SampleRect {
     }
 }
 
+/// Active Screen Sync session detected on another computer on the same LAN.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPeerConflict {
+    pub host_name: String,
+    pub device_ids: Vec<String>,
+}
+
 /// Runtime + config snapshot of Screen Sync exposed to UI and tray.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +246,8 @@ pub struct SyncStatus {
     pub active: bool,
     pub active_devices: Vec<String>,
     pub config: SyncConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<SyncPeerConflict>,
 }
 
 /// Live preview of a single placement's sample region and smoothed segment colors.

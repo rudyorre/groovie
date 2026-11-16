@@ -1,10 +1,13 @@
 //! OS display enumeration and low-overhead screen capture for Screen Sync.
 //!
-//! On Windows, uses DXGI Desktop Duplication (`IDXGIOutput5::DuplicateOutput1`
-//! with HDR/SDR fallback to `IDXGIOutput1::DuplicateOutput`) on a dedicated
-//! background thread, downsampling GPU staging textures into `64×36`
-//! [`SyncFrame`]s at ~22 Hz and automatically stopping when Windows locks or
-//! enters a secure/suspended session.
+//! - **Windows:** DXGI Desktop Duplication (`IDXGIOutput5::DuplicateOutput1` with
+//!   HDR/SDR fallback to `IDXGIOutput1::DuplicateOutput`), downsampling GPU staging
+//!   textures into `64×36` [`SyncFrame`]s at ~22 Hz and stopping on desktop lock.
+//! - **macOS:** CoreGraphics display capture (`CGDisplayCreateImage`) across active
+//!   displays with Retina/P3/EDR pixel decoding, Screen Recording permission checks,
+//!   and automatic stop when `CGSessionCopyCurrentDictionary` reports screen lock.
+//! - **Linux:** X11 + RandR monitor enumeration and root-window `ZPixmap` capture via
+//!   `x11rb` (works on native X11 and XWayland sessions).
 
 use groovie_core::protocol::Rgb;
 use groovie_core::{DisplayInfo, Groovie, SyncFrame, SYNC_GRID_H, SYNC_GRID_W};
@@ -15,9 +18,14 @@ use std::thread::JoinHandle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum PixelLayout {
+    Bgr8,
     Bgra8,
     Rgba8,
+    Argb8,
+    Abgr8,
     Rgb10A2,
+    Bgr10A2Le,
+    Bgr10A2Be,
     Rgba16F,
 }
 
@@ -53,7 +61,7 @@ impl CaptureManager {
     }
 
     pub fn is_supported() -> bool {
-        cfg!(target_os = "windows")
+        cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"))
     }
 
     pub fn list_displays() -> Vec<DisplayInfo> {
@@ -61,7 +69,15 @@ impl CaptureManager {
         {
             win::list_displays()
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            mac::list_displays()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::list_displays()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
             Vec::new()
         }
@@ -70,13 +86,13 @@ impl CaptureManager {
     pub fn start(&self, groovie: Groovie, display_id: Option<String>) -> Result<(), String> {
         let normalized = display_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
             let _ = (groovie, normalized);
-            Err("Screen Sync capture is currently supported on Windows only".into())
+            Err("Screen Sync is not supported on this platform".into())
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         {
             let mut guard = self.inner.lock().unwrap();
             if let Some(cur) = guard.as_ref() {
@@ -94,14 +110,26 @@ impl CaptureManager {
                 }
             }
 
+            #[cfg(target_os = "windows")]
             win::verify_display_available(normalized.as_deref())?;
+            #[cfg(target_os = "macos")]
+            mac::verify_display_available(normalized.as_deref())?;
+            #[cfg(target_os = "linux")]
+            linux::verify_display_available(normalized.as_deref())?;
 
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = stop.clone();
             let target_id = normalized.clone();
             let handle = std::thread::Builder::new()
-                .name("groovie-dxgi-capture".into())
-                .spawn(move || win::capture_loop(groovie, target_id, stop_thread))
+                .name("groovie-screen-capture".into())
+                .spawn(move || {
+                    #[cfg(target_os = "windows")]
+                    win::capture_loop(groovie, target_id, stop_thread);
+                    #[cfg(target_os = "macos")]
+                    mac::capture_loop(groovie, target_id, stop_thread);
+                    #[cfg(target_os = "linux")]
+                    linux::capture_loop(groovie, target_id, stop_thread);
+                })
                 .map_err(|e| format!("could not spawn capture thread: {e}"))?;
 
             *guard = Some(RunningCapture {
@@ -178,8 +206,10 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
 #[allow(dead_code)]
 fn decode_pixel(bytes: &[u8], layout: PixelLayout) -> Rgb {
     match layout {
-        PixelLayout::Bgra8 => Rgb::new(bytes[2], bytes[1], bytes[0]),
+        PixelLayout::Bgr8 | PixelLayout::Bgra8 => Rgb::new(bytes[2], bytes[1], bytes[0]),
         PixelLayout::Rgba8 => Rgb::new(bytes[0], bytes[1], bytes[2]),
+        PixelLayout::Argb8 => Rgb::new(bytes[1], bytes[2], bytes[3]),
+        PixelLayout::Abgr8 => Rgb::new(bytes[3], bytes[2], bytes[1]),
         PixelLayout::Rgb10A2 => {
             let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let r = ((w & 0x3ff) >> 2) as u8;
@@ -187,8 +217,22 @@ fn decode_pixel(bytes: &[u8], layout: PixelLayout) -> Rgb {
             let b = (((w >> 20) & 0x3ff) >> 2) as u8;
             Rgb::new(r, g, b)
         }
+        PixelLayout::Bgr10A2Le => {
+            let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let r = (((w >> 20) & 0x3ff) >> 2) as u8;
+            let g = (((w >> 10) & 0x3ff) >> 2) as u8;
+            let b = ((w & 0x3ff) >> 2) as u8;
+            Rgb::new(r, g, b)
+        }
+        PixelLayout::Bgr10A2Be => {
+            let w = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let r = (((w >> 20) & 0x3ff) >> 2) as u8;
+            let g = (((w >> 10) & 0x3ff) >> 2) as u8;
+            let b = ((w & 0x3ff) >> 2) as u8;
+            Rgb::new(r, g, b)
+        }
         PixelLayout::Rgba16F => {
-            // Windows scRGB linear float: 1.0 = 80 nits SDR reference, ~2.0 = typical 160-nit SDR white.
+            // Windows scRGB / macOS EDR linear float: 1.0 = SDR reference, ~2.0 = typical bright white.
             // Scale by 0.5 and apply gentle luminance Reinhard rolloff so both SDR-on-HDR and HDR scenes map naturally.
             let mut r = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
             let mut g = f16_to_f32(u16::from_le_bytes([bytes[2], bytes[3]]));
@@ -220,7 +264,14 @@ pub fn downsample_surface_to_frame(
         return None;
     }
     let bpp = match layout {
-        PixelLayout::Bgra8 | PixelLayout::Rgba8 | PixelLayout::Rgb10A2 => 4usize,
+        PixelLayout::Bgr8 => 3usize,
+        PixelLayout::Bgra8
+        | PixelLayout::Rgba8
+        | PixelLayout::Argb8
+        | PixelLayout::Abgr8
+        | PixelLayout::Rgb10A2
+        | PixelLayout::Bgr10A2Le
+        | PixelLayout::Bgr10A2Be => 4usize,
         PixelLayout::Rgba16F => 8usize,
     };
     let min_bytes = tex_h.checked_sub(1)?.checked_mul(row_pitch)?.checked_add(tex_w.checked_mul(bpp)?)?;
@@ -790,27 +841,605 @@ mod win {
     }
 }
 
+#[allow(dead_code)]
+fn map_cg_bitmap(bits_per_pixel: usize, bits_per_component: usize, bitmap_info: u32) -> Option<PixelLayout> {
+    const ALPHA_MASK: u32 = 0x1F;
+    const FLOAT_COMPONENTS: u32 = 1 << 8;
+    const BYTE_ORDER_MASK: u32 = 0x7000;
+    const BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
+    const BYTE_ORDER_32_BIG: u32 = 4 << 12;
+
+    if bits_per_pixel == 64 && bits_per_component == 16 && (bitmap_info & FLOAT_COMPONENTS) != 0 {
+        return Some(PixelLayout::Rgba16F);
+    }
+    if bits_per_pixel == 32 && bits_per_component == 10 {
+        return match bitmap_info & BYTE_ORDER_MASK {
+            BYTE_ORDER_32_LITTLE => Some(PixelLayout::Bgr10A2Le),
+            _ => Some(PixelLayout::Bgr10A2Be),
+        };
+    }
+    if bits_per_pixel != 32 || bits_per_component != 8 {
+        return None;
+    }
+
+    let alpha_info = bitmap_info & ALPHA_MASK;
+    // CGImageAlphaInfo: 3 = PremultipliedFirst, 4 = First, 6 = NoneSkipFirst
+    let alpha_first = matches!(alpha_info, 3 | 4 | 6);
+    match bitmap_info & BYTE_ORDER_MASK {
+        BYTE_ORDER_32_LITTLE => {
+            if alpha_first {
+                Some(PixelLayout::Bgra8)
+            } else {
+                Some(PixelLayout::Abgr8)
+            }
+        }
+        BYTE_ORDER_32_BIG | 0 => {
+            if alpha_first {
+                Some(PixelLayout::Argb8)
+            } else {
+                Some(PixelLayout::Rgba8)
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---- macOS CoreGraphics implementation ------------------------------------
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::{downsample_surface_to_frame, map_cg_bitmap, SurfaceRotation};
+    use groovie_core::{DisplayInfo, Groovie};
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    type CGDirectDisplayID = u32;
+    type CGError = i32;
+    type CFIndex = isize;
+    type CFTypeRef = *const c_void;
+    type CFDataRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFBooleanRef = *const c_void;
+    type CGImageRef = *const c_void;
+    type CGDataProviderRef = *const c_void;
+
+    const K_CG_ERROR_SUCCESS: CGError = 0;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const CAPTURE_INTERVAL: Duration = Duration::from_millis(45);
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(
+            max_displays: u32,
+            active_displays: *mut CGDirectDisplayID,
+            display_count: *mut u32,
+        ) -> CGError;
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> u32;
+        fn CGDisplayCreateImage(display_id: CGDirectDisplayID) -> CGImageRef;
+        fn CGImageGetWidth(image: CGImageRef) -> usize;
+        fn CGImageGetHeight(image: CGImageRef) -> usize;
+        fn CGImageGetBitsPerComponent(image: CGImageRef) -> usize;
+        fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+        fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+        fn CGImageGetBitmapInfo(image: CGImageRef) -> u32;
+        fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+        fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
+        fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFStringCreateWithCString(
+            alloc: CFTypeRef,
+            c_str: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFDictionaryGetValue(the_dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFBooleanGetValue(boolean: CFBooleanRef) -> u8;
+    }
+
+    struct CfGuard(CFTypeRef);
+    impl Drop for CfGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn active_display_ids() -> Result<Vec<CGDirectDisplayID>, String> {
+        let mut ids = [0 as CGDirectDisplayID; 16];
+        let mut count = 0u32;
+        let rc = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+        if rc != K_CG_ERROR_SUCCESS {
+            return Err(format!("CoreGraphics display enumeration failed ({rc})"));
+        }
+        let n = (count as usize).min(ids.len());
+        Ok(ids[..n].to_vec())
+    }
+
+    pub fn list_displays() -> Vec<DisplayInfo> {
+        let Ok(ids) = active_display_ids() else {
+            return Vec::new();
+        };
+        let main_id = unsafe { CGMainDisplayID() };
+        let mut out = Vec::with_capacity(ids.len());
+        for (idx, id) in ids.into_iter().enumerate() {
+            let width = unsafe { CGDisplayPixelsWide(id) } as u32;
+            let height = unsafe { CGDisplayPixelsHigh(id) } as u32;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let is_primary = id == main_id;
+            let builtin = unsafe { CGDisplayIsBuiltin(id) != 0 };
+            let name = if builtin {
+                format!("Display {} · Built-in Display", idx + 1)
+            } else {
+                format!("Display {}", idx + 1)
+            };
+            out.push(DisplayInfo {
+                id: id.to_string(),
+                name,
+                width,
+                height,
+                is_primary,
+            });
+        }
+        out.sort_by(|a, b| b.is_primary.cmp(&a.is_primary).then_with(|| a.id.cmp(&b.id)));
+        out
+    }
+
+    pub fn verify_display_available(preferred_id: Option<&str>) -> Result<(), String> {
+        let displays = list_displays();
+        if displays.is_empty() {
+            return Err("No active displays found for Screen Sync".into());
+        }
+        let _ = preferred_id;
+        let granted = unsafe { CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() };
+        if !granted {
+            return Err(
+                "Screen Recording permission is required — enable Groovie in System Settings → Privacy & Security → Screen & System Audio Recording"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn is_session_locked() -> bool {
+        unsafe {
+            let dict = CGSessionCopyCurrentDictionary();
+            if dict.is_null() {
+                return false;
+            }
+            let _dict_guard = CfGuard(dict);
+            let key = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"CGSSessionScreenIsLocked".as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            if key.is_null() {
+                return false;
+            }
+            let _key_guard = CfGuard(key);
+            let val = CFDictionaryGetValue(dict, key);
+            !val.is_null() && CFBooleanGetValue(val) != 0
+        }
+    }
+
+    fn resolve_target_display(preferred_id: Option<&str>) -> Option<CGDirectDisplayID> {
+        let ids = active_display_ids().ok()?;
+        if ids.is_empty() {
+            return None;
+        }
+        if let Some(raw) = preferred_id {
+            if let Ok(parsed) = raw.parse::<CGDirectDisplayID>() {
+                if ids.contains(&parsed) {
+                    return Some(parsed);
+                }
+            }
+        }
+        let main = unsafe { CGMainDisplayID() };
+        if ids.contains(&main) {
+            Some(main)
+        } else {
+            ids.into_iter().next()
+        }
+    }
+
+    pub fn capture_loop(groovie: Groovie, display_id: Option<String>, stop: Arc<AtomicBool>) {
+        let mut reopen_failures = 0u32;
+        let mut last_lock_probe = Instant::now();
+
+        while !stop.load(Ordering::SeqCst) {
+            let tick_start = Instant::now();
+
+            if last_lock_probe.elapsed() >= Duration::from_millis(850) {
+                last_lock_probe = Instant::now();
+                if is_session_locked() {
+                    if !stop.load(Ordering::SeqCst) {
+                        tauri::async_runtime::block_on(groovie.stop_sync(Some("screen locked")));
+                    }
+                    return;
+                }
+            }
+
+            let Some(target_id) = resolve_target_display(display_id.as_deref()) else {
+                reopen_failures += 1;
+                if reopen_failures >= 16 {
+                    if !stop.load(Ordering::SeqCst) {
+                        tauri::async_runtime::block_on(groovie.stop_sync(Some("display unavailable")));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            };
+
+            let img = unsafe { CGDisplayCreateImage(target_id) };
+            if img.is_null() {
+                if is_session_locked() {
+                    if !stop.load(Ordering::SeqCst) {
+                        tauri::async_runtime::block_on(groovie.stop_sync(Some("screen locked")));
+                    }
+                    return;
+                }
+                reopen_failures += 1;
+                if reopen_failures >= 16 {
+                    if !stop.load(Ordering::SeqCst) {
+                        tauri::async_runtime::block_on(groovie.stop_sync(Some("display unavailable")));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            reopen_failures = 0;
+            let _img_guard = CfGuard(img);
+
+            let tex_w = unsafe { CGImageGetWidth(img) };
+            let tex_h = unsafe { CGImageGetHeight(img) };
+            let bpc = unsafe { CGImageGetBitsPerComponent(img) };
+            let bpp = unsafe { CGImageGetBitsPerPixel(img) };
+            let pitch = unsafe { CGImageGetBytesPerRow(img) };
+            let bitmap_info = unsafe { CGImageGetBitmapInfo(img) };
+
+            if let Some(layout) = map_cg_bitmap(bpp, bpc, bitmap_info) {
+                let provider = unsafe { CGImageGetDataProvider(img) };
+                if !provider.is_null() {
+                    let cf_data = unsafe { CGDataProviderCopyData(provider) };
+                    if !cf_data.is_null() {
+                        let _data_guard = CfGuard(cf_data);
+                        let ptr = unsafe { CFDataGetBytePtr(cf_data) };
+                        let len = unsafe { CFDataGetLength(cf_data) };
+                        if !ptr.is_null() && len > 0 {
+                            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                            if let Some(frame) = downsample_surface_to_frame(
+                                bytes,
+                                pitch,
+                                tex_w,
+                                tex_h,
+                                layout,
+                                SurfaceRotation::Identity,
+                            ) {
+                                if !stop.load(Ordering::SeqCst) {
+                                    tauri::async_runtime::block_on(groovie.push_sync_frame(frame));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let elapsed = tick_start.elapsed();
+            if let Some(rem) = CAPTURE_INTERVAL.checked_sub(elapsed) {
+                std::thread::sleep(rem);
+            }
+        }
+    }
+}
+
+// ---- Linux X11 / RandR implementation -------------------------------------
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{downsample_surface_to_frame, PixelLayout, SurfaceRotation};
+    use groovie_core::{DisplayInfo, Groovie};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder};
+    use x11rb::rust_connection::RustConnection;
+
+    const CAPTURE_INTERVAL: Duration = Duration::from_millis(45);
+
+    struct MonitorTarget {
+        info: DisplayInfo,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+    }
+
+    fn connect_x11() -> Result<(RustConnection, usize), String> {
+        x11rb::connect(None).map_err(|e| {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
+                "Screen Sync on Linux requires X11 or XWayland (DISPLAY is not set in this Wayland session)"
+                    .to_string()
+            } else {
+                format!("Could not connect to X11 display for Screen Sync: {e}")
+            }
+        })
+    }
+
+    fn enumerate_monitors(conn: &RustConnection, screen_num: usize) -> Vec<MonitorTarget> {
+        let Some(screen) = conn.setup().roots.get(screen_num) else {
+            return Vec::new();
+        };
+        let root_w = screen.width_in_pixels;
+        let root_h = screen.height_in_pixels;
+        let mut results = Vec::new();
+
+        if let Ok(cookie) = conn.randr_get_monitors(screen.root, true) {
+            if let Ok(reply) = cookie.reply() {
+                for (idx, m) in reply.monitors.into_iter().enumerate() {
+                    let sx = m.x.max(0);
+                    let sy = m.y.max(0);
+                    let max_w = (root_w as i32 - sx as i32).max(0) as u16;
+                    let max_h = (root_h as i32 - sy as i32).max(0) as u16;
+                    let sw = m.width.min(max_w);
+                    let sh = m.height.min(max_h);
+                    if sw == 0 || sh == 0 {
+                        continue;
+                    }
+                    let atom_label = conn
+                        .get_atom_name(m.name)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| String::from_utf8_lossy(&r.name).trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let id = atom_label.clone().unwrap_or_else(|| format!("xrandr-{idx}"));
+                    let name = match atom_label {
+                        Some(lbl) => format!("Display {} · {lbl}", idx + 1),
+                        None => format!("Display {}", idx + 1),
+                    };
+                    results.push(MonitorTarget {
+                        info: DisplayInfo {
+                            id,
+                            name,
+                            width: sw as u32,
+                            height: sh as u32,
+                            is_primary: m.primary,
+                        },
+                        x: sx,
+                        y: sy,
+                        w: sw,
+                        h: sh,
+                    });
+                }
+            }
+        }
+
+        if results.is_empty() && root_w > 0 && root_h > 0 {
+            results.push(MonitorTarget {
+                info: DisplayInfo {
+                    id: "x11-default".into(),
+                    name: "Primary display".into(),
+                    width: root_w as u32,
+                    height: root_h as u32,
+                    is_primary: true,
+                },
+                x: 0,
+                y: 0,
+                w: root_w,
+                h: root_h,
+            });
+        }
+
+        if !results.is_empty() && !results.iter().any(|m| m.info.is_primary) {
+            results[0].info.is_primary = true;
+        }
+        results.sort_by(|a, b| {
+            b.info
+                .is_primary
+                .cmp(&a.info.is_primary)
+                .then_with(|| a.info.id.cmp(&b.info.id))
+        });
+        results
+    }
+
+    pub fn list_displays() -> Vec<DisplayInfo> {
+        let Ok((conn, screen_num)) = connect_x11() else {
+            return Vec::new();
+        };
+        enumerate_monitors(&conn, screen_num)
+            .into_iter()
+            .map(|m| m.info)
+            .collect()
+    }
+
+    pub fn verify_display_available(preferred_id: Option<&str>) -> Result<(), String> {
+        let (conn, screen_num) = connect_x11()?;
+        let monitors = enumerate_monitors(&conn, screen_num);
+        let chosen = preferred_id
+            .and_then(|id| monitors.iter().find(|m| m.info.id == id))
+            .or_else(|| monitors.iter().find(|m| m.info.is_primary))
+            .or_else(|| monitors.first())
+            .ok_or_else(|| "No active X11 display outputs found for Screen Sync".to_string())?;
+        let screen = &conn.setup().roots[screen_num];
+        conn.get_image(ImageFormat::Z_PIXMAP, screen.root, chosen.x, chosen.y, 1, 1, !0)
+            .map_err(|e| format!("X11 capture request failed: {e}"))?
+            .reply()
+            .map_err(|e| {
+                format!(
+                    "X11 screen capture was rejected ({e}) — on Wayland, direct root-window readback may be restricted"
+                )
+            })?;
+        Ok(())
+    }
+
+    pub fn capture_loop(groovie: Groovie, display_id: Option<String>, stop: Arc<AtomicBool>) {
+        let mut session: Option<(RustConnection, usize)> = None;
+        let mut reopen_failures = 0u32;
+
+        while !stop.load(Ordering::SeqCst) {
+            if session.is_none() {
+                match connect_x11() {
+                    Ok(pair) => {
+                        session = Some(pair);
+                        reopen_failures = 0;
+                    }
+                    Err(_) => {
+                        reopen_failures += 1;
+                        if reopen_failures >= 16 {
+                            if !stop.load(Ordering::SeqCst) {
+                                tauri::async_runtime::block_on(
+                                    groovie.stop_sync(Some("display unavailable")),
+                                );
+                            }
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                }
+            }
+
+            let tick_start = Instant::now();
+            let (conn, screen_num) = session.as_ref().unwrap();
+            let monitors = enumerate_monitors(conn, *screen_num);
+            let Some(chosen) = display_id
+                .as_deref()
+                .and_then(|id| monitors.iter().find(|m| m.info.id == id))
+                .or_else(|| monitors.iter().find(|m| m.info.is_primary))
+                .or_else(|| monitors.first())
+            else {
+                session = None;
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            };
+
+            let root = conn.setup().roots[*screen_num].root;
+            let byte_order = conn.setup().image_byte_order;
+            let reply = conn
+                .get_image(
+                    ImageFormat::Z_PIXMAP,
+                    root,
+                    chosen.x,
+                    chosen.y,
+                    chosen.w,
+                    chosen.h,
+                    !0,
+                )
+                .ok()
+                .and_then(|c| c.reply().ok());
+
+            let Some(img) = reply else {
+                session = None;
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            };
+
+            let w_usize = chosen.w as usize;
+            let h_usize = chosen.h as usize;
+            if w_usize > 0 && h_usize > 0 && img.data.len() >= h_usize {
+                let pitch = img.data.len() / h_usize;
+                let layout = if pitch >= w_usize * 4 {
+                    if byte_order == ImageOrder::MSB_FIRST {
+                        Some(PixelLayout::Argb8)
+                    } else {
+                        Some(PixelLayout::Bgra8)
+                    }
+                } else if pitch >= w_usize * 3 && byte_order == ImageOrder::LSB_FIRST {
+                    Some(PixelLayout::Bgr8)
+                } else {
+                    None
+                };
+
+                if let Some(layout) = layout {
+                    if let Some(frame) = downsample_surface_to_frame(
+                        &img.data,
+                        pitch,
+                        w_usize,
+                        h_usize,
+                        layout,
+                        SurfaceRotation::Identity,
+                    ) {
+                        if !stop.load(Ordering::SeqCst) {
+                            tauri::async_runtime::block_on(groovie.push_sync_frame(frame));
+                        }
+                    }
+                }
+            }
+
+            let elapsed = tick_start.elapsed();
+            if let Some(rem) = CAPTURE_INTERVAL.checked_sub(elapsed) {
+                std::thread::sleep(rem);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decodes_bgra8_rgb10a2_and_hdr_rgba16f_cleanly() {
+    fn decodes_all_pixel_layouts_cleanly() {
+        assert_eq!(decode_pixel(&[30, 120, 240], PixelLayout::Bgr8), Rgb::new(240, 120, 30));
         assert_eq!(decode_pixel(&[30, 120, 240, 255], PixelLayout::Bgra8), Rgb::new(240, 120, 30));
         assert_eq!(decode_pixel(&[240, 120, 30, 255], PixelLayout::Rgba8), Rgb::new(240, 120, 30));
+        assert_eq!(decode_pixel(&[255, 240, 120, 30], PixelLayout::Argb8), Rgb::new(240, 120, 30));
+        assert_eq!(decode_pixel(&[255, 30, 120, 240], PixelLayout::Abgr8), Rgb::new(240, 120, 30));
 
-        // R10G10B10A2: R=1023 (~255), G=512 (~128), B=0
-        let packed: u32 = 1023 | (512 << 10);
-        let c10 = decode_pixel(&packed.to_le_bytes(), PixelLayout::Rgb10A2);
+        // DXGI R10G10B10A2: R=1023 (~255), G=512 (~128), B=0
+        let packed_dxgi: u32 = 1023 | (512 << 10);
+        let c10 = decode_pixel(&packed_dxgi.to_le_bytes(), PixelLayout::Rgb10A2);
         assert_eq!(c10.r, 255);
         assert!((127..=129).contains(&c10.g));
         assert_eq!(c10.b, 0);
+
+        // CoreGraphics RGB101010: R in [29:20], G in [19:10], B in [9:0]
+        let packed_cg: u32 = (1023 << 20) | (512 << 10) | 256;
+        let cg_le = decode_pixel(&packed_cg.to_le_bytes(), PixelLayout::Bgr10A2Le);
+        let cg_be = decode_pixel(&packed_cg.to_be_bytes(), PixelLayout::Bgr10A2Be);
+        assert_eq!(cg_le, Rgb::new(255, 128, 64));
+        assert_eq!(cg_be, Rgb::new(255, 128, 64));
 
         // IEEE binary16: 0x4000 = 2.0 (SDR white in scRGB), 0x0000 = 0.0
         let mut f16_bytes = [0u8; 8];
         f16_bytes[0..2].copy_from_slice(&0x4000u16.to_le_bytes()); // R = 2.0
         let hdr_red = decode_pixel(&f16_bytes, PixelLayout::Rgba16F);
         assert!(hdr_red.r > 200 && hdr_red.g == 0 && hdr_red.b == 0, "hdr_red={hdr_red:?}");
+    }
+
+    #[test]
+    fn maps_coregraphics_bitmap_info_variants() {
+        // kCGBitmapByteOrder32Little (2<<12) | kCGImageAlphaPremultipliedFirst (3)
+        assert_eq!(map_cg_bitmap(32, 8, (2 << 12) | 3), Some(PixelLayout::Bgra8));
+        // kCGBitmapByteOrder32Little (2<<12) | kCGImageAlphaNoneSkipFirst (6)
+        assert_eq!(map_cg_bitmap(32, 8, (2 << 12) | 6), Some(PixelLayout::Bgra8));
+        // kCGBitmapByteOrder32Big (4<<12) | kCGImageAlphaPremultipliedLast (1)
+        assert_eq!(map_cg_bitmap(32, 8, (4 << 12) | 1), Some(PixelLayout::Rgba8));
+        // kCGBitmapByteOrder32Big (4<<12) | kCGImageAlphaNoneSkipFirst (6)
+        assert_eq!(map_cg_bitmap(32, 8, (4 << 12) | 6), Some(PixelLayout::Argb8));
+        // 10-bit P3 wide gamut
+        assert_eq!(map_cg_bitmap(32, 10, 2 << 12), Some(PixelLayout::Bgr10A2Le));
+        // 16-bit float EDR
+        assert_eq!(map_cg_bitmap(64, 16, 1 << 8), Some(PixelLayout::Rgba16F));
     }
 
     #[test]

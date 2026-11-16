@@ -32,7 +32,7 @@
 - **Direct control:** power, brightness, RGB colour, and white colour temperature (`2000K–9000K`)
 - **Two-way LAN sync:** changes made in the Govee mobile app sync back automatically without cloud polling
 - **Groups & scenes:** control rooms together (e.g. "Desk") and snapshot saved looks (e.g. "Evening")
-- **Screen Sync (Windows):** low-latency 2D spatial display sync with per-segment & split-bar RGBIC streaming, Oklab smoothing, and automatic letterbox cropping
+- **Screen Sync (Windows, macOS & Linux):** low-latency 2D spatial display sync with per-segment & split-bar RGBIC streaming, Oklab smoothing, automatic letterbox cropping, and multi-device conflict detection across computers on the same LAN
 - **Lightweight tray app + CLI:** native Tauri desktop app for Windows, macOS, and Linux with quick **Groups** & **Scenes** tray submenus, optional launch at login / start minimized (`--minimized`), and `grooviectl` for scripts and keybindings
 
 > Groovie is an independent open-source project and is not affiliated with or endorsed by Govee.
@@ -50,7 +50,8 @@ Grab the latest installer from [**Releases**](https://github.com/rudyorre/groovi
 
 Notes on first launch (builds are not OS-notarized yet):
 - **Windows:** if SmartScreen says *"Windows protected your PC"*, click **More info → Run anyway**.
-- **macOS:** if Gatekeeper blocks opening, drag `Groovie.app` to Applications and run `xattr -cr /Applications/Groovie.app` once.
+- **macOS:** if Gatekeeper blocks opening, drag `Groovie.app` to Applications and run `xattr -cr /Applications/Groovie.app` once. For **Screen Sync**, grant Screen Recording access in **System Settings → Privacy & Security → Screen & System Audio Recording** when prompted.
+- **Linux:** **Screen Sync** uses X11/RandR (`DISPLAY`); on Wayland desktops, make sure XWayland is enabled.
 - **Firewall:** allow Groovie on **private** networks when prompted (UDP ports `4001–4003`).
 
 ## Setup
@@ -74,7 +75,7 @@ grooviectl scene save Evening "Light Bars"
 grooviectl scene update Evening           # overwrite scene with current look
 grooviectl scene rename Evening "Late Night"
 grooviectl scene apply "Late Night"
-grooviectl sync toggle                    # start/stop Screen Sync in the desktop app
+grooviectl sync toggle                    # start/stop Screen Sync (--force to take over from another host)
 grooviectl add-ip 192.168.1.50            # add a light directly if multicast is blocked
 grooviectl forget "Old Bulb"              # remove a light from groups, scenes & config
 grooviectl config                         # print active groovie.json path (--json for contents)

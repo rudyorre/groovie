@@ -67,7 +67,17 @@
   const group = $derived(groups.find((g) => g.id === view));
   const shown = $derived(group ? devices.filter((d) => group.members.includes(d.id)) : devices);
   const target = $derived<Target>(group ? { type: 'group', id: group.id } : { type: 'all' });
-  const onCount = $derived(shown.filter((d) => d.online && d.state?.on).length);
+  const peerConflict = $derived(syncState && !syncState.active ? (syncState.conflict ?? null) : null);
+  const peerSyncedIds = $derived(peerConflict?.deviceIds ?? []);
+  const peerSyncedSet = $derived(new Set(peerSyncedIds));
+  const peerConflictOverlapsIncluded = $derived(
+    Boolean(
+      peerConflict &&
+        syncState?.config.placements.some((p) => !p.excluded && peerSyncedSet.has(p.deviceId)),
+    ),
+  );
+  const controllableShown = $derived(shown.filter((d) => !peerSyncedSet.has(d.id)));
+  const onCount = $derived(controllableShown.filter((d) => d.online && d.state?.on).length);
   const shownLogs = $derived(hidePolls ? logs.filter((l) => !l.poll) : logs);
   const updating = $derived(updateProgress !== null);
   const updatePct = $derived(
@@ -121,11 +131,14 @@
     }
   }
 
-  async function toggleSync(enabled: boolean) {
-    const next = await run((a) => a.setSyncEnabled(enabled));
+  async function toggleSync(enabled: boolean, force = false) {
+    const next = await run((a) => a.setSyncEnabled(enabled, force));
     if (next) {
       syncState = next;
       if (!next.active) syncPreview = null;
+    } else if (enabled && !force) {
+      const refreshed = await (await api).getSyncState().catch(() => null);
+      if (refreshed) syncState = refreshed;
     }
   }
 
@@ -544,14 +557,26 @@
       </button>
 
       {#if syncState?.supported}
-        <div class="sync-nav" class:active={view === 'sync'} class:live={syncState.active}>
+        <div
+          class="sync-nav"
+          class:active={view === 'sync'}
+          class:live={syncState.active || peerConflictOverlapsIncluded}
+        >
           <button class="nav-item" onclick={() => (view = 'sync')}>
             <Icon name="monitor" /> <span>Screen sync</span>
           </button>
-          <label class="switch nav-switch" title={syncState.active ? 'Stop screen sync' : 'Start screen sync'}>
+          <label
+            class="switch nav-switch"
+            title={syncState.active
+              ? 'Stop screen sync'
+              : peerConflictOverlapsIncluded
+                ? `Active on ${peerConflict?.hostName} — open Screen Sync to take over`
+                : 'Start screen sync'}
+          >
             <input
               type="checkbox"
               checked={syncState.active}
+              disabled={!syncState.active && peerConflictOverlapsIncluded}
               onchange={(e) => toggleSync(e.currentTarget.checked)}
             />
             <span></span>
@@ -667,7 +692,7 @@
         <div>
           <h1>{group?.name ?? 'All lights'}</h1>
           <p class="sub">
-            {shown.length} {shown.length === 1 ? 'light' : 'lights'}{#if shown.length}{' · '}{onCount} on{/if}
+            {shown.length} {shown.length === 1 ? 'light' : 'lights'}{#if shown.length}{' · '}{onCount} on{/if}{#if peerConflict && shown.some((d) => peerSyncedSet.has(d.id))}{' · '}synced by {peerConflict.hostName}{/if}
           </p>
         </div>
         <div class="actions">
@@ -683,7 +708,10 @@
           {/if}
           <button class="ghost icon-btn" title="Add light by IP" onclick={() => (addingLight = true)}><Icon name="plus" /></button>
           <button class="ghost icon-btn" class:spin={scanning} title="Search for lights" onclick={rescan}><Icon name="refresh" /></button>
-          <button onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))} disabled={!shown.length}>
+          <button
+            onclick={() => run((a) => a.apply(target, { type: 'power', value: onCount === 0 }))}
+            disabled={!controllableShown.length}
+          >
             <Icon name="power" size={14} /> {onCount ? 'All off' : 'All on'}
           </button>
         </div>
@@ -700,7 +728,13 @@
       {/if}
 
       {#if group ? shown.length > 0 : shown.length > 1}
-        <MasterControlBar {target} devices={shown} groupName={group?.name} />
+        <MasterControlBar
+          {target}
+          devices={shown}
+          groupName={group?.name}
+          {peerSyncedIds}
+          peerSyncHost={peerConflict?.hostName ?? null}
+        />
       {/if}
 
       <section class="grid">
@@ -708,7 +742,8 @@
           <DeviceCard
             device={d}
             syncing={Boolean(syncState?.active && syncState.activeDevices.includes(d.id))}
-            onOpenSync={() => (view = 'sync')}
+            peerSyncHost={peerSyncedSet.has(d.id) ? (peerConflict?.hostName ?? null) : null}
+            onOpenSync={syncState?.supported ? () => (view = 'sync') : undefined}
             onForget={forgetDevice}
           />
         {:else}
