@@ -72,11 +72,12 @@ grooviectl brightness all 80
 grooviectl group create Desk "Light Bars"
 grooviectl scene save Evening
 grooviectl scene apply Evening
+grooviectl sync toggle                    # start/stop Screen Sync in the desktop app
 grooviectl add-ip 192.168.1.50            # add a light directly if multicast is blocked
 grooviectl config                         # print active groovie.json path (--json for contents)
 ```
 
-Targets accept a light's nickname, IP, or device ID, a group name, or `all`. Run `grooviectl --help` for full usage.
+Targets accept a light's nickname, IP, or device ID, a group name, or `all`. `grooviectl` coordinates automatically with the running desktop tray app over local loopback (and sends cached commands immediately without waiting for LAN discovery when the app is closed). Run `grooviectl --help` for full usage.
 
 ## Configuration
 

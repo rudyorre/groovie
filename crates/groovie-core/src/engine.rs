@@ -281,6 +281,60 @@ impl Groovie {
         Ok(())
     }
 
+    /// Probe `ip` directly and return as soon as the device replies (bounded by `timeout`).
+    pub async fn add_device_by_ip_and_wait(
+        &self,
+        ip: Ipv4Addr,
+        timeout: Duration,
+    ) -> Result<Option<Device>> {
+        let mut rx = self.subscribe();
+        self.add_device_by_ip(ip).await?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(d) = self.devices().await.into_iter().find(|d| d.ip == ip && d.online) {
+                if d.state.is_some() {
+                    return Ok(Some(d));
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(self.devices().await.into_iter().find(|d| d.ip == ip && d.online));
+            }
+            match tokio::time::timeout(deadline - now, rx.recv()).await {
+                Ok(Ok(Event::DeviceUpdated { device })) if device.ip == ip && device.state.is_some() => {
+                    return Ok(Some(device));
+                }
+                Ok(_) => continue,
+                Err(_) => return Ok(self.devices().await.into_iter().find(|d| d.ip == ip && d.online)),
+            }
+        }
+    }
+
+    /// Wait until every device in `ids` has reported a `DeviceState` (or `timeout` elapses).
+    pub async fn wait_for_devices_ready(&self, ids: &[String], timeout: Duration) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut rx = self.subscribe();
+        let ready = || async {
+            let devs = self.inner.devices.read().await;
+            ids.iter().all(|id| devs.get(id).and_then(|e| e.device.state).is_some())
+        };
+        if ready().await {
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline || ready().await {
+                return;
+            }
+            if tokio::time::timeout(deadline - now, rx.recv()).await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub async fn devices(&self) -> Vec<Device> {
         let mut v: Vec<Device> =
             self.inner.devices.read().await.values().map(|e| e.device.clone()).collect();
@@ -1940,4 +1994,93 @@ fn describe_state(s: &DeviceState) -> String {
 fn new_id(prefix: &str) -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("{prefix}{:x}", nanos & 0xffff_ffff_ffff)
+}
+
+/// Generate a store identifier (e.g. `g...` for groups or `s...` for scenes).
+pub fn new_store_id(prefix: &str) -> String {
+    new_id(prefix)
+}
+
+/// Fire-and-forget UDP command path using cached `known_devices` IPs on an
+/// ephemeral source port (`0.0.0.0:0`). Returns `Ok(false)` when `action`
+/// requires live device state (`Action::Toggle`) or when `target` is missing
+/// from `store.data.known_devices`.
+pub async fn send_ephemeral_action(
+    store: &Store,
+    target: &Target,
+    action: Action,
+    command_port: u16,
+) -> Result<bool> {
+    let cmd = match action {
+        Action::Power(on) => Command::Turn(on),
+        Action::Brightness(b) => Command::Brightness(b.clamp(1, 100)),
+        Action::Color(c) => Command::Color(c),
+        Action::Kelvin(k) => Command::ColorTemp(k.clamp(KELVIN_MIN, KELVIN_MAX)),
+        Action::Toggle => return Ok(false),
+    };
+    let Some(targets) = store.data.resolve_known_ips(target) else {
+        return Ok(false);
+    };
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let bytes = cmd.to_bytes();
+    for (_, ip) in targets {
+        sock.send_to(&bytes, SocketAddr::from((ip, command_port))).await?;
+    }
+    Ok(true)
+}
+
+/// Apply a saved scene directly from cached `known_devices` IPs on an ephemeral
+/// UDP socket (`0.0.0.0:0`). Returns `Ok(false)` if any device in the scene is
+/// not yet recorded in `store.data.known_devices`.
+pub async fn send_ephemeral_scene(
+    store: &Store,
+    scene_query: &str,
+    command_port: u16,
+) -> Result<bool> {
+    let scene = store
+        .data
+        .scenes
+        .iter()
+        .find(|s| s.id == scene_query || s.name.eq_ignore_ascii_case(scene_query))
+        .ok_or_else(|| Error::UnknownScene(scene_query.into()))?;
+
+    if store.data.known_devices.is_empty() {
+        return Ok(false);
+    }
+    let ip_by_id: HashMap<&str, Ipv4Addr> = store
+        .data
+        .known_devices
+        .iter()
+        .map(|d| (d.id.as_str(), d.ip))
+        .collect();
+    if scene.entries.iter().any(|e| !ip_by_id.contains_key(e.device.as_str())) {
+        return Ok(false);
+    }
+
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let gap = Duration::from_millis(40);
+    for e in &scene.entries {
+        let Some(&ip) = ip_by_id.get(e.device.as_str()) else { continue };
+        let addr = SocketAddr::from((ip, command_port));
+        sock.send_to(&Command::Turn(e.on).to_bytes(), addr).await?;
+        if !e.on {
+            continue;
+        }
+        if let Some(b) = e.brightness {
+            tokio::time::sleep(gap).await;
+            sock.send_to(&Command::Brightness(b.clamp(1, 100)).to_bytes(), addr).await?;
+        }
+        if let Some(k) = e.kelvin {
+            tokio::time::sleep(gap).await;
+            sock.send_to(
+                &Command::ColorTemp(k.clamp(KELVIN_MIN, KELVIN_MAX)).to_bytes(),
+                addr,
+            )
+            .await?;
+        } else if let Some(c) = e.color {
+            tokio::time::sleep(gap).await;
+            sock.send_to(&Command::Color(c).to_bytes(), addr).await?;
+        }
+    }
+    Ok(true)
 }
