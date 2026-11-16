@@ -242,11 +242,49 @@ pub struct StatusInfo {
     pub color_tem_in_kelvin: u16,
 }
 
-/// Any message a device may send to us.
+/// Peer-to-peer LAN lease announcement between Groovie instances on UDP port `4002`
+/// so multiple computers running Groovie detect active Screen Sync and hand off cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPeerLease {
+    pub instance_id: String,
+    pub host_name: String,
+    pub active: bool,
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+    #[serde(default)]
+    pub lease_epoch_ms: u64,
+}
+
+impl SyncPeerLease {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "msg": { "cmd": "groovieSync", "data": self } }))
+            .expect("peer lease serialises")
+    }
+}
+
+/// Lightweight startup/rescan probe asking any peer Groovie instance currently
+/// streaming Screen Sync on the LAN to announce its active lease immediately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPeerQuery {
+    pub instance_id: String,
+}
+
+impl SyncPeerQuery {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "msg": { "cmd": "groovieSyncQuery", "data": self } }))
+            .expect("peer query serialises")
+    }
+}
+
+/// Any message a device (or peer Groovie instance) may send to us.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
     Scan(ScanInfo),
     Status(StatusInfo),
+    PeerSync(SyncPeerLease),
+    PeerSyncQuery(SyncPeerQuery),
     Other { cmd: String, data: Value },
 }
 
@@ -267,6 +305,8 @@ pub fn parse_incoming(bytes: &[u8]) -> Result<Incoming, serde_json::Error> {
     Ok(match env.msg.cmd.as_str() {
         "scan" => Incoming::Scan(serde_json::from_value(env.msg.data)?),
         "devStatus" => Incoming::Status(serde_json::from_value(env.msg.data)?),
+        "groovieSync" => Incoming::PeerSync(serde_json::from_value(env.msg.data)?),
+        "groovieSyncQuery" => Incoming::PeerSyncQuery(serde_json::from_value(env.msg.data)?),
         _ => Incoming::Other { cmd: env.msg.cmd, data: env.msg.data },
     })
 }
@@ -446,5 +486,20 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_peer_sync_lease_and_query() {
+        let lease = SyncPeerLease {
+            instance_id: "inst-1".into(),
+            host_name: "MacBook-Pro".into(),
+            active: true,
+            device_ids: vec!["AA:BB".into()],
+            lease_epoch_ms: 1_700_000_000_123,
+        };
+        assert_eq!(parse_incoming(&lease.to_bytes()).unwrap(), Incoming::PeerSync(lease));
+
+        let q = SyncPeerQuery { instance_id: "inst-2".into() };
+        assert_eq!(parse_incoming(&q.to_bytes()).unwrap(), Incoming::PeerSyncQuery(q));
     }
 }

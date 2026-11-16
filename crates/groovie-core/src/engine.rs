@@ -9,12 +9,13 @@ use crate::store::{
 };
 use crate::sync::{
     build_identify_razer_colors, device_uses_razer, reconcile_placements, DeviceSyncCommand,
-    SyncConfig, SyncFrame, SyncPlacement, SyncProcessor, SyncStatus,
+    SyncConfig, SyncFrame, SyncPeerConflict, SyncPlacement, SyncProcessor, SyncStatus,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -28,6 +29,9 @@ const RAZER_KEEPALIVE: Duration = Duration::from_millis(450);
 const RAZER_REASSERT: Duration = Duration::from_secs(25);
 const SOLID_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PEER_LEASE_HEARTBEAT: Duration = Duration::from_millis(1500);
+const PEER_LEASE_TTL: Duration = Duration::from_secs(5);
+const KNOWN_PEER_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -47,6 +51,10 @@ pub enum Error {
     NoOnlineSyncDevices,
     #[error("unknown placement '{0}'")]
     UnknownPlacement(String),
+    #[error("Screen Sync is already active on {host_name}")]
+    SyncConflict { host_name: String },
+    #[error("{device} is currently controlled by Screen Sync on {host_name}")]
+    DeviceSyncedByPeer { device: String, host_name: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -69,6 +77,10 @@ pub struct Config {
     pub rescan_interval: Duration,
     /// After a command, wait this long and then confirm the real state.
     pub refresh_delay: Duration,
+    /// Where peer Screen Sync lease announcements and queries go.
+    pub peer_sync_targets: Vec<SocketAddr>,
+    /// Human-readable machine name advertised in peer Screen Sync leases (`None` auto-detects OS hostname).
+    pub host_name: Option<String>,
 }
 
 impl Default for Config {
@@ -82,6 +94,11 @@ impl Default for Config {
             poll_interval: Duration::from_secs(15),
             rescan_interval: Duration::from_secs(60),
             refresh_delay: Duration::from_millis(1800),
+            peer_sync_targets: vec![
+                SocketAddr::V4(SocketAddrV4::new(MULTICAST_ADDR, LISTEN_PORT)),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, LISTEN_PORT)),
+            ],
+            host_name: None,
         }
     }
 }
@@ -118,11 +135,23 @@ struct IdentifyPulse {
     restore_after: Option<DeviceState>,
 }
 
+#[derive(Clone)]
+struct PeerLeaseEntry {
+    host_name: String,
+    device_ids: HashSet<String>,
+    lease_epoch_ms: u64,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 struct SyncRuntime {
     active: bool,
+    lease_epoch_ms: u64,
+    last_lease_broadcast_at: Option<Instant>,
     sessions: HashMap<String, SyncDeviceSession>,
     detached: HashSet<String>,
+    peer_leases: HashMap<String, PeerLeaseEntry>,
+    known_peers: HashMap<SocketAddr, Instant>,
     frame: Option<SyncFrame>,
     processor: SyncProcessor,
     preview_enabled: bool,
@@ -131,8 +160,74 @@ struct SyncRuntime {
     identify: Option<IdentifyPulse>,
 }
 
+impl SyncRuntime {
+    fn prune_expired_peers(&mut self, now: Instant) -> bool {
+        self.known_peers.retain(|_, seen| now.saturating_duration_since(*seen) <= KNOWN_PEER_TTL);
+        let before = self.peer_leases.len();
+        self.peer_leases.retain(|_, e| e.expires_at > now && !e.device_ids.is_empty());
+        self.peer_leases.len() != before
+    }
+
+    fn peer_host_for_device(&self, device_id: &str, now: Instant) -> Option<String> {
+        if self.sessions.contains_key(device_id) {
+            return None;
+        }
+        self.peer_leases
+            .values()
+            .filter(|e| e.expires_at > now && e.device_ids.contains(device_id))
+            .max_by_key(|e| e.lease_epoch_ms)
+            .map(|e| e.host_name.clone())
+    }
+
+    fn peer_synced_device_ids(&self, now: Instant) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for e in self.peer_leases.values().filter(|e| e.expires_at > now) {
+            for id in &e.device_ids {
+                if !self.sessions.contains_key(id) {
+                    out.insert(id.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn current_conflict(&self, now: Instant) -> Option<SyncPeerConflict> {
+        let mut active_peers: Vec<&PeerLeaseEntry> = self
+            .peer_leases
+            .values()
+            .filter(|e| {
+                e.expires_at > now && e.device_ids.iter().any(|id| !self.sessions.contains_key(id))
+            })
+            .collect();
+        if active_peers.is_empty() {
+            return None;
+        }
+        active_peers.sort_by(|a, b| {
+            b.lease_epoch_ms.cmp(&a.lease_epoch_ms).then_with(|| a.host_name.cmp(&b.host_name))
+        });
+        let mut hosts: Vec<String> = Vec::new();
+        let mut dev_set: HashSet<String> = HashSet::new();
+        for p in active_peers {
+            if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&p.host_name)) {
+                hosts.push(p.host_name.clone());
+            }
+            for id in &p.device_ids {
+                if !self.sessions.contains_key(id) {
+                    dev_set.insert(id.clone());
+                }
+            }
+        }
+        let mut device_ids: Vec<String> = dev_set.into_iter().collect();
+        device_ids.sort();
+        Some(SyncPeerConflict { host_name: hosts.join(", "), device_ids })
+    }
+}
+
 struct Inner {
+    instance_id: String,
+    host_name: String,
     cfg: Config,
+    peer_sync_targets: Mutex<Vec<SocketAddr>>,
     sock: UdpSocket,
     scan_lock: Mutex<()>,
     devices: RwLock<HashMap<String, Entry>>,
@@ -142,6 +237,7 @@ struct Inner {
     last_refresh: Mutex<Option<Instant>>,
     sync_rt: Mutex<SyncRuntime>,
     sync_notify: Notify,
+    peer_notify: Notify,
     events: broadcast::Sender<Event>,
 }
 
@@ -199,10 +295,20 @@ impl Groovie {
             );
         }
 
+        let host_name = cfg
+            .host_name
+            .as_deref()
+            .map(sanitize_host_name)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(detect_host_name);
+        let peer_targets = cfg.peer_sync_targets.clone();
         let (events, _) = broadcast::channel(256);
         let (poll_tx, _) = watch::channel(cfg.poll_interval);
         let inner = Arc::new(Inner {
+            instance_id: new_id("inst_"),
+            host_name,
             cfg,
+            peer_sync_targets: Mutex::new(peer_targets),
             sock,
             scan_lock: Mutex::new(()),
             devices: RwLock::new(devices),
@@ -212,6 +318,7 @@ impl Groovie {
             last_refresh: Mutex::new(None),
             sync_rt: Mutex::new(SyncRuntime::default()),
             sync_notify: Notify::new(),
+            peer_notify: Notify::new(),
             events,
         });
 
@@ -220,12 +327,27 @@ impl Groovie {
             tokio::spawn(poll_loop(inner.clone())),
             tokio::spawn(rescan_loop(inner.clone())),
             tokio::spawn(sync_loop(inner.clone())),
+            tokio::spawn(peer_lease_loop(inner.clone())),
         ];
 
         let me = Self { inner, _tasks: Arc::new(TaskGuard(tasks)) };
         me.discover().await?;
         me.refresh_all().await;
         Ok(me)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.sock.local_addr()
+    }
+
+    pub async fn add_peer_sync_target(&self, addr: SocketAddr) {
+        {
+            let mut targets = self.inner.peer_sync_targets.lock().await;
+            if !targets.contains(&addr) {
+                targets.push(addr);
+            }
+        }
+        self.inner.send_peer_query().await;
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -387,7 +509,11 @@ impl Groovie {
 
     /// Send an action to a device, a group, or everything.
     pub async fn apply(&self, target: &Target, action: Action) -> Result<()> {
-        let ids = self.resolve_ids(target).await?;
+        let resolved_ids = self.resolve_ids(target).await?;
+        let ids = self.inner.filter_peer_synced_ids(resolved_ids).await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
         let action = match action {
             Action::Toggle => {
                 let devices = self.inner.devices.read().await;
@@ -637,6 +763,16 @@ impl Groovie {
             .into_iter()
             .find(|s| s.id == id || s.name.eq_ignore_ascii_case(id))
             .ok_or_else(|| Error::UnknownScene(id.into()))?;
+        let candidate_ids: Vec<String> = {
+            let devs = self.inner.devices.read().await;
+            scene.entries.iter().filter(|e| devs.contains_key(&e.device)).map(|e| e.device.clone()).collect()
+        };
+        let allowed_ids: HashSet<String> = self
+            .inner
+            .filter_peer_synced_ids(candidate_ids)
+            .await?
+            .into_iter()
+            .collect();
         // Exit Screen Sync without restoring pre-sync snapshots so the scene's own look takes over.
         self.inner.abort_sync_without_restore("scene applied").await;
         self.inner
@@ -644,7 +780,7 @@ impl Groovie {
             .await;
         let gap = Duration::from_millis(40);
         for e in &scene.entries {
-            if !self.inner.devices.read().await.contains_key(&e.device) {
+            if !allowed_ids.contains(&e.device) {
                 continue;
             }
             self.inner.send_action(&e.device, Action::Power(e.on)).await?;
@@ -677,7 +813,11 @@ impl Groovie {
     }
 
     pub async fn start_sync(&self) -> Result<SyncStatus> {
-        self.inner.start_sync().await
+        self.inner.start_sync(false).await
+    }
+
+    pub async fn start_sync_with_options(&self, force: bool) -> Result<SyncStatus> {
+        self.inner.start_sync(force).await
     }
 
     pub async fn stop_sync(&self, reason: Option<&str>) -> SyncStatus {
@@ -943,39 +1083,165 @@ impl Inner {
     }
 
     async fn send_scan(&self) -> Result<()> {
-        let _guard = self.scan_lock.lock().await;
-        let json = Command::Scan.to_json().to_string();
-        let bytes = json.as_bytes();
-        for target in &self.cfg.scan_targets {
-            let multicast = matches!(target, SocketAddr::V4(v4) if v4.ip().is_multicast());
-            if !multicast {
-                self.sock.send_to(bytes, target).await?;
-                self.log("tx", target.to_string(), None, json.clone(), false).await;
-                continue;
-            }
-            // Send the multicast scan out of every interface so multi-NIC
-            // machines (VPN, ethernet + wifi, ...) still find devices.
-            let ifaces = local_ipv4_interfaces();
-            if ifaces.is_empty() {
-                self.sock.send_to(bytes, target).await?;
-            }
-            let sref = socket2::SockRef::from(&self.sock);
-            for ip in &ifaces {
-                if let Err(e) = sref.set_multicast_if_v4(ip) {
-                    debug!(%ip, error = %e, "cannot use interface for multicast");
+        {
+            let _guard = self.scan_lock.lock().await;
+            let json = Command::Scan.to_json().to_string();
+            let bytes = json.as_bytes();
+            for target in &self.cfg.scan_targets {
+                let multicast = matches!(target, SocketAddr::V4(v4) if v4.ip().is_multicast());
+                if !multicast {
+                    self.sock.send_to(bytes, target).await?;
+                    self.log("tx", target.to_string(), None, json.clone(), false).await;
                     continue;
                 }
-                if let Err(e) = self.sock.send_to(bytes, target).await {
-                    debug!(%ip, error = %e, "multicast send failed");
+                // Send the multicast scan out of every interface so multi-NIC
+                // machines (VPN, ethernet + wifi, ...) still find devices.
+                let ifaces = local_ipv4_interfaces();
+                if ifaces.is_empty() {
+                    self.sock.send_to(bytes, target).await?;
                 }
+                let sref = socket2::SockRef::from(&self.sock);
+                for ip in &ifaces {
+                    if let Err(e) = sref.set_multicast_if_v4(ip) {
+                        debug!(%ip, error = %e, "cannot use interface for multicast");
+                        continue;
+                    }
+                    if let Err(e) = self.sock.send_to(bytes, target).await {
+                        debug!(%ip, error = %e, "multicast send failed");
+                    }
+                }
+                self.log("tx", target.to_string(), None, json.clone(), false).await;
             }
-            self.log("tx", target.to_string(), None, json.clone(), false).await;
         }
+        self.send_peer_query().await;
         Ok(())
     }
 
+    async fn send_peer_query(&self) {
+        let pkt = SyncPeerQuery { instance_id: self.instance_id.clone() }.to_bytes();
+        self.broadcast_peer_datagram(&pkt).await;
+    }
+
+    fn make_peer_lease_locked(&self, rt: &SyncRuntime) -> SyncPeerLease {
+        let mut device_ids: Vec<String> = if rt.active {
+            rt.sessions.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        device_ids.sort();
+        SyncPeerLease {
+            instance_id: self.instance_id.clone(),
+            host_name: self.host_name.clone(),
+            active: rt.active && !device_ids.is_empty(),
+            device_ids,
+            lease_epoch_ms: rt.lease_epoch_ms,
+        }
+    }
+
+    async fn broadcast_peer_datagram(&self, bytes: &[u8]) {
+        let local_addr = self.sock.local_addr().ok();
+        let local_is_loopback = local_addr
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or_else(|| self.cfg.listen.ip().is_loopback());
+
+        let mut targets = self.peer_sync_targets.lock().await.clone();
+        {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            for peer in rt.known_peers.keys() {
+                if !targets.contains(peer) {
+                    targets.push(*peer);
+                }
+            }
+        }
+
+        let _guard = self.scan_lock.lock().await;
+        for target in targets {
+            if Some(target) == local_addr {
+                continue;
+            }
+            if local_is_loopback && !target.ip().is_loopback() {
+                continue;
+            }
+            match target {
+                SocketAddr::V4(v4) if v4.ip().is_multicast() => {
+                    let ifaces = local_ipv4_interfaces();
+                    if ifaces.is_empty() {
+                        let _ = self.sock.send_to(bytes, target).await;
+                    } else {
+                        let sref = socket2::SockRef::from(&self.sock);
+                        for ip in &ifaces {
+                            if sref.set_multicast_if_v4(ip).is_ok() {
+                                let _ = self.sock.send_to(bytes, target).await;
+                            }
+                        }
+                    }
+                }
+                SocketAddr::V4(v4) if *v4.ip() == Ipv4Addr::BROADCAST => {
+                    let _ = self.sock.send_to(bytes, target).await;
+                    for bcast in local_ipv4_broadcasts(v4.port()) {
+                        let _ = self.sock.send_to(bytes, bcast).await;
+                    }
+                }
+                _ => {
+                    let _ = self.sock.send_to(bytes, target).await;
+                }
+            }
+        }
+    }
+
+    async fn filter_peer_synced_ids(&self, ids: Vec<String>) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let (allowed, first_blocked) = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            let mut allowed = Vec::with_capacity(ids.len());
+            let mut first_blocked: Option<(String, String)> = None;
+            for id in ids {
+                if let Some(host) = rt.peer_host_for_device(&id, now) {
+                    if first_blocked.is_none() {
+                        first_blocked = Some((id, host));
+                    }
+                } else {
+                    allowed.push(id);
+                }
+            }
+            (allowed, first_blocked)
+        };
+        if allowed.is_empty() {
+            if let Some((blocked_id, host_name)) = first_blocked {
+                let dev_name = self
+                    .devices
+                    .read()
+                    .await
+                    .get(&blocked_id)
+                    .map(|e| e.device.name.clone())
+                    .unwrap_or(blocked_id);
+                return Err(Error::DeviceSyncedByPeer { device: dev_name, host_name });
+            }
+        }
+        Ok(allowed)
+    }
+
     async fn refresh_all(&self) {
-        let mut ips: Vec<Ipv4Addr> = self.devices.read().await.values().map(|e| e.device.ip).collect();
+        let synced_ids: HashSet<String> = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            rt.peer_synced_device_ids(now)
+        };
+        let mut ips: Vec<Ipv4Addr> = self
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| !synced_ids.contains(&e.device.id))
+            .map(|e| e.device.ip)
+            .collect();
         ips.sort();
         ips.dedup();
         self.poll_ips(ips).await;
@@ -985,8 +1251,11 @@ impl Inner {
     /// post-command `refresh_delay` check is still pending or that are actively streaming Screen Sync.
     async fn refresh_idle(&self) {
         let synced_ids: HashSet<String> = {
-            let rt = self.sync_rt.lock().await;
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
             let mut set: HashSet<String> = rt.sessions.keys().cloned().collect();
+            set.extend(rt.peer_synced_device_ids(now));
             if let Some(id_pulse) = &rt.identify {
                 set.insert(id_pulse.device_id.clone());
             }
@@ -1114,12 +1383,18 @@ impl Inner {
 
     async fn current_sync_status(&self) -> SyncStatus {
         let cfg = self.reconciled_sync_config().await;
-        let (active, mut active_devices) = {
-            let rt = self.sync_rt.lock().await;
-            (rt.active, rt.sessions.keys().cloned().collect::<Vec<_>>())
+        let (active, mut active_devices, conflict) = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            (
+                rt.active,
+                rt.sessions.keys().cloned().collect::<Vec<_>>(),
+                rt.current_conflict(now),
+            )
         };
         active_devices.sort();
-        SyncStatus { active, active_devices, config: cfg }
+        SyncStatus { active, active_devices, config: cfg, conflict }
     }
 
     async fn update_sync_config(&self, config: SyncConfig) -> Result<SyncStatus> {
@@ -1137,11 +1412,13 @@ impl Inner {
             dev_pairs.iter().map(|(id, sku)| (id.as_str(), sku.as_str())),
         );
 
-        {
+        let prev_brightness = {
             let mut store = self.store.lock().await;
+            let prev = store.data.sync.brightness;
             store.data.sync = sanitized.clone();
             store.save()?;
-        }
+            prev
+        };
         self.emit(Event::ConfigChanged);
 
         // If Screen Sync is actively streaming, reconcile newly excluded/included or mode-changed lights live.
@@ -1152,6 +1429,36 @@ impl Inner {
         };
         if is_active {
             self.reconcile_live_sync_sessions(&sanitized).await;
+            if sanitized.brightness != prev_brightness {
+                let targets: Vec<(String, Ipv4Addr)> = {
+                    let rt = self.sync_rt.lock().await;
+                    rt.sessions.iter().map(|(id, s)| (id.clone(), s.ip)).collect()
+                };
+                for (id, ip) in targets {
+                    let addr = SocketAddr::from((ip, self.cfg.command_port));
+                    let _ = self.send(Command::Brightness(sanitized.brightness), addr).await;
+                    let updated = {
+                        let mut devices = self.devices.write().await;
+                        devices.get_mut(&id).map(|e| {
+                            let mut s = e.device.state.unwrap_or_default();
+                            s.brightness = sanitized.brightness;
+                            e.device.state = Some(s);
+                            e.last_command = Some(Instant::now());
+                            e.generation += 1;
+                            e.device.clone()
+                        })
+                    };
+                    if let Some(d) = updated {
+                        self.emit(Event::DeviceUpdated { device: d });
+                    }
+                }
+            }
+            let lease = {
+                let mut rt = self.sync_rt.lock().await;
+                rt.last_lease_broadcast_at = Some(Instant::now());
+                self.make_peer_lease_locked(&rt)
+            };
+            self.broadcast_peer_datagram(&lease.to_bytes()).await;
         }
 
         let status = self.current_sync_status().await;
@@ -1160,7 +1467,7 @@ impl Inner {
         Ok(status)
     }
 
-    async fn start_sync(&self) -> Result<SyncStatus> {
+    async fn start_sync(&self, force: bool) -> Result<SyncStatus> {
         let cfg = self.reconciled_sync_config().await;
         let enabled_ids: HashSet<String> = cfg
             .placements
@@ -1171,6 +1478,28 @@ impl Inner {
         if enabled_ids.is_empty() {
             return Err(Error::NoSyncDevices);
         }
+
+        let (max_peer_epoch, takeover_host) = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            let mut conflict_host: Option<String> = None;
+            let mut sorted_enabled: Vec<&String> = enabled_ids.iter().collect();
+            sorted_enabled.sort();
+            for id in sorted_enabled {
+                if let Some(h) = rt.peer_host_for_device(id, now) {
+                    conflict_host = Some(h);
+                    break;
+                }
+            }
+            if !force {
+                if let Some(host_name) = conflict_host {
+                    return Err(Error::SyncConflict { host_name });
+                }
+            }
+            let max_ep = rt.peer_leases.values().map(|e| e.lease_epoch_ms).max().unwrap_or(0);
+            (max_ep, conflict_host)
+        };
 
         let candidates: Vec<(Device, DeviceState, bool)> = {
             let devices = self.devices.read().await;
@@ -1203,32 +1532,35 @@ impl Inner {
                 woke_any = true;
                 let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
                 let _ = self.send(Command::Turn(true), addr).await;
-                let updated = {
-                    let mut devices = self.devices.write().await;
-                    devices.get_mut(&dev.id).map(|e| {
-                        let mut s = e.device.state.unwrap_or(*snap);
-                        s.on = true;
-                        e.device.state = Some(s);
-                        e.last_command = Some(Instant::now());
-                        e.generation += 1;
-                        e.device.clone()
-                    })
-                };
-                if let Some(d) = updated {
-                    self.emit(Event::DeviceUpdated { device: d });
-                }
             }
         }
         if woke_any {
             tokio::time::sleep(Duration::from_millis(85)).await;
         }
 
+        let target_brightness = cfg.brightness.clamp(1, 100);
         let now = Instant::now();
         let mut new_sessions = HashMap::new();
         for (dev, snap, uses_razer) in &candidates {
+            let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
             if *uses_razer {
-                let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
                 let _ = self.send(Command::RazerEnable(true), addr).await;
+            }
+            let _ = self.send(Command::Brightness(target_brightness), addr).await;
+            let updated = {
+                let mut devices = self.devices.write().await;
+                devices.get_mut(&dev.id).map(|e| {
+                    let mut s = e.device.state.unwrap_or(*snap);
+                    s.on = true;
+                    s.brightness = target_brightness;
+                    e.device.state = Some(s);
+                    e.last_command = Some(Instant::now());
+                    e.generation += 1;
+                    e.device.clone()
+                })
+            };
+            if let Some(d) = updated {
+                self.emit(Event::DeviceUpdated { device: d });
             }
             new_sessions.insert(
                 dev.id.clone(),
@@ -1246,7 +1578,7 @@ impl Inner {
         }
 
         let count = new_sessions.len();
-        {
+        let lease = {
             let mut rt = self.sync_rt.lock().await;
             // Preserve pre-sync snapshots for any device that was already in an active session.
             for (id, prev) in std::mem::take(&mut rt.sessions) {
@@ -1254,20 +1586,29 @@ impl Inner {
                     next.snapshot = prev.snapshot;
                 }
             }
+            for e in rt.peer_leases.values_mut() {
+                e.device_ids.retain(|id| !new_sessions.contains_key(id));
+            }
+            rt.peer_leases.retain(|_, e| !e.device_ids.is_empty());
             rt.active = true;
+            rt.lease_epoch_ms = epoch_ms_now().max(max_peer_epoch.saturating_add(1));
+            rt.last_lease_broadcast_at = Some(now);
             rt.detached.clear();
             rt.processor.reset();
             rt.sessions = new_sessions;
-        }
+            self.make_peer_lease_locked(&rt)
+        };
 
-        self.log(
-            "action",
-            "",
-            None,
-            format!("Screen Sync started ({count} {})", if count == 1 { "light" } else { "lights" }),
-            false,
-        )
-        .await;
+        self.broadcast_peer_datagram(&lease.to_bytes()).await;
+
+        let log_msg = match takeover_host {
+            Some(h) if force => format!(
+                "Screen Sync taken over from {h} ({count} {})",
+                if count == 1 { "light" } else { "lights" }
+            ),
+            _ => format!("Screen Sync started ({count} {})", if count == 1 { "light" } else { "lights" }),
+        };
+        self.log("action", "", None, log_msg, false).await;
 
         let status = self.current_sync_status().await;
         self.emit(Event::SyncChanged { status: status.clone() });
@@ -1276,17 +1617,22 @@ impl Inner {
     }
 
     async fn stop_sync(&self, reason: Option<&str>) -> SyncStatus {
-        let to_restore: Vec<(String, SyncDeviceSession)> = {
+        let (to_restore, lease): (Vec<(String, SyncDeviceSession)>, SyncPeerLease) = {
             let mut rt = self.sync_rt.lock().await;
             if !rt.active && rt.sessions.is_empty() {
                 drop(rt);
                 return self.current_sync_status().await;
             }
             rt.active = false;
+            rt.last_lease_broadcast_at = None;
             rt.detached.clear();
             rt.processor.reset();
-            rt.sessions.drain().collect()
+            let drained = rt.sessions.drain().collect();
+            let lease = self.make_peer_lease_locked(&rt);
+            (drained, lease)
         };
+
+        self.broadcast_peer_datagram(&lease.to_bytes()).await;
 
         let status = self.current_sync_status().await;
         let msg = match reason {
@@ -1303,16 +1649,20 @@ impl Inner {
     }
 
     async fn abort_sync_without_restore(&self, reason: &str) {
-        let to_disable: Vec<(Ipv4Addr, bool)> = {
+        let (to_disable, lease): (Vec<(Ipv4Addr, bool)>, SyncPeerLease) = {
             let mut rt = self.sync_rt.lock().await;
             if !rt.active && rt.sessions.is_empty() {
                 return;
             }
             rt.active = false;
+            rt.last_lease_broadcast_at = None;
             rt.detached.clear();
             rt.processor.reset();
-            rt.sessions.drain().map(|(_, s)| (s.ip, s.uses_razer)).collect()
+            let drained = rt.sessions.drain().map(|(_, s)| (s.ip, s.uses_razer)).collect();
+            let lease = self.make_peer_lease_locked(&rt);
+            (drained, lease)
         };
+        self.broadcast_peer_datagram(&lease.to_bytes()).await;
         self.log("action", "", None, format!("Screen Sync stopped ({reason})"), false).await;
         for (ip, uses_razer) in to_disable {
             if uses_razer {
@@ -1327,7 +1677,7 @@ impl Inner {
         let mut detached_razer = Vec::new();
         let mut stopped_all = false;
         let mut any_removed = false;
-        {
+        let lease = {
             let mut rt = self.sync_rt.lock().await;
             if !rt.active {
                 return;
@@ -1343,14 +1693,17 @@ impl Inner {
             }
             if any_removed && rt.sessions.is_empty() {
                 rt.active = false;
+                rt.last_lease_broadcast_at = None;
                 rt.detached.clear();
                 rt.processor.reset();
                 stopped_all = true;
             }
-        }
-        if !any_removed {
+            any_removed.then(|| self.make_peer_lease_locked(&rt))
+        };
+        let Some(lease) = lease else {
             return;
-        }
+        };
+        self.broadcast_peer_datagram(&lease.to_bytes()).await;
         for ip in detached_razer {
             let _ = self.send(Command::RazerEnable(false), SocketAddr::from((ip, self.cfg.command_port))).await;
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1386,10 +1739,13 @@ impl Inner {
         let mut auto_stopped = false;
 
         {
+            let now = Instant::now();
             let mut rt = self.sync_rt.lock().await;
             if !rt.active {
                 return;
             }
+            rt.prune_expired_peers(now);
+            let peer_ids = rt.peer_synced_device_ids(now);
             // Remove devices that were excluded in config.
             let existing_ids: Vec<String> = rt.sessions.keys().cloned().collect();
             for id in existing_ids {
@@ -1414,9 +1770,9 @@ impl Inner {
                     }
                 }
             }
-            // Attach newly un-excluded online devices.
+            // Attach newly un-excluded online devices (unless synced by a peer).
             for (id, placements) in &enabled_by_dev {
-                if !rt.sessions.contains_key(id) && !rt.detached.contains(id) {
+                if !rt.sessions.contains_key(id) && !rt.detached.contains(id) && !peer_ids.contains(id) {
                     if let Some(dev) = online_devs.get(id) {
                         let snap = snapshot_for_device(dev);
                         let uses_razer = device_uses_razer(&dev.sku, placements);
@@ -1426,6 +1782,7 @@ impl Inner {
             }
             if rt.sessions.is_empty() && to_wake.is_empty() {
                 rt.active = false;
+                rt.last_lease_broadcast_at = None;
                 rt.processor.reset();
                 auto_stopped = true;
             }
@@ -1437,6 +1794,7 @@ impl Inner {
         for (ip, en) in razer_toggles {
             let _ = self.send(Command::RazerEnable(en), SocketAddr::from((ip, self.cfg.command_port))).await;
         }
+        let target_brightness = cfg.brightness.clamp(1, 100);
         for (dev, snap, uses_razer) in to_wake {
             let addr = SocketAddr::from((dev.ip, self.cfg.command_port));
             if !snap.on {
@@ -1446,6 +1804,7 @@ impl Inner {
             if uses_razer {
                 let _ = self.send(Command::RazerEnable(true), addr).await;
             }
+            let _ = self.send(Command::Brightness(target_brightness), addr).await;
             let mut rt = self.sync_rt.lock().await;
             if rt.active {
                 rt.sessions.insert(
@@ -1533,7 +1892,12 @@ impl Inner {
         let uses_razer = device_uses_razer(&dev.sku, &dev_placements);
 
         let already_synced = {
-            let rt = self.sync_rt.lock().await;
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            if let Some(host_name) = rt.peer_host_for_device(&dev.id, now) {
+                return Err(Error::DeviceSyncedByPeer { device: dev.name, host_name });
+            }
             rt.active && rt.sessions.contains_key(&dev.id)
         };
 
@@ -1578,10 +1942,22 @@ impl Inner {
         let mut raw_sends: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         let mut finished_identify: Option<IdentifyPulse> = None;
         let mut preview_to_emit = None;
+        let mut lease_to_broadcast: Option<SyncPeerLease> = None;
 
         {
             let mut rt = self.sync_rt.lock().await;
             let identify_dev_id = rt.identify.as_ref().map(|p| p.device_id.clone());
+
+            if rt.active && !rt.sessions.is_empty() {
+                let heartbeat_due = rt
+                    .last_lease_broadcast_at
+                    .map(|t| now.saturating_duration_since(t) >= PEER_LEASE_HEARTBEAT)
+                    .unwrap_or(true);
+                if heartbeat_due {
+                    rt.last_lease_broadcast_at = Some(now);
+                    lease_to_broadcast = Some(self.make_peer_lease_locked(&rt));
+                }
+            }
 
             if let Some(pulse) = &rt.identify {
                 let elapsed = now.saturating_duration_since(pulse.started_at);
@@ -1684,6 +2060,10 @@ impl Inner {
             let _ = self.sock.send_to(&payload, addr).await;
         }
 
+        if let Some(lease) = lease_to_broadcast {
+            self.broadcast_peer_datagram(&lease.to_bytes()).await;
+        }
+
         if let Some(preview) = preview_to_emit {
             self.emit(Event::SyncPreview { preview });
         }
@@ -1696,11 +2076,13 @@ impl Inner {
         }
     }
 
-    async fn handle(&self, bytes: &[u8], src: SocketAddr) {
+    async fn handle(self: &Arc<Self>, bytes: &[u8], src: SocketAddr) {
         let raw = String::from_utf8_lossy(bytes).trim().to_string();
         match parse_incoming(bytes) {
             Ok(Incoming::Scan(info)) => self.on_scan(info, src, raw).await,
             Ok(Incoming::Status(st)) => self.on_status(st, src, raw).await,
+            Ok(Incoming::PeerSync(lease)) => self.on_peer_sync(lease, src).await,
+            Ok(Incoming::PeerSyncQuery(q)) => self.on_peer_query(q, src).await,
             Ok(Incoming::Other { cmd, .. }) => {
                 debug!(%src, cmd, "ignoring message");
                 let label = self.device_label_for_ip(src.ip()).await;
@@ -1715,6 +2097,165 @@ impl Inner {
                 let label = self.device_label_for_ip(src.ip()).await;
                 self.log("rx", src.to_string(), label, raw, false).await;
             }
+        }
+    }
+
+    async fn on_peer_query(&self, q: SyncPeerQuery, src: SocketAddr) {
+        if q.instance_id == self.instance_id {
+            return;
+        }
+        let reply = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            rt.known_peers.insert(src, now);
+            (rt.active && !rt.sessions.is_empty()).then(|| self.make_peer_lease_locked(&rt))
+        };
+        if let Some(lease) = reply {
+            let _ = self.sock.send_to(&lease.to_bytes(), src).await;
+        }
+    }
+
+    async fn on_peer_sync(self: &Arc<Self>, lease: SyncPeerLease, src: SocketAddr) {
+        if lease.instance_id == self.instance_id {
+            return;
+        }
+        let peer_host = {
+            let h = sanitize_host_name(&lease.host_name);
+            if h.is_empty() { "Another device".to_string() } else { h }
+        };
+
+        let mut handed_off_all = false;
+        let mut yielded_partial = false;
+        let mut our_lease_reply: Option<SyncPeerLease> = None;
+        let (prev_conflict, next_conflict, has_peers, now_idle) = {
+            let now = Instant::now();
+            let mut rt = self.sync_rt.lock().await;
+            rt.prune_expired_peers(now);
+            rt.known_peers.insert(src, now);
+            let prev_conflict = rt.current_conflict(now);
+
+            if lease.active && !lease.device_ids.is_empty() {
+                let overlap: Vec<String> = lease
+                    .device_ids
+                    .iter()
+                    .filter(|id| rt.sessions.contains_key(*id))
+                    .cloned()
+                    .collect();
+                if !overlap.is_empty() {
+                    let peer_wins =
+                        (lease.lease_epoch_ms, &lease.instance_id) > (rt.lease_epoch_ms, &self.instance_id);
+                    if peer_wins {
+                        // Yield overlapping lights cleanly WITHOUT sending RazerEnable(false)
+                        // or restoring our old pre-sync snapshot on top of the peer's new stream.
+                        for id in &overlap {
+                            rt.sessions.remove(id);
+                            rt.detached.insert(id.clone());
+                        }
+                        if rt.sessions.is_empty() {
+                            rt.active = false;
+                            rt.last_lease_broadcast_at = None;
+                            rt.detached.clear();
+                            rt.processor.reset();
+                            handed_off_all = true;
+                        } else {
+                            yielded_partial = true;
+                        }
+                        our_lease_reply = Some(self.make_peer_lease_locked(&rt));
+                    } else {
+                        our_lease_reply = Some(self.make_peer_lease_locked(&rt));
+                    }
+                }
+
+                let peer_devs: HashSet<String> = lease
+                    .device_ids
+                    .into_iter()
+                    .filter(|id| !rt.sessions.contains_key(id))
+                    .collect();
+                for (other_id, other_entry) in rt.peer_leases.iter_mut() {
+                    if other_id != &lease.instance_id && other_entry.lease_epoch_ms <= lease.lease_epoch_ms {
+                        other_entry.device_ids.retain(|id| !peer_devs.contains(id));
+                    }
+                }
+                rt.peer_leases.retain(|_, e| !e.device_ids.is_empty());
+
+                if !peer_devs.is_empty() {
+                    rt.peer_leases.insert(
+                        lease.instance_id,
+                        PeerLeaseEntry {
+                            host_name: peer_host.clone(),
+                            device_ids: peer_devs,
+                            lease_epoch_ms: lease.lease_epoch_ms,
+                            expires_at: now + PEER_LEASE_TTL,
+                        },
+                    );
+                } else {
+                    rt.peer_leases.remove(&lease.instance_id);
+                }
+            } else {
+                rt.peer_leases.remove(&lease.instance_id);
+            }
+
+            let next_conflict = rt.current_conflict(now);
+            (prev_conflict, next_conflict, !rt.peer_leases.is_empty(), !rt.active)
+        };
+
+        if has_peers {
+            self.peer_notify.notify_one();
+        }
+        if let Some(reply) = our_lease_reply {
+            self.broadcast_peer_datagram(&reply.to_bytes()).await;
+        }
+
+        if handed_off_all {
+            self.log(
+                "action",
+                src.to_string(),
+                None,
+                format!("Screen Sync handed off to {peer_host}"),
+                false,
+            )
+            .await;
+        } else if yielded_partial {
+            self.log(
+                "action",
+                src.to_string(),
+                None,
+                format!("Screen Sync yielded lights to {peer_host}"),
+                false,
+            )
+            .await;
+        } else if prev_conflict.is_none() && next_conflict.is_some() {
+            self.log(
+                "state",
+                src.to_string(),
+                None,
+                format!("Screen Sync active on {peer_host}"),
+                false,
+            )
+            .await;
+        } else if prev_conflict.is_some() && next_conflict.is_none() {
+            self.log(
+                "state",
+                src.to_string(),
+                None,
+                format!("Screen Sync ended on {peer_host}"),
+                false,
+            )
+            .await;
+        }
+
+        if handed_off_all || yielded_partial || prev_conflict != next_conflict {
+            let status = self.current_sync_status().await;
+            self.emit(Event::SyncChanged { status });
+        }
+
+        if prev_conflict.is_some() && next_conflict.is_none() && now_idle {
+            let me = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                me.refresh_idle().await;
+            });
         }
     }
 
@@ -1777,7 +2318,12 @@ impl Inner {
             self.emit(Event::SyncChanged { status });
         }
         if needs_status {
-            let is_synced = self.sync_rt.lock().await.sessions.contains_key(&dev.id);
+            let is_synced = {
+                let now = Instant::now();
+                let mut rt = self.sync_rt.lock().await;
+                rt.prune_expired_peers(now);
+                rt.sessions.contains_key(&dev.id) || rt.peer_host_for_device(&dev.id, now).is_some()
+            };
             if !is_synced {
                 let _ = self.send(Command::DevStatus, SocketAddr::from((ip, self.cfg.command_port))).await;
             }
@@ -1786,13 +2332,20 @@ impl Inner {
 
     async fn on_status(&self, st: StatusInfo, src: SocketAddr, raw: String) {
         let IpAddr::V4(ip) = src.ip() else { return };
-        // Ignore color=(0,0,0) status replies from lights currently in Razer streaming mode.
+        // Ignore color=(0,0,0) status replies from lights currently in Razer streaming mode
+        // (either locally or on another machine running Screen Sync).
         {
-            let synced_match = {
-                let rt = self.sync_rt.lock().await;
-                rt.sessions.values().any(|s| s.ip == ip)
+            let (local_synced_ip, peer_ids) = {
+                let now = Instant::now();
+                let mut rt = self.sync_rt.lock().await;
+                rt.prune_expired_peers(now);
+                (rt.sessions.values().any(|s| s.ip == ip), rt.peer_synced_device_ids(now))
             };
-            if synced_match {
+            let peer_synced_ip = !peer_ids.is_empty() && {
+                let devices = self.devices.read().await;
+                devices.values().any(|e| e.device.ip == ip && peer_ids.contains(&e.device.id))
+            };
+            if local_synced_ip || peer_synced_ip {
                 let mut devices = self.devices.write().await;
                 for e in devices.values_mut().filter(|e| e.device.ip == ip) {
                     e.device.online = true;
@@ -1992,16 +2545,48 @@ async fn sync_loop(inner: Arc<Inner>) {
     }
 }
 
+async fn peer_lease_loop(inner: Arc<Inner>) {
+    loop {
+        let next_expiry = {
+            let now = Instant::now();
+            let mut rt = inner.sync_rt.lock().await;
+            let expired = rt.prune_expired_peers(now);
+            let earliest = rt.peer_leases.values().map(|e| e.expires_at).min();
+            (expired, earliest, !rt.active)
+        };
+        if next_expiry.0 {
+            let status = inner.current_sync_status().await;
+            inner.emit(Event::SyncChanged { status });
+            if next_expiry.2 {
+                inner.refresh_idle().await;
+            }
+        }
+        match next_expiry.1 {
+            None => inner.peer_notify.notified().await,
+            Some(when) => {
+                let wait = when
+                    .saturating_duration_since(Instant::now())
+                    .saturating_add(Duration::from_millis(20));
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = inner.peer_notify.notified() => {}
+                }
+            }
+        }
+    }
+}
+
 fn snapshot_for_device(dev: &Device) -> DeviceState {
     if let Some(s) = dev.state {
         if s.kelvin == 0 && s.color == Rgb::new(0, 0, 0) {
-            // If the light was running a built-in scene, fall back to its remembered colour or warm white.
+            // If the light was running a built-in scene or peer sync, fall back to its remembered colour or warm white.
             if let Some(c) = dev.last_color {
                 return DeviceState { color: c, ..s };
             }
             if let Some(k) = dev.last_kelvin {
                 return DeviceState { kelvin: k, ..s };
             }
+            return DeviceState { color: Rgb::new(255, 180, 100), ..s };
         }
         return s;
     }
@@ -2031,6 +2616,7 @@ fn slice_color_diff(a: &[Rgb], b: &[Rgb]) -> u8 {
 fn bind_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    s.set_broadcast(true)?;
     s.set_multicast_ttl_v4(2)?;
     s.set_multicast_loop_v4(true)?;
     s.set_nonblocking(true)?;
@@ -2040,6 +2626,14 @@ fn bind_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
             format!("cannot listen on {addr} ({e}). Is another Govee app (Govee Desktop, SignalRGB, ...) using it?"),
         )
     })?;
+    if let SocketAddr::V4(v4) = addr {
+        if v4.ip().is_unspecified() {
+            let _ = s.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+            for iface in local_ipv4_interfaces() {
+                let _ = s.join_multicast_v4(&MULTICAST_ADDR, &iface);
+            }
+        }
+    }
     UdpSocket::from_std(s.into())
 }
 
@@ -2055,6 +2649,69 @@ fn local_ipv4_interfaces() -> Vec<Ipv4Addr> {
             .collect(),
         Err(_) => vec![],
     }
+}
+
+fn local_ipv4_broadcasts(port: u16) -> Vec<SocketAddr> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .filter(|i| !i.is_loopback())
+            .filter_map(|i| match i.addr {
+                if_addrs::IfAddr::V4(v4) if !v4.ip.is_link_local() => {
+                    v4.broadcast.map(|b| SocketAddr::from((b, port)))
+                }
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![],
+    }
+}
+
+fn sanitize_host_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = trimmed.strip_suffix(".local").unwrap_or(trimmed).trim();
+    base.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+fn detect_host_name() -> String {
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(val) = std::env::var(key) {
+            let cleaned = sanitize_host_name(&val);
+            if !cleaned.is_empty() {
+                return cleaned;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(raw) = std::fs::read_to_string("/etc/hostname") {
+        let cleaned = sanitize_host_name(&raw);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn gethostname(name: *mut u8, len: usize) -> i32;
+        }
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid 256-byte mutable buffer; we leave at least one NUL byte.
+        let rc = unsafe { gethostname(buf.as_mut_ptr(), buf.len() - 1) };
+        if rc == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len() - 1);
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                let cleaned = sanitize_host_name(s);
+                if !cleaned.is_empty() {
+                    return cleaned;
+                }
+            }
+        }
+    }
+    "Another device".to_string()
+}
+
+fn epoch_ms_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1)
 }
 
 fn display_name(store: &Store, id: &str, sku: &str) -> String {
@@ -2091,8 +2748,11 @@ fn describe_state(s: &DeviceState) -> String {
 }
 
 fn new_id(prefix: &str) -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("{prefix}{:x}", nanos & 0xffff_ffff_ffff)
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let mixed = (nanos & 0xffff_ffff_ffff) ^ (seq.wrapping_mul(0x9e37_79b9_7f4a_7c15) & 0xffff_ffff_ffff);
+    format!("{prefix}{mixed:x}")
 }
 
 /// Generate a store identifier (e.g. `g...` for groups or `s...` for scenes).

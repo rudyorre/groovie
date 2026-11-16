@@ -54,11 +54,13 @@
   let {
     device,
     syncing = false,
+    peerSyncHost = null,
     onOpenSync,
     onForget,
   }: {
     device: Device;
     syncing?: boolean;
+    peerSyncHost?: string | null;
     onOpenSync?: () => void;
     onForget?: (device: Device) => void;
   } = $props();
@@ -71,12 +73,13 @@
   ];
 
   const s = $derived(device.state);
-  const on = $derived(!!s?.on && device.online);
+  const lockedByPeer = $derived(Boolean(peerSyncHost) && device.online);
+  const on = $derived((!!s?.on || lockedByPeer) && device.online);
   // Govee lights report RGB (0,0,0) + kelvin 0 when playing a built-in scene or music mode.
   const isEffect = $derived(!!s && s.kelvin === 0 && s.color.r === 0 && s.color.g === 0 && s.color.b === 0);
   const lit = $derived(
     s
-      ? syncing
+      ? syncing || lockedByPeer
         ? { r: 255, g: 176, b: 32 }
         : s.kelvin
           ? kelvinToRgb(s.kelvin)
@@ -128,9 +131,11 @@
       ? 'Offline'
       : !s
         ? 'Connecting…'
-        : s.on
-          ? `On · ${s.brightness}%${syncing ? ' · Syncing' : isEffect ? ' · Scene' : ''}`
-          : 'Off',
+        : lockedByPeer
+          ? `Synced by ${peerSyncHost}`
+          : s.on
+            ? `On · ${s.brightness}%${syncing ? ' · Syncing' : isEffect ? ' · Scene' : ''}`
+            : 'Off',
   );
 
   const target = $derived({ type: 'device' as const, id: device.id });
@@ -225,11 +230,11 @@
     >
       <Icon name="info" size={14} />
     </button>
-    <label class="switch" title={on ? 'Turn off' : 'Turn on'}>
+    <label class="switch" title={lockedByPeer ? `Controlled by Screen Sync on ${peerSyncHost}` : on ? 'Turn off' : 'Turn on'}>
       <input
         type="checkbox"
         checked={s?.on ?? false}
-        disabled={!device.online}
+        disabled={!device.online || lockedByPeer}
         onchange={(e) => send({ type: 'power', value: e.currentTarget.checked })}
       />
       <span></span>
@@ -307,7 +312,7 @@
         min={1}
         max={100}
         value={s.brightness}
-        disabled={!device.online}
+        disabled={!device.online || lockedByPeer}
         oninput={(v) => sendThrottled({ type: 'brightness', value: v })}
       />
       <span class="bri-label"><Icon name="sun" size={14} /> {s.brightness}%</span>
@@ -318,6 +323,18 @@
         <span class="sync-dot"></span>
         <Icon name="monitor" size={14} />
         <span>Syncing with screen</span>
+      </button>
+    {:else if lockedByPeer}
+      <button
+        type="button"
+        class="sync-pill"
+        disabled={!onOpenSync}
+        title="Open Screen Sync to view or take over"
+        onclick={() => onOpenSync?.()}
+      >
+        <span class="sync-dot"></span>
+        <Icon name="monitor" size={14} />
+        <span>Synced by {peerSyncHost}</span>
       </button>
     {:else}
       <div class="segmented" role="tablist">

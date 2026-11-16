@@ -55,6 +55,15 @@ impl Config {
         if let Some(p) = var("GROOVIE_CONFIG") {
             self.store_path = Some(p.into());
         }
+        if let Some(v) = var("GROOVIE_PEER_SYNC_TARGETS") {
+            let targets: Vec<_> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if !targets.is_empty() {
+                self.peer_sync_targets = targets;
+            }
+        }
+        if let Some(h) = var("GROOVIE_HOST_NAME") {
+            self.host_name = Some(h.trim().to_string());
+        }
         self
     }
 }

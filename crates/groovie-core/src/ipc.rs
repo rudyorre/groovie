@@ -4,7 +4,7 @@
 
 use crate::model::{Action, Device, Group, Scene, Target};
 use crate::store::default_ipc_path;
-use crate::sync::{SyncConfig, SyncStatus};
+use crate::sync::{SyncConfig, SyncPeerConflict, SyncStatus};
 use crate::Groovie;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,7 @@ pub trait SyncController: Send + Sync + 'static {
     fn set_or_toggle<'a>(
         &'a self,
         desired: Option<bool>,
+        force: bool,
     ) -> Pin<Box<dyn Future<Output = Result<SyncStatus, String>> + Send + 'a>>;
 }
 
@@ -44,6 +45,8 @@ pub struct SyncStatusInfo {
     pub active: bool,
     pub active_devices: Vec<String>,
     pub config: SyncConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<SyncPeerConflict>,
 }
 
 impl SyncStatusInfo {
@@ -53,6 +56,7 @@ impl SyncStatusInfo {
             active: st.active,
             active_devices: st.active_devices,
             config: st.config,
+            conflict: st.conflict,
         }
     }
 }
@@ -130,6 +134,8 @@ pub enum IpcRequest {
     SyncStatus,
     SyncSet {
         enabled: Option<bool>,
+        #[serde(default)]
+        force: bool,
     },
 }
 
@@ -433,17 +439,17 @@ async fn dispatch(
             let st = g.sync_status().await;
             to_val(serde_json::to_value(SyncStatusInfo::from_status(supported, st)))
         }
-        IpcRequest::SyncSet { enabled } => match sync_ctl {
+        IpcRequest::SyncSet { enabled, force } => match sync_ctl {
             Some(ctl) => {
                 let supported = ctl.is_supported();
-                let st = ctl.set_or_toggle(enabled).await?;
+                let st = ctl.set_or_toggle(enabled, force).await?;
                 to_val(serde_json::to_value(SyncStatusInfo::from_status(supported, st)))
             }
             None => {
                 let cur = g.sync_status().await;
                 let next_en = enabled.unwrap_or(!cur.active);
                 let st = if next_en {
-                    g.start_sync().await.map_err(|e| e.to_string())?
+                    g.start_sync_with_options(force).await.map_err(|e| e.to_string())?
                 } else {
                     g.stop_sync(Some("stopped via CLI")).await
                 };
