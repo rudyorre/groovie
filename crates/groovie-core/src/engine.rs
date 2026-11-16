@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -28,6 +29,9 @@ const RAZER_KEEPALIVE: Duration = Duration::from_millis(450);
 const RAZER_REASSERT: Duration = Duration::from_secs(25);
 const SOLID_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const UNICAST_SCAN_BATCH: usize = 24;
+const UNICAST_SCAN_PACE: Duration = Duration::from_millis(8);
+const MAX_SUBNET_HOSTS: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -57,10 +61,13 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Where `scan` requests go. Defaults to the Govee multicast group.
     pub scan_targets: Vec<SocketAddr>,
-    /// Port used for unicast scans when adding a device by IP.
+    /// Port used for unicast scans when adding a device by IP or sweeping a `/24`.
     pub scan_port: u16,
     /// Port devices accept commands on.
     pub command_port: u16,
+    /// Also send unicast `scan` packets across private `/24` LAN interfaces so
+    /// discovery works without paid multicast entitlements (enabled by default on iOS).
+    pub subnet_scan: bool,
     /// JSON config file. `None` keeps everything in memory.
     pub store_path: Option<PathBuf>,
     /// How often to ask every device for its status.
@@ -78,6 +85,7 @@ impl Default for Config {
             scan_targets: vec![SocketAddr::V4(SocketAddrV4::new(MULTICAST_ADDR, SCAN_PORT))],
             scan_port: SCAN_PORT,
             command_port: COMMAND_PORT,
+            subnet_scan: cfg!(target_os = "ios"),
             store_path: default_store_path(),
             poll_interval: Duration::from_secs(15),
             rescan_interval: Duration::from_secs(60),
@@ -133,7 +141,10 @@ struct SyncRuntime {
 
 struct Inner {
     cfg: Config,
-    sock: UdpSocket,
+    sock: std::sync::RwLock<Arc<UdpSocket>>,
+    sock_dead: AtomicBool,
+    sock_rebound: Notify,
+    rebind_lock: Mutex<()>,
     scan_lock: Mutex<()>,
     devices: RwLock<HashMap<String, Entry>>,
     store: Mutex<Store>,
@@ -167,10 +178,18 @@ impl Groovie {
     /// Bind the socket, load config, start background tasks and kick off
     /// discovery.
     pub async fn start(cfg: Config) -> Result<Self> {
-        let sock = bind_socket(cfg.listen)?;
+        let sock = Arc::new(bind_socket(cfg.listen)?);
         let store = match &cfg.store_path {
             Some(p) => Store::open(p)?,
             None => Store::in_memory(),
+        };
+        #[cfg(target_os = "ios")]
+        let store = {
+            // Seed ~/Documents/groovie.json immediately so the Groovie folder
+            // appears right away in the iOS Files app (On My iPhone -> Groovie).
+            let mut store = store;
+            let _ = store.ensure_saved();
+            store
         };
 
         // Show previously seen devices immediately (offline until they answer).
@@ -203,7 +222,10 @@ impl Groovie {
         let (poll_tx, _) = watch::channel(cfg.poll_interval);
         let inner = Arc::new(Inner {
             cfg,
-            sock,
+            sock: std::sync::RwLock::new(sock),
+            sock_dead: AtomicBool::new(false),
+            sock_rebound: Notify::new(),
+            rebind_lock: Mutex::new(()),
             scan_lock: Mutex::new(()),
             devices: RwLock::new(devices),
             store: Mutex::new(store),
@@ -223,7 +245,7 @@ impl Groovie {
         ];
 
         let me = Self { inner, _tasks: Arc::new(TaskGuard(tasks)) };
-        me.discover().await?;
+        let _ = me.discover().await;
         me.refresh_all().await;
         Ok(me)
     }
@@ -232,7 +254,7 @@ impl Groovie {
         self.inner.events.subscribe()
     }
 
-    /// Multicast a scan request; replies are handled in the background.
+    /// Multicast (and optionally unicast-sweep) a scan request; replies are handled in the background.
     pub async fn discover(&self) -> Result<()> {
         self.inner.send_scan().await
     }
@@ -269,6 +291,23 @@ impl Groovie {
             .unwrap_or(false);
         if !recent {
             self.inner.refresh_idle().await;
+        }
+    }
+
+    /// Recover cleanly after mobile background suspension or the iOS Local Network
+    /// permission prompt: rebinds the UDP listener if invalidated by the OS, reloads
+    /// external `groovie.json` edits, and re-runs discovery when no lights are online.
+    pub async fn resume(&self) {
+        if self.inner.sock_dead.load(Ordering::Acquire)
+            || self.inner.socket().local_addr().is_err()
+        {
+            let _ = self.inner.rebind_socket("foreground resume").await;
+        }
+        self.sync_now().await;
+        let any_online = self.inner.devices.read().await.values().any(|e| e.device.online);
+        if !any_online {
+            let _ = self.discover().await;
+            self.refresh_all().await;
         }
     }
 
@@ -628,6 +667,62 @@ impl Groovie {
         Ok(store.path().map(PathBuf::from))
     }
 
+    /// Validate and atomically save raw `groovie.json` text (preserving any currently
+    /// online discovered lights), reconcile nicknames/groups/scenes/sync, and probe any
+    /// newly imported offline devices so they come online immediately.
+    pub async fn save_config_json(&self, raw_json: &str) -> Result<ConfigInfo> {
+        let live_known: Vec<KnownDevice> = self
+            .inner
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| e.device.online)
+            .map(|e| KnownDevice {
+                id: e.device.id.clone(),
+                ip: e.device.ip,
+                sku: e.device.sku.clone(),
+            })
+            .collect();
+
+        let info = {
+            let mut store = self.inner.store.lock().await;
+            store.replace_json(raw_json, &live_known)?;
+            self.inner.apply_store_to_devices(&store).await;
+            build_config_info(&store)
+        };
+
+        let status = self.inner.current_sync_status().await;
+        self.inner.emit(Event::SyncChanged { status });
+        self.inner
+            .log("action", "", None, "saved configuration JSON", false)
+            .await;
+
+        // Probe offline known devices right away so pasting a desktop groovie.json
+        // onto iOS lights up reachable devices without waiting for the next poll.
+        let offline_ips: Vec<Ipv4Addr> = self
+            .inner
+            .devices
+            .read()
+            .await
+            .values()
+            .filter(|e| !e.device.online)
+            .map(|e| e.device.ip)
+            .collect();
+        for ip in offline_ips {
+            let _ = self
+                .inner
+                .send(Command::Scan, SocketAddr::from((ip, self.inner.cfg.scan_port)))
+                .await;
+            let _ = self
+                .inner
+                .send(Command::DevStatus, SocketAddr::from((ip, self.inner.cfg.command_port)))
+                .await;
+        }
+
+        Ok(info)
+    }
+
     // ---- diagnostic logs -------------------------------------------------
 
     pub async fn logs(&self) -> Vec<LogEntry> {
@@ -659,6 +754,30 @@ impl Inner {
     fn emit(&self, ev: Event) {
         // No subscribers is fine.
         let _ = self.events.send(ev);
+    }
+
+    fn socket(&self) -> Arc<UdpSocket> {
+        self.sock.read().unwrap().clone()
+    }
+
+    async fn rebind_socket(&self, reason: &str) -> Result<Arc<UdpSocket>> {
+        let _guard = self.rebind_lock.lock().await;
+        if !self.sock_dead.load(Ordering::Acquire) && self.socket().local_addr().is_ok() {
+            return Ok(self.socket());
+        }
+        let next = Arc::new(bind_socket(self.cfg.listen)?);
+        *self.sock.write().unwrap() = next.clone();
+        self.sock_dead.store(false, Ordering::Release);
+        self.sock_rebound.notify_waiters();
+        self.log(
+            "state",
+            self.cfg.listen.to_string(),
+            None,
+            format!("rebound UDP listener ({reason})"),
+            false,
+        )
+        .await;
+        Ok(next)
     }
 
     async fn device_label_for_ip(&self, ip: IpAddr) -> Option<String> {
@@ -732,13 +851,32 @@ impl Inner {
     }
 
     async fn apply_store_to_devices(&self, store: &Store) {
+        let known_by_id: HashMap<&str, &KnownDevice> = store
+            .data
+            .known_devices
+            .iter()
+            .map(|k| (k.id.as_str(), k))
+            .collect();
         let mut updated = Vec::new();
         {
             let mut devices = self.devices.write().await;
             for (id, e) in devices.iter_mut() {
+                let mut changed = false;
+                if !e.device.online {
+                    if let Some(k) = known_by_id.get(id.as_str()) {
+                        if e.device.ip != k.ip || e.device.sku != k.sku {
+                            e.device.ip = k.ip;
+                            e.device.sku = k.sku.clone();
+                            changed = true;
+                        }
+                    }
+                }
                 let next_name = display_name(store, id, &e.device.sku);
                 if e.device.name != next_name {
                     e.device.name = next_name;
+                    changed = true;
+                }
+                if changed {
                     updated.push(e.device.clone());
                 }
             }
@@ -780,7 +918,15 @@ impl Inner {
         let json = cmd.to_json().to_string();
         let poll = matches!(cmd, Command::DevStatus);
         let label = self.device_label_for_ip(to.ip()).await;
-        let res = self.sock.send_to(json.as_bytes(), to).await;
+        let mut res = self.socket().send_to(json.as_bytes(), to).await;
+        if let Err(ref e) = res {
+            if is_fatal_socket_error(e) {
+                self.sock_dead.store(true, Ordering::Release);
+                if let Ok(rebound) = self.rebind_socket("send after OS wake").await {
+                    res = rebound.send_to(json.as_bytes(), to).await;
+                }
+            }
+        }
         match &res {
             Ok(_) => self.log("tx", to.to_string(), label, json, poll).await,
             Err(e) => self.log("tx", to.to_string(), label, format!("ERROR {e}: {json}"), false).await,
@@ -793,30 +939,131 @@ impl Inner {
         let _guard = self.scan_lock.lock().await;
         let json = Command::Scan.to_json().to_string();
         let bytes = json.as_bytes();
+        let mut explicit_unicast_ips = HashSet::new();
+        let mut had_multicast_target = false;
+        let mut any_multicast_ok = false;
+
         for target in &self.cfg.scan_targets {
             let multicast = matches!(target, SocketAddr::V4(v4) if v4.ip().is_multicast());
             if !multicast {
-                self.sock.send_to(bytes, target).await?;
-                self.log("tx", target.to_string(), None, json.clone(), false).await;
+                if let SocketAddr::V4(v4) = target {
+                    if v4.port() == self.cfg.scan_port {
+                        explicit_unicast_ips.insert(*v4.ip());
+                    }
+                }
+                let mut res = self.socket().send_to(bytes, target).await;
+                if let Err(ref e) = res {
+                    if is_fatal_socket_error(e) {
+                        self.sock_dead.store(true, Ordering::Release);
+                        if let Ok(rebound) = self.rebind_socket("scan after OS wake").await {
+                            res = rebound.send_to(bytes, target).await;
+                        }
+                    }
+                }
+                match res {
+                    Ok(_) => self.log("tx", target.to_string(), None, json.clone(), false).await,
+                    Err(e) => {
+                        self.log(
+                            "tx",
+                            target.to_string(),
+                            None,
+                            format!("ERROR {e}: {json}"),
+                            false,
+                        )
+                        .await;
+                    }
+                }
                 continue;
             }
+
+            had_multicast_target = true;
             // Send the multicast scan out of every interface so multi-NIC
             // machines (VPN, ethernet + wifi, ...) still find devices.
             let ifaces = local_ipv4_interfaces();
+            let sock = self.socket();
             if ifaces.is_empty() {
-                self.sock.send_to(bytes, target).await?;
-            }
-            let sref = socket2::SockRef::from(&self.sock);
-            for ip in &ifaces {
-                if let Err(e) = sref.set_multicast_if_v4(ip) {
-                    debug!(%ip, error = %e, "cannot use interface for multicast");
-                    continue;
+                match sock.send_to(bytes, target).await {
+                    Ok(_) => any_multicast_ok = true,
+                    Err(e) => debug!(error = %e, "multicast send without interface list failed"),
                 }
-                if let Err(e) = self.sock.send_to(bytes, target).await {
-                    debug!(%ip, error = %e, "multicast send failed");
+            } else {
+                let sref = socket2::SockRef::from(&*sock);
+                for ip in &ifaces {
+                    if let Err(e) = sref.set_multicast_if_v4(ip) {
+                        debug!(%ip, error = %e, "cannot use interface for multicast");
+                        continue;
+                    }
+                    match sock.send_to(bytes, target).await {
+                        Ok(_) => any_multicast_ok = true,
+                        Err(e) => debug!(%ip, error = %e, "multicast send failed"),
+                    }
                 }
             }
-            self.log("tx", target.to_string(), None, json.clone(), false).await;
+            if any_multicast_ok {
+                self.log("tx", target.to_string(), None, json.clone(), false).await;
+            } else {
+                debug!(%target, "multicast scan unavailable on all interfaces");
+            }
+        }
+
+        // Sweep private LAN `/24` hosts via unicast UDP when configured (default on iOS,
+        // where Apple gates `239.255.255.250` behind a paid multicast entitlement) or
+        // when multicast failed on every interface.
+        let run_subnet_sweep = self.cfg.subnet_scan
+            || (had_multicast_target && !any_multicast_ok && explicit_unicast_ips.is_empty());
+        if run_subnet_sweep {
+            let mut targets: Vec<Ipv4Addr> = Vec::new();
+            let mut seen: HashSet<Ipv4Addr> = explicit_unicast_ips;
+            {
+                let devices = self.devices.read().await;
+                for e in devices.values() {
+                    if seen.insert(e.device.ip) {
+                        targets.push(e.device.ip);
+                    }
+                }
+            }
+            for ip in lan_ipv4_subnet_hosts() {
+                if targets.len() >= MAX_SUBNET_HOSTS {
+                    break;
+                }
+                if seen.insert(ip) {
+                    targets.push(ip);
+                }
+            }
+
+            if !targets.is_empty() {
+                let mut sock = self.socket();
+                let mut sent_ok = 0usize;
+                for (idx, ip) in targets.iter().copied().enumerate() {
+                    if idx > 0 && idx % UNICAST_SCAN_BATCH == 0 {
+                        tokio::time::sleep(UNICAST_SCAN_PACE).await;
+                    }
+                    let addr = SocketAddr::from((ip, self.cfg.scan_port));
+                    match sock.send_to(bytes, addr).await {
+                        Ok(_) => sent_ok += 1,
+                        Err(e) if is_fatal_socket_error(&e) => {
+                            self.sock_dead.store(true, Ordering::Release);
+                            if let Ok(rebound) = self.rebind_socket("subnet scan socket recovery").await {
+                                sock = rebound;
+                                if sock.send_to(bytes, addr).await.is_ok() {
+                                    sent_ok += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(%ip, error = %e, "unicast scan send failed");
+                        }
+                    }
+                }
+                self.log(
+                    "tx",
+                    format!("lan-unicast:{}", self.cfg.scan_port),
+                    None,
+                    format!("{json} (unicast scan to {sent_ok}/{} LAN hosts)", targets.len()),
+                    false,
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -1527,8 +1774,9 @@ impl Inner {
             }
         }
 
+        let sock = self.socket();
         for (addr, payload) in raw_sends {
-            let _ = self.sock.send_to(&payload, addr).await;
+            let _ = sock.send_to(&payload, addr).await;
         }
 
         if let Some(preview) = preview_to_emit {
@@ -1764,8 +2012,22 @@ impl Inner {
 async fn recv_loop(inner: Arc<Inner>) {
     let mut buf = vec![0u8; 8192];
     loop {
-        match inner.sock.recv_from(&mut buf).await {
+        let sock = inner.socket();
+        let res = tokio::select! {
+            r = sock.recv_from(&mut buf) => r,
+            _ = inner.sock_rebound.notified() => continue,
+        };
+        match res {
             Ok((n, src)) => inner.handle(&buf[..n], src).await,
+            Err(e) if is_fatal_socket_error(&e) => {
+                warn!(error = %e, "UDP listener invalidated; attempting rebind");
+                inner.sock_dead.store(true, Ordering::Release);
+                drop(sock);
+                if let Err(rebind_err) = inner.rebind_socket("socket invalidated by OS").await {
+                    debug!(error = %rebind_err, "UDP socket rebind deferred");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
             Err(e) => {
                 // Windows reports ICMP "port unreachable" as ConnectionReset on
                 // the next recv; just keep going.
@@ -1875,9 +2137,32 @@ fn slice_color_diff(a: &[Rgb], b: &[Rgb]) -> u8 {
         .unwrap_or(0)
 }
 
+fn is_fatal_socket_error(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected | io::ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    match e.raw_os_error() {
+        // POSIX EBADF (9) or EINVAL (22)
+        Some(9 | 22) => true,
+        // iOS/macOS ENETDOWN (50) or ENOTCONN (57) after background suspension
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        Some(50 | 57) => true,
+        #[cfg(target_os = "linux")]
+        Some(100 | 107) => true,
+        _ => false,
+    }
+}
+
 fn bind_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // On iOS, allow immediate rebinding on `:4002` when recovering from background
+    // suspension; on desktop, keep exclusive port-4002 conflict detection intact.
+    #[cfg(target_os = "ios")]
+    s.set_reuse_address(true)?;
     s.set_multicast_ttl_v4(2)?;
     s.set_multicast_loop_v4(true)?;
     s.set_nonblocking(true)?;
@@ -1902,6 +2187,85 @@ fn local_ipv4_interfaces() -> Vec<Ipv4Addr> {
             .collect(),
         Err(_) => vec![],
     }
+}
+
+/// Skip VPN tunnels (e.g. SideStore WireGuard `utun*`), iOS cellular (`pdp_ip*`),
+/// Apple peer-to-peer Wi-Fi (`awdl*`, `llw*`), and container bridges when sweeping
+/// private `/24` subnets for Govee lights.
+fn is_lan_interface_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    const SKIP_PREFIXES: &[&str] = &[
+        "lo",
+        "utun",
+        "tun",
+        "tap",
+        "wg",
+        "tailscale",
+        "zt",
+        "ipsec",
+        "ppp",
+        "pdp_ip",
+        "llw",
+        "awdl",
+        "anpi",
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "vmnet",
+        "vboxnet",
+    ];
+    !lower.is_empty() && !SKIP_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// Enumerate usable host IPv4 addresses on a private RFC1918 LAN subnet, clamping
+/// masks wider than `/24` (or `/32` point-to-point masks) to the local `/24`.
+fn subnet_hosts_v4(local_ip: Ipv4Addr, netmask: Ipv4Addr) -> Vec<Ipv4Addr> {
+    if !local_ip.is_private() {
+        return Vec::new();
+    }
+    let ip_u = u32::from(local_ip);
+    let mask_u = u32::from(netmask);
+    // Clamp wide masks (< /24) and degenerate masks (/31, /32) to /24 so we scan
+    // at most 253 neighbours per Wi-Fi/LAN interface.
+    let eff_mask = if (0xffff_ff00..=0xffff_fffc).contains(&mask_u) {
+        mask_u
+    } else {
+        0xffff_ff00
+    };
+    let net = ip_u & eff_mask;
+    let bcast = net | !eff_mask;
+    if bcast <= net + 1 {
+        return Vec::new();
+    }
+    ((net + 1)..bcast)
+        .map(Ipv4Addr::from)
+        .filter(|&ip| ip != local_ip)
+        .collect()
+}
+
+fn lan_ipv4_subnet_hosts() -> Vec<Ipv4Addr> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for iface in ifaces {
+        if iface.is_loopback() || !is_lan_interface_name(&iface.name) {
+            continue;
+        }
+        if let if_addrs::IfAddr::V4(v4) = iface.addr {
+            for host in subnet_hosts_v4(v4.ip, v4.netmask) {
+                if seen.insert(host) {
+                    out.push(host);
+                    if out.len() >= MAX_SUBNET_HOSTS {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn display_name(store: &Store, id: &str, sku: &str) -> String {
@@ -1940,4 +2304,66 @@ fn describe_state(s: &DeviceState) -> String {
 fn new_id(prefix: &str) -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("{prefix}{:x}", nanos & 0xffff_ffff_ffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_vpn_cellular_and_virtual_interfaces() {
+        assert!(is_lan_interface_name("en0"));
+        assert!(is_lan_interface_name("en1"));
+        assert!(is_lan_interface_name("wlan0"));
+        assert!(is_lan_interface_name("wlp3s0"));
+        assert!(is_lan_interface_name("eth0"));
+
+        // SideStore WireGuard loopback VPN, iOS cellular, AWDL, loopback, Docker
+        assert!(!is_lan_interface_name("utun0"));
+        assert!(!is_lan_interface_name("utun4"));
+        assert!(!is_lan_interface_name("pdp_ip0"));
+        assert!(!is_lan_interface_name("awdl0"));
+        assert!(!is_lan_interface_name("llw0"));
+        assert!(!is_lan_interface_name("ipsec0"));
+        assert!(!is_lan_interface_name("wg0"));
+        assert!(!is_lan_interface_name("tun0"));
+        assert!(!is_lan_interface_name("lo0"));
+        assert!(!is_lan_interface_name("docker0"));
+    }
+
+    #[test]
+    fn enumerates_private_lan_hosts_and_clamps_wide_masks() {
+        // Standard /24 Wi-Fi subnet -> 253 neighbours (excludes .0, .255, and self)
+        let hosts = subnet_hosts_v4(
+            Ipv4Addr::new(192, 168, 1, 25),
+            Ipv4Addr::new(255, 255, 255, 0),
+        );
+        assert_eq!(hosts.len(), 253);
+        assert_eq!(hosts.first().copied(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(hosts.last().copied(), Some(Ipv4Addr::new(192, 168, 1, 254)));
+        assert!(!hosts.contains(&Ipv4Addr::new(192, 168, 1, 25)));
+
+        // Wide /8 mask on 10.x -> clamped to 10.0.5.0/24 (253 hosts, not 16M)
+        let clamped = subnet_hosts_v4(
+            Ipv4Addr::new(10, 0, 5, 10),
+            Ipv4Addr::new(255, 0, 0, 0),
+        );
+        assert_eq!(clamped.len(), 253);
+        assert_eq!(clamped.first().copied(), Some(Ipv4Addr::new(10, 0, 5, 1)));
+        assert_eq!(clamped.last().copied(), Some(Ipv4Addr::new(10, 0, 5, 254)));
+
+        // Narrow /28 mask -> 13 usable neighbours
+        let narrow = subnet_hosts_v4(
+            Ipv4Addr::new(172, 16, 0, 2),
+            Ipv4Addr::new(255, 255, 255, 240),
+        );
+        assert_eq!(narrow.len(), 13);
+        assert_eq!(narrow.first().copied(), Some(Ipv4Addr::new(172, 16, 0, 1)));
+        assert_eq!(narrow.last().copied(), Some(Ipv4Addr::new(172, 16, 0, 14)));
+
+        // CGNAT (100.64.0.0/10 cellular / Tailscale), link-local, and loopback are rejected
+        assert!(subnet_hosts_v4(Ipv4Addr::new(100, 64, 12, 34), Ipv4Addr::new(255, 255, 255, 0)).is_empty());
+        assert!(subnet_hosts_v4(Ipv4Addr::new(169, 254, 10, 20), Ipv4Addr::new(255, 255, 0, 0)).is_empty());
+        assert!(subnet_hosts_v4(Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 0, 0, 0)).is_empty());
+    }
 }

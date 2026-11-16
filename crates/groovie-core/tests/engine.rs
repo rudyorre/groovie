@@ -37,6 +37,7 @@ fn config(net: u8, base: u16, n: u8, store: Option<PathBuf>) -> Config {
         scan_targets: (0..n).map(|i| SocketAddr::from((sim_ip(net, i), base))).collect(),
         scan_port: base,
         command_port: base + 1,
+        subnet_scan: false,
         store_path: store,
         poll_interval: Duration::from_secs(60),
         rescan_interval: Duration::from_secs(60),
@@ -625,6 +626,111 @@ async fn screen_sync_identify_sweeps_and_restores_when_idle() {
     eventually("bars restored after identify sweep", || async {
         let s = r.sims[0].state();
         !r.sims[0].is_razer_enabled() && s.on && s.brightness == 65 && s.kelvin == 3200
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn save_config_json_imports_and_probes_devices_without_multicast() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Documents/groovie.json");
+    let (net, base) = (18, 41170);
+    let sims = spawn_sims(net, base, 2).await;
+    let id_a = sims[0].config.id.clone();
+    let id_b = sims[1].config.id.clone();
+    let ip_a = sims[0].config.ip;
+    let ip_b = sims[1].config.ip;
+
+    // Start with zero scan_targets (simulating iOS without multicast).
+    let mut cfg = config(net, base, 0, Some(path.clone()));
+    cfg.scan_targets.clear();
+    let g = Groovie::start(cfg).await.unwrap();
+    assert!(g.devices().await.is_empty());
+
+    // First manually discover light A so it is online in memory.
+    g.add_device_by_ip(ip_a).await.unwrap();
+    let g_wait = g.clone();
+    eventually("light A online", || {
+        let g = g_wait.clone();
+        async move { g.devices().await.iter().any(|d| d.online && d.state.is_some()) }
+    })
+    .await;
+
+    // Reject invalid JSON cleanly without dropping light A.
+    assert!(g.save_config_json("{ broken").await.is_err());
+    assert_eq!(g.devices().await.len(), 1);
+
+    // Paste desktop groovie.json containing nicknames, groups, scenes, and light B
+    // (while omitting light A from known_devices to verify live devices are preserved).
+    let pasted = serde_json::json!({
+        "version": 1,
+        "nicknames": {
+            id_a.clone(): "Bedside",
+            id_b.clone(): "TV Bars",
+        },
+        "groups": [
+            { "id": "g_bed", "name": "Bedroom", "members": [id_a.clone(), id_b.clone()] }
+        ],
+        "scenes": [
+            {
+                "id": "s_night",
+                "name": "Night",
+                "entries": [
+                    { "device": id_b.clone(), "on": true, "brightness": 25, "kelvin": 2700 }
+                ]
+            }
+        ],
+        "known_devices": [
+            { "id": id_b.clone(), "ip": ip_b.to_string(), "sku": "H6046" }
+        ]
+    })
+    .to_string();
+
+    let info = g.save_config_json(&pasted).await.unwrap();
+    assert!(path.is_file());
+    assert!(info.json.contains("Bedside"));
+    assert!(info.json.contains("TV Bars"));
+    assert_eq!(g.groups().await.len(), 1);
+    assert_eq!(g.scenes().await.len(), 1);
+
+    // Newly imported light B is probed automatically via unicast and comes online!
+    let g_probe = g.clone();
+    let id_b2 = id_b.clone();
+    eventually("imported light B came online automatically", || {
+        let g = g_probe.clone();
+        let id_b = id_b2.clone();
+        async move {
+            g.device(&id_b)
+                .await
+                .map(|d| d.online && d.name == "TV Bars" && d.state.is_some())
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    assert_eq!(g.device(&id_a).await.unwrap().name, "Bedside");
+}
+
+#[tokio::test]
+async fn resume_recovers_discovery_when_lights_appear_after_startup() {
+    let (net, base) = (19, 41180);
+    // Start the engine BEFORE the simulated light exists (simulating the iOS
+    // Local Network permission dialog dropping the initial startup scan).
+    let cfg = config(net, base, 1, None);
+    let g = Groovie::start(cfg).await.unwrap();
+    assert!(g.devices().await.is_empty());
+
+    // Now the user grants permission / the light becomes reachable on the LAN,
+    // and the app foregrounds (`resume()`).
+    let _sims = spawn_sims(net, base, 1).await;
+    g.resume().await;
+
+    let g2 = g.clone();
+    eventually("resume() discovered light and fetched status", || {
+        let g = g2.clone();
+        async move {
+            let d = g.devices().await;
+            d.len() == 1 && d[0].online && d[0].state.is_some()
+        }
     })
     .await;
 }

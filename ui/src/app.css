@@ -46,6 +46,9 @@ body { margin: 0; }
 ::selection { background: #ffb02055; }
 
 /* Buttons */
+button, label, .switch {
+  -webkit-tap-highlight-color: transparent;
+}
 button {
   font: inherit;
   font-size: 13px;
@@ -138,3 +141,38 @@ input[type='checkbox'] { accent-color: var(--accent); width: 15px; height: 15px;
 .switch input:checked + span::before { transform: translateX(16px); }
 .switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
 .switch input:disabled + span { cursor: not-allowed; opacity: 0.5; }
+
+/* Mobile touch ergonomics: prevent iOS WKWebView <16px focus zoom and enlarge tap targets */
+@media (hover: none) and (max-width: 680px) {
+  .field,
+  textarea {
+    font-size: 16px;
+  }
+  .field {
+    height: 38px;
+  }
+  .segmented button {
+    height: 30px;
+    font-size: 13px;
+  }
+  .chip {
+    height: 30px;
+    padding: 0 12px;
+    border-radius: 15px;
+    font-size: 12.5px;
+  }
+  .switch {
+    width: 42px;
+    height: 25px;
+  }
+  .switch span {
+    border-radius: 12.5px;
+  }
+  .switch span::before {
+    width: 21px;
+    height: 21px;
+  }
+  .switch input:checked + span::before {
+    transform: translateX(17px);
+  }
+}

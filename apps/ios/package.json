@@ -1,0 +1,14 @@
+{
+  "name": "groovie-ios",
+  "private": true,
+  "version": "0.3.0",
+  "scripts": {
+    "postinstall": "npm --prefix ../../ui install",
+    "dev": "tauri ios dev",
+    "build": "tauri ios build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

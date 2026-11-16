@@ -31,6 +31,7 @@ impl Config {
     /// * `GROOVIE_SCAN_TARGETS`: comma-separated `ip:port` list
     /// * `GROOVIE_LISTEN`: `ip:port` to receive replies on
     /// * `GROOVIE_COMMAND_PORT` / `GROOVIE_SCAN_PORT`
+    /// * `GROOVIE_SUBNET_SCAN`: `1`/`true` or `0`/`false` to force unicast `/24` sweep
     /// * `GROOVIE_CONFIG`: path to the JSON config file
     pub fn with_env_overrides(mut self) -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -48,6 +49,13 @@ impl Config {
         }
         if let Some(p) = var("GROOVIE_SCAN_PORT").and_then(|v| v.parse().ok()) {
             self.scan_port = p;
+        }
+        if let Some(v) = var("GROOVIE_SUBNET_SCAN") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.subnet_scan = true,
+                "0" | "false" | "no" | "off" => self.subnet_scan = false,
+                _ => {}
+            }
         }
         if let Some(p) = var("GROOVIE_CONFIG") {
             self.store_path = Some(p.into());

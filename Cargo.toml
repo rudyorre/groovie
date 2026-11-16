@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/groovie-core", "crates/groovie-sim", "crates/grooviectl"]
 # The Tauri shell has heavy native deps (webkit on Linux), so it lives in its
 # own workspace and is built separately (`pnpm tauri build` / CI).
-exclude = ["apps/desktop/src-tauri"]
+exclude = ["apps/desktop/src-tauri", "apps/ios/src-tauri"]
 
 [workspace.package]
 version = "0.3.0"

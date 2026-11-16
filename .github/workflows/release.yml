@@ -1,10 +1,11 @@
 name: Release
 
-# Push a tag like `v0.2.6` (matching the version in Cargo.toml and
-# apps/desktop/src-tauri/tauri.conf.json) to publish an atomic GitHub Release:
+# Push a tag like `v0.3.0` (matching the version in Cargo.toml,
+# apps/desktop/src-tauri/tauri.conf.json, and apps/ios/src-tauri/tauri.conf.json)
+# to publish an atomic GitHub Release:
 #   1. `create-release` verifies versions and opens a hidden draft release.
-#   2. `build` compiles desktop installers + `grooviectl` CLI on all 3 OSes in parallel.
-#   3. `publish-release` builds `latest.json` once, verifies every asset, and flips draft=false.
+#   2. `build` + `build-ios` compile desktop installers, `grooviectl`, and iOS `.ipa` in parallel.
+#   3. `publish-release` builds `latest.json` + `altstore-source.json`, verifies assets, and flips draft=false.
 on:
   push:
     tags: ['v*']
@@ -31,9 +32,11 @@ jobs:
           EXPECTED="${TAG#v}"
           TAURI_VER=$(jq -r '.version' apps/desktop/src-tauri/tauri.conf.json)
           DESKTOP_CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/desktop/src-tauri/Cargo.toml | head -n1)
+          IOS_TAURI_VER=$(jq -r '.version' apps/ios/src-tauri/tauri.conf.json)
+          IOS_CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/ios/src-tauri/Cargo.toml | head -n1)
           WORKSPACE_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          if [ "$EXPECTED" != "$TAURI_VER" ] || [ "$EXPECTED" != "$DESKTOP_CARGO_VER" ] || [ "$EXPECTED" != "$WORKSPACE_VER" ]; then
-            echo "::error::Tag '$TAG' disagrees with manifests (tauri.conf.json=$TAURI_VER, src-tauri/Cargo.toml=$DESKTOP_CARGO_VER, Cargo.toml=$WORKSPACE_VER)"
+          if [ "$EXPECTED" != "$TAURI_VER" ] || [ "$EXPECTED" != "$DESKTOP_CARGO_VER" ] || [ "$EXPECTED" != "$IOS_TAURI_VER" ] || [ "$EXPECTED" != "$IOS_CARGO_VER" ] || [ "$EXPECTED" != "$WORKSPACE_VER" ]; then
+            echo "::error::Tag '$TAG' disagrees with manifests (desktop tauri=$TAURI_VER, desktop Cargo=$DESKTOP_CARGO_VER, iOS tauri=$IOS_TAURI_VER, iOS Cargo=$IOS_CARGO_VER, Cargo.toml=$WORKSPACE_VER)"
             exit 1
           fi
       - name: Create or reuse draft GitHub Release
@@ -42,7 +45,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          NOTES="Download the installer for your system below (\`grooviectl-*\` archives contain the standalone CLI). Already have Groovie? It will offer this update automatically."
+          NOTES="Download the installer for your system below (\`Groovie_*_ios.ipa\` + \`altstore-source.json\` for free iOS sideloading via SideStore/AltStore, \`grooviectl-*\` archives for the standalone CLI). Already have Groovie? Desktop updates automatically, and SideStore/AltStore updates via the Groovie source."
           if VIEW=$(gh release view "$TAG" --json databaseId,isDraft 2>/dev/null); then
             IS_DRAFT=$(printf '%s' "$VIEW" | jq -r '.isDraft')
             if [ "$IS_DRAFT" != "true" ]; then
@@ -148,23 +151,56 @@ jobs:
           uploadUpdaterJson: false
           args: ${{ matrix.args }}
 
+  build-ios:
+    name: Build (iOS unsigned .ipa)
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/ios/src-tauri
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            apps/ios/package-lock.json
+      - run: npm ci
+        working-directory: apps/ios
+      - name: Build and upload unsigned iOS IPA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=$(jq -r '.version' apps/ios/src-tauri/tauri.conf.json)
+          IPA="Groovie_${VERSION}_ios.ipa"
+          bash .github/scripts/build-ios-ipa.sh "$IPA"
+          gh release upload "$TAG" "$IPA" --clobber
+
   publish-release:
-    name: Generate latest.json & publish
-    needs: [create-release, build]
+    name: Generate release manifests & publish
+    needs: [create-release, build, build-ios]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - name: Generate and upload latest.json, then publish release
+      - name: Generate and upload latest.json & altstore-source.json, then publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
         run: |
           node .github/scripts/generate-latest-json.mjs
-          gh release upload "$TAG" latest.json --clobber
+          node .github/scripts/generate-altstore-source.mjs
+          gh release upload "$TAG" latest.json altstore-source.json --clobber
           if [[ "$TAG" == *-* ]]; then
             gh release edit "$TAG" --draft=false
           else

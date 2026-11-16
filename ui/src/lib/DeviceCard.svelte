@@ -374,4 +374,13 @@
     background: var(--accent);
     box-shadow: 0 0 8px var(--accent);
   }
+
+  @media (hover: none) {
+    .edit { opacity: 0.65; }
+  }
+  @media (hover: none) and (max-width: 680px) {
+    .rename { font-size: 16px; }
+    .swatches { gap: 9px; }
+    .swatch { width: 30px; height: 30px; }
+  }
 </style>
