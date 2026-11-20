@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "groovie-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "if-addrs",
  "serde",
@@ -1448,9 +1448,12 @@ dependencies = [
 
 [[package]]
 name = "groovie-desktop"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "groovie-core",
+ "reqwest",
+ "rustls",
+ "semver",
  "serde",
  "serde_json",
  "tauri",
@@ -1461,6 +1464,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
  "tokio",
+ "url",
  "windows",
  "x11rb",
 ]

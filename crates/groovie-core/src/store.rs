@@ -11,6 +11,49 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Earliest desktop release that understands `pinned_version` and preserves unknown `groovie.json` keys.
+pub const MIN_PINNABLE_VERSION: &str = "0.5.3";
+const MIN_PINNABLE_TUPLE: (u64, u64, u64) = (0, 5, 3);
+
+/// Parse a stable `major.minor.patch` release version (accepting an optional leading `v`).
+pub fn parse_release_semver(raw: &str) -> Option<(u64, u64, u64)> {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s);
+    let mut parts = s.split('.');
+    let parse_part = |part: &str| -> Option<u64> {
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let major = parse_part(parts.next()?)?;
+    let minor = parse_part(parts.next()?)?;
+    let patch = parse_part(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Validate and normalize a user- or config-supplied pinned version (`>= 0.5.3`).
+pub fn validate_pinned_version(raw: &str) -> Result<String, String> {
+    let Some((maj, min, pat)) = parse_release_semver(raw) else {
+        return Err(format!(
+            "'{}' is not a valid release version (expected x.y.z)",
+            raw.trim()
+        ));
+    };
+    if (maj, min, pat) < MIN_PINNABLE_TUPLE {
+        return Err(format!(
+            "v{maj}.{min}.{pat} predates version pinning (minimum pinnable version is v{MIN_PINNABLE_VERSION})"
+        ));
+    }
+    Ok(format!("{maj}.{min}.{pat}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownDevice {
     pub id: String,
@@ -22,12 +65,18 @@ pub struct KnownDevice {
 #[serde(default)]
 pub struct StoreData {
     pub version: u32,
+    #[serde(default, alias = "pinnedVersion", skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
     pub nicknames: BTreeMap<String, String>,
     pub groups: Vec<Group>,
     pub scenes: Vec<Scene>,
     pub known_devices: Vec<KnownDevice>,
     #[serde(default, skip_serializing_if = "SyncConfig::is_default")]
     pub sync: SyncConfig,
+    /// Preserves unrecognized top-level keys verbatim so rolling back from a future
+    /// Groovie release never strips fields introduced in newer versions.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -164,6 +213,14 @@ fn read_store_file(path: &Path) -> io::Result<(StoreData, Option<SystemTime>)> {
             if data.version == 0 {
                 data.version = 1;
             }
+            if let Some(raw) = data.pinned_version.take() {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    data.pinned_version = Some(
+                        validate_pinned_version(trimmed).unwrap_or_else(|_| trimmed.to_string()),
+                    );
+                }
+            }
             Ok((data, file_mtime(path)))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -293,6 +350,22 @@ pub fn default_auto_store_path() -> Option<PathBuf> {
 }
 
 impl StoreData {
+    /// Returns the normalized pinned version (`"x.y.z"`) if set and valid (`>= 0.5.3`).
+    pub fn effective_pinned_version(&self) -> Option<String> {
+        self.pinned_version
+            .as_deref()
+            .and_then(|v| validate_pinned_version(v).ok())
+    }
+
+    /// Returns a human-readable validation error if `pinned_version` is set to an invalid or pre-`0.5.3` value.
+    pub fn pinned_version_error(&self) -> Option<String> {
+        self.pinned_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(|v| validate_pinned_version(v).err())
+    }
+
     pub fn display_name(&self, id: &str, sku: &str) -> String {
         self.nicknames
             .get(id)
@@ -612,5 +685,53 @@ mod tests {
         assert_eq!(data.scenes[0].entries[0].device, "BB");
         assert_eq!(data.sync.placements.len(), 1);
         assert_eq!(data.sync.placements[0].device_id, "BB");
+    }
+
+    #[test]
+    fn validates_pinned_version_floor_and_preserves_future_fields() {
+        assert_eq!(validate_pinned_version("0.5.3").as_deref(), Ok("0.5.3"));
+        assert_eq!(validate_pinned_version("v0.5.3").as_deref(), Ok("0.5.3"));
+        assert_eq!(validate_pinned_version(" V1.2.10 ").as_deref(), Ok("1.2.10"));
+        assert!(validate_pinned_version("0.5.2").is_err());
+        assert!(validate_pinned_version("0.2.7").is_err());
+        assert!(validate_pinned_version("0.6.0-rc1").is_err());
+        assert!(validate_pinned_version("latest").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groovie.json");
+
+        // Default config omits `pinned_version` completely.
+        let mut s = Store::open(&path).unwrap();
+        s.save().unwrap();
+        let raw_default = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw_default.contains("pinned_version"));
+
+        // External config with leading `v` and an unknown future key roundtrips cleanly.
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "pinned_version": "v0.6.1",
+  "future_schedules": [{"hour": 22, "scene": "Evening"}]
+}"#,
+        )
+        .unwrap();
+
+        let mut loaded = Store::open(&path).unwrap();
+        assert_eq!(loaded.data.effective_pinned_version().as_deref(), Some("0.6.1"));
+        assert_eq!(loaded.data.pinned_version_error(), None);
+        loaded.data.nicknames.insert("AA".into(), "Lamp".into());
+        loaded.save().unwrap();
+
+        let saved_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved_json["pinned_version"], "0.6.1");
+        assert_eq!(saved_json["future_schedules"][0]["hour"], 22);
+
+        // Pre-0.5.3 manual pin surfaces a validation warning without breaking store load.
+        std::fs::write(&path, r#"{ "version": 1, "pinnedVersion": "0.5.2" }"#).unwrap();
+        let legacy = Store::open(&path).unwrap();
+        assert_eq!(legacy.data.effective_pinned_version(), None);
+        assert!(legacy.data.pinned_version_error().unwrap().contains("0.5.3"));
     }
 }

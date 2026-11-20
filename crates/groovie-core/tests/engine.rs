@@ -1246,5 +1246,30 @@ async fn clamps_kelvin_commands_to_sku_bounds() {
     assert!(r.sims[0].received().contains(&Command::ColorTemp(6500)));
 }
 
+#[tokio::test]
+async fn set_pinned_version_persists_validates_floor_and_reloads_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("groovie.json");
+    let mut cfg = config(28, 41270, 0, Some(path.clone()));
+    cfg.scan_targets.clear();
 
+    let g = Groovie::start(cfg).await.unwrap();
+    let initial = g.config_info().await;
+    assert_eq!(initial.pinned_version, None);
+    assert_eq!(initial.pinned_version_error, None);
+    assert_eq!(initial.min_pinnable_version, "0.5.3");
 
+    // Rejects releases older than v0.5.3.
+    let err = g.set_pinned_version(Some("0.5.2")).await.unwrap_err();
+    assert!(err.to_string().contains("0.5.3"), "unexpected error: {err}");
+
+    // Accepts and normalizes `v0.5.3`, persisting `"pinned_version": "0.5.3"`.
+    let pinned = g.set_pinned_version(Some("v0.5.3")).await.unwrap();
+    assert_eq!(pinned.pinned_version.as_deref(), Some("0.5.3"));
+    assert!(pinned.json.contains("\"pinned_version\": \"0.5.3\""));
+
+    // Unpinning omits `pinned_version` from disk again.
+    let unpinned = g.set_pinned_version(None).await.unwrap();
+    assert_eq!(unpinned.pinned_version, None);
+    assert!(!unpinned.json.contains("pinned_version"));
+}

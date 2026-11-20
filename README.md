@@ -46,7 +46,7 @@ Grab the latest installer from [**Releases**](https://github.com/rudyorre/groovi
 - **Linux:** `Groovie_x.y.z_amd64.AppImage` or `.deb`
 - **`grooviectl` CLI (optional):** `grooviectl-windows-x64.zip`, `grooviectl-macos-universal.tar.gz`, `grooviectl-linux-x64.tar.gz`
 
-**In-app updates:** when a new release is published, Groovie shows an **Update** button in the sidebar that downloads, verifies, installs, and relaunches in one click.
+**In-app updates & version pinning:** when a new release is published, Groovie shows an **Update** button in the sidebar that downloads, verifies, installs, and relaunches in one click. To stay on a specific release (or roll back to an earlier release `>= 0.5.3`), open **Configuration → Pin version…** or set `"pinned_version": "0.5.3"` in `groovie.json`.
 
 Notes on first launch (builds are not OS-notarized yet):
 - **Windows:** if SmartScreen says *"Windows protected your PC"*, click **More info → Run anyway**.
@@ -85,11 +85,12 @@ Targets accept a light's nickname, IP, or device ID, a group name, or `all`. `gr
 
 ## Configuration
 
-Nicknames, groups, scenes, and known devices are stored in plain, deterministic JSON (`groovie.json`) designed to play nicely with dotfiles:
+Nicknames, groups, scenes, known devices, and optional `"pinned_version"` are stored in plain, deterministic JSON (`groovie.json`) designed to play nicely with dotfiles:
 
 - **Default locations:** `%APPDATA%\groovie\groovie.json` on Windows, `~/Library/Application Support/groovie/groovie.json` on macOS, and `~/.config/groovie/groovie.json` on Linux.
 - **Cross-OS dotfiles:** if `~/.config/groovie/groovie.json` exists on Windows or macOS, Groovie uses it automatically.
 - **Symlink & custom-path friendly:** atomic saves follow symlinks (`ln -s`, `stow`, `chezmoi`) instead of replacing them, or you can point Groovie at any path from the **Configuration** button in the sidebar footer (or via `GROOVIE_CONFIG=/path/to/groovie.json`). External edits reload automatically when you focus the app.
+- **Version pinning:** set `"pinned_version": "0.5.3"` (or use **Configuration → Pin version…**) to pause update prompts or switch across signed releases (`>= 0.5.3`).
 
 ## Troubleshooting
 

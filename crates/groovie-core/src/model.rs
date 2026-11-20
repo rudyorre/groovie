@@ -140,6 +140,14 @@ pub struct ConfigInfo {
     pub default_path: Option<String>,
     /// True when the active path differs from the automatic default path.
     pub is_custom: bool,
+    /// Validated pinned desktop release version (`"0.5.3"`), when configured in `groovie.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
+    /// Validation message when `groovie.json` specifies an invalid or pre-`v0.5.3` `pinned_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version_error: Option<String>,
+    /// Earliest Groovie release supporting version pinning (`"0.5.3"`).
+    pub min_pinnable_version: String,
     /// Pretty-printed JSON representation of the current config.
     pub json: String,
 }

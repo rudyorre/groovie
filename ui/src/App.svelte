@@ -9,6 +9,7 @@
     type Device,
     type Group,
     type LogEntry,
+    type ReleaseVersionInfo,
     type Scene,
     type SyncConfig,
     type SyncPreview,
@@ -65,6 +66,12 @@
   let pathDraft = $state('');
   let copiedPath = $state(false);
   let copiedConfig = $state(false);
+  let editingPin = $state(false);
+  let releases = $state<ReleaseVersionInfo[]>([]);
+  let loadingReleases = $state(false);
+  let releasesError = $state('');
+  let pinChoice = $state('');
+  let customPinDraft = $state('');
 
   function selectTheme(next: ThemeMode) {
     theme = next;
@@ -132,13 +139,51 @@
   const controllableShown = $derived(shown.filter((d) => !peerSyncedSet.has(d.id)));
   const onCount = $derived(controllableShown.filter((d) => d.online && d.state?.on).length);
   const shownLogs = $derived(hidePolls ? logs.filter((l) => !l.poll) : logs);
+  function parseSemverTuple(raw?: string | null): [number, number, number] | null {
+    if (!raw) return null;
+    const m = /^[vV]?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+    if (!m) return null;
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  }
+
+  function cmpSemver(a: [number, number, number], b: [number, number, number]): number {
+    return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  }
+
+  const minPinnable = $derived(configInfo?.minPinnableVersion ?? '0.5.3');
+  const versionChoices = $derived.by(() => {
+    const floor = parseSemverTuple(minPinnable) ?? [0, 5, 3];
+    const map = new Map<string, ReleaseVersionInfo>();
+    for (const r of releases) {
+      map.set(r.version, r);
+    }
+    for (const extra of [version, configInfo?.pinnedVersion]) {
+      const tup = parseSemverTuple(extra);
+      if (extra && tup && cmpSemver(tup, floor) >= 0) {
+        const clean = `${tup[0]}.${tup[1]}.${tup[2]}`;
+        if (!map.has(clean)) {
+          map.set(clean, { version: clean, isLatest: false });
+        }
+      }
+    }
+    return Array.from(map.values()).sort((x, y) => {
+      const tx = parseSemverTuple(x.version) ?? [0, 0, 0];
+      const ty = parseSemverTuple(y.version) ?? [0, 0, 0];
+      return cmpSemver(ty, tx);
+    });
+  });
+  const selectedPinTarget = $derived(
+    (pinChoice === 'custom' ? customPinDraft : pinChoice).trim().replace(/^[vV]/, ''),
+  );
   const updating = $derived(updateProgress !== null);
   const updatePct = $derived(
     updateProgress?.stage === 'downloading' ? (updateProgress.percent ?? 15) : updateProgress ? 100 : 0,
   );
   const updateLabel = $derived(
     !updateProgress
-      ? `Update to ${update?.version ?? ''}`
+      ? update?.pinned
+        ? `Switch to v${update.version}`
+        : `Update to ${update?.version ?? ''}`
       : updateProgress.stage === 'downloading'
         ? updateProgress.percent !== null
           ? `Downloading ${updateProgress.percent}%`
@@ -165,6 +210,15 @@
     } catch (e) {
       showToast(String(e));
     }
+  }
+
+  let lastUpdateCheck = 0;
+  async function refreshUpdate(force = false) {
+    if (updating) return;
+    if (!force && (update || Date.now() - lastUpdateCheck < 60_000)) return;
+    lastUpdateCheck = Date.now();
+    const a = await api;
+    update = await a.checkUpdate().catch(() => null);
   }
 
   async function reload() {
@@ -207,15 +261,8 @@
   onMount(() => {
     reload();
     let off = () => {};
-    let lastUpdateCheck = 0;
-    const maybeCheckUpdate = async () => {
-      if (update || updating || Date.now() - lastUpdateCheck < 60_000) return;
-      lastUpdateCheck = Date.now();
-      const a = await api;
-      update = await a.checkUpdate().catch(() => null);
-    };
     const onFocus = () => {
-      maybeCheckUpdate();
+      refreshUpdate(false);
       api.then((a) => a.setWindowActive(true, true)).catch(() => {});
     };
     const onVisibility = () => {
@@ -237,16 +284,25 @@
           syncPreview = e.preview;
         } else if (e.type === 'configChanged') {
           reload();
-          if (configOpen) {
-            a.getConfigInfo().then((info) => (configInfo = info)).catch(() => {});
-          }
+          a.getConfigInfo()
+            .then((info) => {
+              configInfo = info;
+              if (!editingPath) pathDraft = info.path ?? '';
+            })
+            .catch(() => {});
+          refreshUpdate(true);
         } else if (e.type === 'logged' && logsOpen) {
           logs = [...logs.slice(-499), e.entry];
         }
       });
       await a.setWindowActive(!document.hidden, false).catch(() => {});
-      version = await a.appVersion().catch(() => '');
-      await maybeCheckUpdate();
+      const [ver, info] = await Promise.all([
+        a.appVersion().catch(() => ''),
+        a.getConfigInfo().catch(() => null),
+      ]);
+      version = ver;
+      if (info) configInfo = info;
+      await refreshUpdate(true);
     });
     return () => {
       off();
@@ -279,6 +335,7 @@
   async function openConfig() {
     configOpen = true;
     editingPath = false;
+    editingPin = false;
     copiedPath = false;
     copiedConfig = false;
     const [info, prefs] = await Promise.all([
@@ -291,6 +348,105 @@
     }
     if (prefs) {
       desktopPrefs = prefs;
+    }
+  }
+
+  async function togglePinEditor() {
+    if (editingPin) {
+      editingPin = false;
+      return;
+    }
+    editingPin = true;
+    releasesError = '';
+    loadingReleases = true;
+    try {
+      const a = await api;
+      releases = await a.listPinnableReleases();
+    } catch (e) {
+      releasesError = String(e);
+    } finally {
+      loadingReleases = false;
+    }
+    const preferred = configInfo?.pinnedVersion || version;
+    if (preferred && versionChoices.some((c) => c.version === preferred)) {
+      pinChoice = preferred;
+      customPinDraft = '';
+    } else if (versionChoices.length > 0) {
+      pinChoice = versionChoices[0].version;
+      customPinDraft = '';
+    } else {
+      pinChoice = 'custom';
+      customPinDraft = preferred || minPinnable;
+    }
+  }
+
+  function fmtReleaseDate(iso?: string): string {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 10);
+  }
+
+  async function applyPinVersion() {
+    const targetVer = selectedPinTarget;
+    if (!targetVer || updating) return;
+    if (version && targetVer === version) {
+      const info = await run((a) => a.setPinnedVersion(targetVer));
+      if (info) {
+        configInfo = info;
+        update = null;
+        editingPin = false;
+        showToast(`Pinned Groovie to v${targetVer}`);
+      }
+      return;
+    }
+    updateProgress = { stage: 'downloading', percent: null };
+    try {
+      const a = await api;
+      await a.installVersion(targetVer, true, (p) => {
+        updateProgress = p;
+      });
+      if (!isTauri) {
+        version = await a.appVersion();
+        configInfo = await a.getConfigInfo();
+        updateProgress = null;
+        editingPin = false;
+        showToast(`Pinned & switched to v${targetVer}`);
+      }
+    } catch (e) {
+      updateProgress = null;
+      showToast(`Could not switch to v${targetVer}: ${e}`);
+    }
+  }
+
+  async function installConfiguredPin() {
+    const targetVer = configInfo?.pinnedVersion;
+    if (!targetVer || targetVer === version || updating) return;
+    updateProgress = { stage: 'downloading', percent: null };
+    try {
+      const a = await api;
+      await a.installVersion(targetVer, false, (p) => {
+        updateProgress = p;
+      });
+      if (!isTauri) {
+        version = await a.appVersion();
+        updateProgress = null;
+        showToast(`Switched to pinned v${targetVer}`);
+      }
+    } catch (e) {
+      updateProgress = null;
+      showToast(`Could not install v${targetVer}: ${e}`);
+    }
+  }
+
+  async function unpinVersion() {
+    if (updating) return;
+    const info = await run((a) => a.setPinnedVersion(null));
+    if (info) {
+      configInfo = info;
+      editingPin = false;
+      await refreshUpdate(true);
+      showToast('Unpinned version — update suggestions enabled');
     }
   }
 
@@ -330,6 +486,7 @@
       configInfo = info;
       pathDraft = info.path ?? '';
       await reload();
+      await refreshUpdate(true);
       showToast('Reloaded configuration from disk');
     }
   }
@@ -343,6 +500,7 @@
       pathDraft = info.path ?? '';
       editingPath = false;
       await reload();
+      await refreshUpdate(true);
       showToast('Updated config file location');
     }
   }
@@ -354,6 +512,7 @@
       pathDraft = info.path ?? '';
       editingPath = false;
       await reload();
+      await refreshUpdate(true);
       showToast('Restored default config location');
     }
   }
@@ -686,7 +845,11 @@
           class:busy={updating}
           class:spin={updateProgress !== null && updateProgress.stage !== 'downloading'}
           style:--pct="{updatePct}%"
-          title={update.notes ? `Groovie v${update.version}\n\n${update.notes}` : `Install Groovie v${update.version}`}
+          title={update.pinned
+            ? `Pinned to v${update.version} in groovie.json — install and restart`
+            : update.notes
+              ? `Groovie v${update.version}\n\n${update.notes}`
+              : `Install Groovie v${update.version}`}
           onclick={installUpdate}
           disabled={updating}
         >
@@ -695,14 +858,26 @@
         </button>
       {/if}
       <div class="foot-row">
-        <button
-          class="ghost version-link"
-          title="View Groovie on GitHub"
-          onclick={() => run((a) => a.openGithub())}
-        >
-          <span>{isTauri ? `v${version}` : 'Demo'}</span>
-          <Icon name="external" size={11} />
-        </button>
+        <div class="foot-left">
+          <button
+            class="ghost version-link"
+            title="View Groovie on GitHub"
+            onclick={() => run((a) => a.openGithub())}
+          >
+            <span>{isTauri ? `v${version}` : `Demo v${version}`}</span>
+            <Icon name="external" size={11} />
+          </button>
+          {#if configInfo?.pinnedVersion}
+            <button
+              class="ghost pin-pill"
+              title="Pinned to v{configInfo.pinnedVersion} — open Configuration to change or unpin"
+              onclick={openConfig}
+            >
+              <Icon name="pin" size={11} />
+              <span>Pinned</span>
+            </button>
+          {/if}
+        </div>
         <div class="foot-tools">
           <button
             class="ghost foot-icon"
@@ -1093,6 +1268,112 @@
 
       <div class="path-card">
         <div class="path-meta">
+          <span class="path-label">Version &amp; updates</span>
+          <div class="path-btns">
+            {#if configInfo?.pinnedVersion && version && configInfo.pinnedVersion !== version && !editingPin}
+              <button type="button" class="primary sm-btn" disabled={updating} onclick={installConfiguredPin}>
+                <Icon name="download" size={12} />
+                {updating ? updateLabel : `Install v${configInfo.pinnedVersion} & restart`}
+              </button>
+            {/if}
+            {#if configInfo?.pinnedVersion || configInfo?.pinnedVersionError}
+              <button type="button" class="ghost sm-btn" disabled={updating} onclick={unpinVersion}>
+                Unpin
+              </button>
+            {/if}
+            <button type="button" class="ghost sm-btn" disabled={updating} onclick={togglePinEditor}>
+              <Icon name="pin" size={13} />
+              {editingPin ? 'Close' : configInfo?.pinnedVersion ? 'Change…' : 'Pin version…'}
+            </button>
+          </div>
+        </div>
+
+        {#if configInfo?.pinnedVersionError}
+          <div class="pin-warn">
+            <Icon name="info" size={13} />
+            <span>{configInfo.pinnedVersionError}</span>
+          </div>
+        {:else if configInfo?.pinnedVersion}
+          <div class="pin-status">
+            <strong>Pinned to <code>v{configInfo.pinnedVersion}</code></strong>
+            <span>
+              {configInfo.pinnedVersion === version
+                ? 'Update suggestions are paused while pinned.'
+                : `Running v${version} — install v${configInfo.pinnedVersion} to match groovie.json.`}
+            </span>
+          </div>
+        {:else}
+          <div class="pin-status">
+            <strong>Suggest updates automatically</strong>
+            <span>
+              Running <code>v{version || '…'}</code>{#if update && !update.pinned}{' · '}<code>v{update.version}</code> available{/if}
+            </span>
+          </div>
+        {/if}
+
+        {#if editingPin}
+          <form class="path-form" onsubmit={(e) => { e.preventDefault(); applyPinVersion(); }}>
+            <select
+              class="field"
+              bind:value={pinChoice}
+              disabled={updating || loadingReleases}
+              aria-label="Target release version"
+            >
+              {#each versionChoices as rel (rel.version)}
+                <option value={rel.version}>
+                  v{rel.version}{rel.version === version ? ' · Installed' : ''}{rel.isLatest ? ' · Latest' : ''}{rel.publishedAt ? ` (${fmtReleaseDate(rel.publishedAt)})` : ''}
+                </option>
+              {/each}
+              <option value="custom">Specify version manually…</option>
+            </select>
+
+            {#if pinChoice === 'custom'}
+              <input
+                class="field mono-field"
+                bind:value={customPinDraft}
+                placeholder={minPinnable}
+                disabled={updating}
+                aria-label="Pinned version (x.y.z)"
+              />
+            {/if}
+
+            {#if loadingReleases}
+              <span class="path-hint">Checking published GitHub Releases…</span>
+            {:else if releasesError}
+              <span class="path-hint">
+                Could not fetch release list ({releasesError}); you can still pin the current version or enter any release ≥ v{minPinnable}.
+              </span>
+            {/if}
+
+            <div class="path-form-foot">
+              <span class="path-hint">
+                {#if selectedPinTarget && version && selectedPinTarget !== version}
+                  Writes <code>"pinned_version": "{selectedPinTarget}"</code> to <code>groovie.json</code>, downloads the signed installer, and restarts.
+                {:else}
+                  Locks Groovie to this release in <code>groovie.json</code> (earliest pinnable version is <code>v{minPinnable}</code>).
+                {/if}
+              </span>
+              <span class="spacer"></span>
+              <button
+                type="submit"
+                class="primary sm-btn"
+                disabled={updating || !selectedPinTarget || (selectedPinTarget === version && configInfo?.pinnedVersion === selectedPinTarget)}
+              >
+                {#if updating}
+                  {updateLabel}
+                {:else if selectedPinTarget && version && selectedPinTarget !== version}
+                  Pin &amp; restart into v{selectedPinTarget}
+                {:else}
+                  Pin v{selectedPinTarget || minPinnable}
+                {/if}
+              </button>
+            </div>
+          </form>
+        {/if}
+      </div>
+
+      <div class="path-card">
+        <div class="path-meta">
           <span class="path-label">{configInfo?.isCustom ? 'Custom path' : 'Config file'}</span>
           <div class="path-btns">
             {#if configInfo?.path}
@@ -1324,6 +1605,7 @@
 
   footer { display: flex; flex-direction: column; gap: 8px; padding: 10px 4px 0 3px; }
   .foot-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .foot-left { display: flex; align-items: center; gap: 2px; min-width: 0; }
   .version-link {
     height: 26px;
     padding: 0 7px;
@@ -1334,6 +1616,16 @@
   }
   .version-link :global(svg) { opacity: 0.55; transition: opacity 0.12s, transform 0.12s; }
   .version-link:hover :global(svg) { opacity: 1; transform: translate(1px, -1px); }
+  .pin-pill {
+    height: 22px;
+    padding: 0 6px;
+    gap: 3px;
+    font-size: 11px;
+    border-radius: 5px;
+    color: var(--accent);
+    background: #ffb02014;
+  }
+  .pin-pill:hover { background: #ffb02024; color: var(--accent); }
   .foot-tools { display: flex; align-items: center; gap: 2px; }
   .foot-icon {
     width: 26px;
@@ -1527,7 +1819,20 @@
     background: var(--surface);
   }
   .path-form-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .path-hint { font-size: 11.5px; color: var(--text-3); }
+  .path-hint { font-size: 11.5px; color: var(--text-3); line-height: 1.4; }
+  .path-hint code { font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace; color: var(--text-2); }
+  .pin-status { display: flex; flex-direction: column; gap: 2px; }
+  .pin-status strong { font-size: 13px; font-weight: 550; color: var(--text); }
+  .pin-status span { font-size: 12px; color: var(--text-2); }
+  .pin-status code { font-family: ui-monospace, 'Cascadia Mono', 'SF Mono', Consolas, monospace; font-size: 11.5px; }
+  .pin-warn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--accent);
+    line-height: 1.4;
+  }
   .config-box {
     margin: 0;
     background: var(--bg);
