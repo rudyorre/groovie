@@ -8,14 +8,17 @@ use groovie_core::{
     Action, Config, ConfigInfo, DesktopPrefs, Device, DisplayInfo, Group, Groovie, LogEntry, Scene,
     SyncConfig, SyncPeerConflict, SyncStatus, Target,
 };
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tauri::ipc::Channel;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_window_state::{AppHandleExt as WindowStateAppExt, StateFlags};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
@@ -24,6 +27,8 @@ use tokio::sync::RwLock;
 const ACTIVE_POLL: Duration = Duration::from_millis(2500);
 const IDLE_POLL: Duration = Duration::from_secs(45);
 const GITHUB_URL: &str = "https://github.com/rudyorre/groovie";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/rudyorre/groovie/releases?per_page=50";
+const RELEASES_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn window_state_flags() -> StateFlags {
     // Exclude VISIBLE so closing to tray or launching with `--minimized` never
@@ -51,6 +56,12 @@ struct IpcHandle(tokio::sync::Mutex<Option<groovie_core::ipc::IpcServer>>);
 
 /// Guards exit teardown so Screen Sync restoration runs at most once across tray Quit and OS Exit.
 struct ShuttingDown(AtomicBool);
+
+/// Verified updater manifests resolved by `check_app_update`, keyed by version string.
+struct PendingUpdates(tokio::sync::Mutex<HashMap<String, tauri_plugin_updater::Update>>);
+
+/// Short-lived cache for published GitHub Releases shown in the version-pinning picker.
+struct ReleasesCache(tokio::sync::Mutex<Option<(Instant, Vec<ReleaseVersionInfo>)>>);
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct TraySnapshot {
@@ -442,43 +453,404 @@ fn set_desktop_prefs(app: AppHandle, prefs: DesktopPrefs) -> R<DesktopPrefs> {
     get_desktop_prefs(app)
 }
 
+fn fallback_config_info() -> ConfigInfo {
+    let cfg = Config::default().with_env_overrides();
+    let auto_default = groovie_core::store::default_auto_store_path();
+    let is_custom = match (cfg.store_path.as_deref(), auto_default.as_deref()) {
+        (Some(cur), Some(def)) => cur != def,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let opened = cfg
+        .store_path
+        .as_deref()
+        .and_then(|p| groovie_core::store::Store::open(p).ok());
+    let (pinned_version, pinned_version_error, raw_json) = match &opened {
+        Some(store) => (
+            store.data.effective_pinned_version(),
+            store.data.pinned_version_error(),
+            store.pretty_json(),
+        ),
+        None => (
+            None,
+            None,
+            cfg.store_path
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_else(|| "{\n  \"version\": 1\n}".into()),
+        ),
+    };
+    let symlink_target = cfg
+        .store_path
+        .as_deref()
+        .and_then(|p| {
+            let meta = std::fs::symlink_metadata(p).ok()?;
+            meta.file_type()
+                .is_symlink()
+                .then(|| groovie_core::store::resolve_write_target(p).ok())
+                .flatten()
+        })
+        .map(|p| p.to_string_lossy().into_owned());
+    ConfigInfo {
+        path: cfg.store_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        symlink_target,
+        default_path: auto_default.map(|p| p.to_string_lossy().into_owned()),
+        is_custom,
+        pinned_version,
+        pinned_version_error,
+        min_pinnable_version: groovie_core::store::MIN_PINNABLE_VERSION.to_string(),
+        json: raw_json,
+    }
+}
+
 #[tauri::command]
 async fn get_config_info(s: State<'_, AppState>) -> R<ConfigInfo> {
     match s.0.read().await.clone() {
         Ok(g) => Ok(g.config_info().await),
-        Err(_) => {
-            let cfg = Config::default().with_env_overrides();
-            let auto_default = groovie_core::store::default_auto_store_path();
-            let is_custom = match (cfg.store_path.as_deref(), auto_default.as_deref()) {
-                (Some(cur), Some(def)) => cur != def,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            let raw_json = cfg
-                .store_path
-                .as_deref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_else(|| "{\n  \"version\": 1\n}".into());
-            let symlink_target = cfg
-                .store_path
-                .as_deref()
-                .and_then(|p| {
-                    let meta = std::fs::symlink_metadata(p).ok()?;
-                    meta.file_type()
-                        .is_symlink()
-                        .then(|| groovie_core::store::resolve_write_target(p).ok())
-                        .flatten()
-                })
-                .map(|p| p.to_string_lossy().into_owned());
-            Ok(ConfigInfo {
-                path: cfg.store_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                symlink_target,
-                default_path: auto_default.map(|p| p.to_string_lossy().into_owned()),
-                is_custom,
-                json: raw_json,
-            })
+        Err(_) => Ok(fallback_config_info()),
+    }
+}
+
+async fn set_pinned_version_inner(
+    app: &AppHandle,
+    s: &State<'_, AppState>,
+    version: Option<&str>,
+) -> R<ConfigInfo> {
+    let cleaned = version.map(str::trim).filter(|v| !v.is_empty());
+    if let Ok(g) = s.0.read().await.clone() {
+        return g.set_pinned_version(cleaned).await.map_err(err);
+    }
+    let normalized = match cleaned {
+        Some(raw) => Some(groovie_core::store::validate_pinned_version(raw)?),
+        None => None,
+    };
+    let path = Config::default()
+        .with_env_overrides()
+        .store_path
+        .ok_or_else(|| "no config file configured".to_string())?;
+    let mut store = groovie_core::store::Store::open(&path).map_err(err)?;
+    if store.data.pinned_version != normalized {
+        store.data.pinned_version = normalized;
+        store.save().map_err(err)?;
+        let _ = app.emit("groovie://event", groovie_core::Event::ConfigChanged);
+    }
+    Ok(fallback_config_info())
+}
+
+#[tauri::command]
+async fn set_pinned_version(
+    app: AppHandle,
+    s: State<'_, AppState>,
+    version: Option<String>,
+) -> R<ConfigInfo> {
+    set_pinned_version_inner(&app, &s, version.as_deref()).await
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseVersionInfo {
+    version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+    is_latest: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubAssetDto {
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubReleaseDto {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    published_at: Option<String>,
+    body: Option<String>,
+    #[serde(default)]
+    assets: Vec<GithubAssetDto>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableUpdatePayload {
+    version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+    pinned: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "stage", rename_all = "camelCase")]
+enum UpdateProgressEvent {
+    Downloading { percent: Option<u8> },
+    Installing,
+    Restarting,
+}
+
+fn ensure_rustls_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+fn release_manifest_url(version: &str) -> String {
+    format!("{GITHUB_URL}/releases/download/v{version}/latest.json")
+}
+
+fn should_offer_target_version(
+    current: &semver::Version,
+    remote: &semver::Version,
+    expected: &semver::Version,
+) -> bool {
+    remote == expected && remote != current
+}
+
+fn parse_pinnable_github_releases(items: Vec<GithubReleaseDto>) -> Vec<ReleaseVersionInfo> {
+    let mut overall_latest: Option<semver::Version> = None;
+    let mut eligible: Vec<(semver::Version, ReleaseVersionInfo)> = Vec::new();
+
+    for rel in items {
+        if rel.draft || rel.prerelease {
+            continue;
+        }
+        if !rel.assets.iter().any(|a| a.name == "latest.json") {
+            continue;
+        }
+        let raw_ver = rel
+            .tag_name
+            .trim()
+            .strip_prefix('v')
+            .or_else(|| rel.tag_name.trim().strip_prefix('V'))
+            .unwrap_or(rel.tag_name.trim());
+        if let Ok(parsed_any) = semver::Version::parse(raw_ver) {
+            if overall_latest.as_ref().map(|cur| &parsed_any > cur).unwrap_or(true) {
+                overall_latest = Some(parsed_any);
+            }
+        }
+        let Ok(normalized) = groovie_core::store::validate_pinned_version(&rel.tag_name) else {
+            continue;
+        };
+        let Ok(ver) = semver::Version::parse(&normalized) else {
+            continue;
+        };
+        if eligible.iter().any(|(v, _)| v == &ver) {
+            continue;
+        }
+        let notes = rel
+            .body
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        eligible.push((
+            ver,
+            ReleaseVersionInfo {
+                version: normalized,
+                published_at: rel.published_at,
+                notes,
+                is_latest: false,
+            },
+        ));
+    }
+
+    eligible.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some(latest) = overall_latest {
+        for (ver, info) in &mut eligible {
+            if *ver == latest {
+                info.is_latest = true;
+            }
         }
     }
+    eligible.into_iter().map(|(_, info)| info).collect()
+}
+
+#[tauri::command]
+async fn list_pinnable_releases(
+    app: AppHandle,
+    cache: State<'_, ReleasesCache>,
+    refresh: Option<bool>,
+) -> R<Vec<ReleaseVersionInfo>> {
+    if !refresh.unwrap_or(false) {
+        if let Some((fetched_at, cached)) = cache.0.lock().await.as_ref() {
+            if fetched_at.elapsed() < RELEASES_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
+    ensure_rustls_provider();
+    let ua = format!("groovie-desktop/{}", app.package_info().version);
+    let client = reqwest::Client::builder()
+        .user_agent(ua)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(err)?;
+
+    let resp = client
+        .get(GITHUB_RELEASES_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(err)?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub Releases API returned {}", resp.status()));
+    }
+
+    let items: Vec<GithubReleaseDto> = resp.json().await.map_err(err)?;
+    let parsed = parse_pinnable_github_releases(items);
+    *cache.0.lock().await = Some((Instant::now(), parsed.clone()));
+    Ok(parsed)
+}
+
+async fn fetch_specific_release_update(
+    app: &AppHandle,
+    expected: &semver::Version,
+) -> R<Option<tauri_plugin_updater::Update>> {
+    let url = url::Url::parse(&release_manifest_url(&expected.to_string())).map_err(err)?;
+    let expected_cmp = expected.clone();
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(err)?
+        .timeout(Duration::from_secs(15))
+        .version_comparator(move |current, remote| {
+            should_offer_target_version(&current, &remote.version, &expected_cmp)
+        })
+        .build()
+        .map_err(err)?;
+    updater.check().await.map_err(err)
+}
+
+#[tauri::command]
+async fn check_app_update(
+    app: AppHandle,
+    s: State<'_, AppState>,
+    pending: State<'_, PendingUpdates>,
+) -> R<Option<AvailableUpdatePayload>> {
+    let info = match s.0.read().await.clone() {
+        Ok(g) => g.config_info().await,
+        Err(_) => fallback_config_info(),
+    };
+
+    if let Some(pinned_str) = info.pinned_version {
+        let pinned_ver = semver::Version::parse(&pinned_str).map_err(err)?;
+        if pinned_ver == app.package_info().version {
+            return Ok(None);
+        }
+        let Some(u) = fetch_specific_release_update(&app, &pinned_ver).await? else {
+            return Ok(None);
+        };
+        let payload = AvailableUpdatePayload {
+            version: u.version.clone(),
+            notes: u.body.clone().filter(|b| !b.trim().is_empty()),
+            pinned: true,
+        };
+        pending.0.lock().await.insert(u.version.clone(), u);
+        return Ok(Some(payload));
+    }
+
+    let updater = app
+        .updater_builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(err)?;
+    let Some(u) = updater.check().await.map_err(err)? else {
+        return Ok(None);
+    };
+    let payload = AvailableUpdatePayload {
+        version: u.version.clone(),
+        notes: u.body.clone().filter(|b| !b.trim().is_empty()),
+        pinned: false,
+    };
+    pending.0.lock().await.insert(u.version.clone(), u);
+    Ok(Some(payload))
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: AppHandle,
+    s: State<'_, AppState>,
+    pending: State<'_, PendingUpdates>,
+    version: String,
+    pin_version: Option<bool>,
+    on_progress: Channel<UpdateProgressEvent>,
+) -> R<()> {
+    let pin = pin_version.unwrap_or(false);
+    let target_str = if pin {
+        groovie_core::store::validate_pinned_version(&version)?
+    } else {
+        let trimmed = version.trim();
+        let raw = trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed);
+        semver::Version::parse(raw).map_err(err)?.to_string()
+    };
+    let target_ver = semver::Version::parse(&target_str).map_err(err)?;
+    if target_ver == app.package_info().version {
+        return Err(format!("Groovie v{target_str} is already installed"));
+    }
+
+    let cached = pending.0.lock().await.get(&target_str).cloned();
+    let update = match cached {
+        Some(u) => u,
+        None => fetch_specific_release_update(&app, &target_ver)
+            .await?
+            .ok_or_else(|| format!("Groovie v{target_str} is not available on GitHub Releases for this platform"))?,
+    };
+
+    let _ = on_progress.send(UpdateProgressEvent::Downloading { percent: None });
+    let mut received: u64 = 0;
+    let mut last_pct: Option<u8> = None;
+    let bytes = update
+        .download(
+            |chunk_len, content_len| {
+                received = received.saturating_add(chunk_len as u64);
+                let pct = content_len
+                    .filter(|&total| total > 0)
+                    .map(|total| ((received * 100) / total).min(100) as u8);
+                if pct != last_pct || last_pct.is_none() {
+                    last_pct = pct;
+                    let _ = on_progress.send(UpdateProgressEvent::Downloading { percent: pct });
+                }
+            },
+            || {
+                let _ = on_progress.send(UpdateProgressEvent::Downloading { percent: Some(100) });
+            },
+        )
+        .await
+        .map_err(err)?;
+
+    let prev_pin = if pin {
+        let prev = match s.0.read().await.clone() {
+            Ok(g) => g.config_info().await.pinned_version,
+            Err(_) => fallback_config_info().pinned_version,
+        };
+        set_pinned_version_inner(&app, &s, Some(&target_str)).await?;
+        Some(prev)
+    } else {
+        None
+    };
+
+    let _ = on_progress.send(UpdateProgressEvent::Installing);
+    prepare_update_install(app.clone(), true).await?;
+    if let Err(install_err) = update.install(&bytes) {
+        if let Some(prev) = prev_pin {
+            let _ = set_pinned_version_inner(&app, &s, prev.as_deref()).await;
+        }
+        if cfg!(windows) {
+            let _ = discover(app.clone(), s).await;
+        }
+        return Err(err(install_err));
+    }
+
+    let _ = on_progress.send(UpdateProgressEvent::Restarting);
+    prepare_update_install(app, false).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -863,6 +1235,8 @@ fn main() {
             app.manage(CaptureManager::new());
             app.manage(IpcHandle(tokio::sync::Mutex::new(None)));
             app.manage(ShuttingDown(AtomicBool::new(false)));
+            app.manage(PendingUpdates(tokio::sync::Mutex::new(HashMap::new())));
+            app.manage(ReleasesCache(tokio::sync::Mutex::new(None)));
             app.manage(TrayState(Mutex::new(None)));
             let initial = tauri::async_runtime::block_on(start_engine(&handle, !start_hidden));
             app.manage(AppState(RwLock::new(initial)));
@@ -924,6 +1298,10 @@ fn main() {
             get_desktop_prefs,
             set_desktop_prefs,
             get_config_info,
+            set_pinned_version,
+            list_pinnable_releases,
+            check_app_update,
+            install_app_update,
             reload_config,
             set_config_path,
             open_config_folder,
@@ -958,5 +1336,86 @@ mod tests {
         assert!(flags.contains(StateFlags::POSITION));
         assert!(flags.contains(StateFlags::MAXIMIZED));
         assert!(!flags.contains(StateFlags::VISIBLE));
+    }
+
+    #[test]
+    fn filters_and_sorts_pinnable_github_releases() {
+        let asset = |name: &str| GithubAssetDto { name: name.to_string() };
+        let items = vec![
+            GithubReleaseDto {
+                tag_name: "v0.5.2".into(),
+                draft: false,
+                prerelease: false,
+                published_at: Some("2026-11-16T10:33:23Z".into()),
+                body: Some("Older release before version pinning".into()),
+                assets: vec![asset("latest.json")],
+            },
+            GithubReleaseDto {
+                tag_name: "v0.5.3".into(),
+                draft: false,
+                prerelease: false,
+                published_at: Some("2026-11-20T00:00:00Z".into()),
+                body: Some("  First pinnable release  ".into()),
+                assets: vec![asset("latest.json")],
+            },
+            GithubReleaseDto {
+                tag_name: "v0.6.0-beta.1".into(),
+                draft: false,
+                prerelease: true,
+                published_at: Some("2026-11-22T00:00:00Z".into()),
+                body: None,
+                assets: vec![asset("latest.json")],
+            },
+            GithubReleaseDto {
+                tag_name: "v0.6.0".into(),
+                draft: true,
+                prerelease: false,
+                published_at: None,
+                body: None,
+                assets: vec![asset("latest.json")],
+            },
+            GithubReleaseDto {
+                tag_name: "v0.5.4".into(),
+                draft: false,
+                prerelease: false,
+                published_at: Some("2026-11-25T00:00:00Z".into()),
+                body: Some("Bugfix release".into()),
+                assets: vec![asset("latest.json")],
+            },
+            GithubReleaseDto {
+                tag_name: "v0.5.5".into(),
+                draft: false,
+                prerelease: false,
+                published_at: Some("2026-11-26T00:00:00Z".into()),
+                body: None,
+                assets: vec![asset("Groovie_0.5.5_amd64.deb")], // missing latest.json
+            },
+        ];
+
+        let parsed = parse_pinnable_github_releases(items);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].version, "0.5.4");
+        assert!(parsed[0].is_latest);
+        assert_eq!(parsed[1].version, "0.5.3");
+        assert!(!parsed[1].is_latest);
+        assert_eq!(parsed[1].notes.as_deref(), Some("First pinnable release"));
+    }
+
+    #[test]
+    fn target_version_comparator_allows_downgrade_only_to_expected_version() {
+        let v053 = semver::Version::parse("0.5.3").unwrap();
+        let v054 = semver::Version::parse("0.5.4").unwrap();
+        let v060 = semver::Version::parse("0.6.0").unwrap();
+
+        // Rollback from 0.6.0 -> 0.5.3 is accepted.
+        assert!(should_offer_target_version(&v060, &v053, &v053));
+        //Already running 0.5.3 -> no-op.
+        assert!(!should_offer_target_version(&v053, &v053, &v053));
+        // Manifest version mismatch -> rejected.
+        assert!(!should_offer_target_version(&v060, &v054, &v053));
+        assert_eq!(
+            release_manifest_url("0.5.3"),
+            "https://github.com/rudyorre/groovie/releases/download/v0.5.3/latest.json"
+        );
     }
 }

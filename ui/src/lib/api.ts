@@ -32,7 +32,16 @@ export type ConfigInfo = {
   symlinkTarget?: string;
   defaultPath?: string;
   isCustom: boolean;
+  pinnedVersion?: string;
+  pinnedVersionError?: string;
+  minPinnableVersion: string;
   json: string;
+};
+export type ReleaseVersionInfo = {
+  version: string;
+  publishedAt?: string;
+  notes?: string;
+  isLatest: boolean;
 };
 export type DesktopPrefs = {
   launchAtLogin: boolean;
@@ -148,14 +157,22 @@ export interface Api {
   getDesktopPrefs(): Promise<DesktopPrefs>;
   setDesktopPrefs(prefs: DesktopPrefs): Promise<DesktopPrefs>;
   getConfigInfo(): Promise<ConfigInfo>;
+  setPinnedVersion(version: string | null): Promise<ConfigInfo>;
+  listPinnableReleases(refresh?: boolean): Promise<ReleaseVersionInfo[]>;
   reloadConfig(): Promise<ConfigInfo>;
   setConfigPath(path: string | null): Promise<ConfigInfo>;
   openConfigFolder(): Promise<void>;
   openGithub(): Promise<void>;
   onEvent(cb: (e: GroovieEvent) => void): () => void;
   appVersion(): Promise<string>;
-  /** Resolves to an available update, or null if up to date. */
+  /** Resolves to an available update (or pinned version mismatch), or null if up to date. */
   checkUpdate(): Promise<Update | null>;
+  /** Downloads, verifies, installs, and relaunches into `version` (optionally pinning first). */
+  installVersion(
+    version: string,
+    pinVersion: boolean,
+    onProgress?: (p: UpdateProgress) => void,
+  ): Promise<void>;
 }
 
 export type UpdateProgress =
@@ -166,6 +183,7 @@ export type UpdateProgress =
 export type Update = {
   version: string;
   notes?: string;
+  pinned?: boolean;
   install: (onProgress?: (p: UpdateProgress) => void) => Promise<void>;
 };
 
@@ -174,8 +192,18 @@ export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in
 // ---- Tauri ---------------------------------------------------------------
 
 async function tauriApi(): Promise<Api> {
-  const { invoke } = await import('@tauri-apps/api/core');
+  const { invoke, Channel } = await import('@tauri-apps/api/core');
   const { listen } = await import('@tauri-apps/api/event');
+  const runInstall = async (
+    version: string,
+    pinVersion: boolean,
+    onProgress?: (p: UpdateProgress) => void,
+  ) => {
+    const ch = new Channel<UpdateProgress>((p) => onProgress?.(p));
+    await invoke('install_app_update', { version, pinVersion, onProgress: ch });
+    const { relaunch } = await import('@tauri-apps/plugin-process');
+    await relaunch();
+  };
   return {
     listDevices: () => invoke('list_devices'),
     discover: () => invoke('discover'),
@@ -206,6 +234,8 @@ async function tauriApi(): Promise<Api> {
     getDesktopPrefs: () => invoke('get_desktop_prefs'),
     setDesktopPrefs: (prefs) => invoke('set_desktop_prefs', { prefs }),
     getConfigInfo: () => invoke('get_config_info'),
+    setPinnedVersion: (version) => invoke('set_pinned_version', { version }),
+    listPinnableReleases: (refresh = false) => invoke('list_pinnable_releases', { refresh }),
     reloadConfig: () => invoke('reload_config'),
     setConfigPath: (path) => invoke('set_config_path', { path }),
     openConfigFolder: () => invoke('open_config_folder'),
@@ -216,43 +246,18 @@ async function tauriApi(): Promise<Api> {
     },
     appVersion: async () => (await import('@tauri-apps/api/app')).getVersion(),
     async checkUpdate() {
-      const { check } = await import('@tauri-apps/plugin-updater');
-      const u = await check();
-      if (!u) return null;
+      const avail = await invoke<{ version: string; notes?: string; pinned: boolean } | null>(
+        'check_app_update',
+      );
+      if (!avail) return null;
       return {
-        version: u.version,
-        notes: u.body || undefined,
-        async install(onProgress) {
-          let total: number | undefined;
-          let received = 0;
-          onProgress?.({ stage: 'downloading', percent: null });
-          await u.download((ev) => {
-            if (ev.event === 'Started') {
-              total = ev.data.contentLength;
-              onProgress?.({ stage: 'downloading', percent: total ? 0 : null });
-            } else if (ev.event === 'Progress') {
-              received += ev.data.chunkLength;
-              const percent = total ? Math.min(100, Math.round((received / total) * 100)) : null;
-              onProgress?.({ stage: 'downloading', percent });
-            } else if (ev.event === 'Finished') {
-              onProgress?.({ stage: 'downloading', percent: 100 });
-            }
-          });
-          onProgress?.({ stage: 'installing' });
-          await invoke('prepare_update_install', { beforeInstall: true });
-          try {
-            await u.install();
-          } catch (e) {
-            await invoke('discover').catch(() => {});
-            throw e;
-          }
-          onProgress?.({ stage: 'restarting' });
-          await invoke('prepare_update_install', { beforeInstall: false });
-          const { relaunch } = await import('@tauri-apps/plugin-process');
-          await relaunch();
-        },
+        version: avail.version,
+        notes: avail.notes,
+        pinned: avail.pinned,
+        install: (onProgress) => runInstall(avail.version, false, onProgress),
       };
     },
+    installVersion: runInstall,
   };
 }
 
@@ -318,6 +323,8 @@ function mockApi(): Api {
   let groups: Group[] = [{ id: 'g1', name: 'Desk', members: ['3A:14:D0:88:19:40:11:2B'] }];
   let scenes: Scene[] = [];
   let desktopPrefs: DesktopPrefs = { launchAtLogin: false, startMinimized: false };
+  let mockCurrentVersion = '0.5.3';
+  let mockPinnedVersion: string | undefined;
   const subs = new Set<(e: GroovieEvent) => void>();
   const emit = (e: GroovieEvent) => subs.forEach((cb) => cb(structuredClone(e)));
   const config = () => emit({ type: 'configChanged' });
@@ -617,8 +624,57 @@ function mockApi(): Api {
         path: '~/.config/groovie/groovie.json',
         defaultPath: '~/.config/groovie/groovie.json',
         isCustom: false,
-        json: JSON.stringify({ version: 1, nicknames, groups, scenes, known_devices, sync: syncConfig }, null, 2),
+        pinnedVersion: mockPinnedVersion,
+        minPinnableVersion: '0.5.3',
+        json: JSON.stringify(
+          {
+            version: 1,
+            ...(mockPinnedVersion ? { pinned_version: mockPinnedVersion } : {}),
+            nicknames,
+            groups,
+            scenes,
+            known_devices,
+            sync: syncConfig,
+          },
+          null,
+          2,
+        ),
       };
+    },
+    async setPinnedVersion(ver) {
+      const cleaned = ver?.trim().replace(/^[vV]/, '') ?? '';
+      if (!cleaned) {
+        mockPinnedVersion = undefined;
+      } else {
+        const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(cleaned);
+        if (!m) throw new Error(`'${ver}' is not a valid release version (expected x.y.z)`);
+        const tuple = [Number(m[1]), Number(m[2]), Number(m[3])] as const;
+        if (
+          tuple[0] < 0 ||
+          (tuple[0] === 0 && (tuple[1] < 5 || (tuple[1] === 5 && tuple[2] < 3)))
+        ) {
+          throw new Error(`v${cleaned} predates version pinning (minimum pinnable version is v0.5.3)`);
+        }
+        mockPinnedVersion = cleaned;
+      }
+      config();
+      return this.getConfigInfo();
+    },
+    async listPinnableReleases() {
+      return [
+        {
+          version: '0.5.4',
+          publishedAt: '2026-11-25T10:00:00Z',
+          notes: 'Screen Sync & LAN stability improvements',
+          isLatest: true,
+        },
+        {
+          version: '0.5.3',
+          publishedAt: '2026-11-20T10:00:00Z',
+          notes: 'Version pinning & signed release rollback',
+          isLatest: false,
+        },
+      ];
     },
     async reloadConfig() {
       return this.getConfigInfo();
@@ -636,8 +692,22 @@ function mockApi(): Api {
       window.open('https://github.com/rudyorre/groovie', '_blank', 'noopener,noreferrer');
     },
     onEvent(cb) { subs.add(cb); return () => subs.delete(cb); },
-    appVersion: async () => 'demo',
+    appVersion: async () => mockCurrentVersion,
     checkUpdate: async () => null,
+    async installVersion(version, pinVersion, onProgress) {
+      const target = version.trim().replace(/^[vV]/, '');
+      onProgress?.({ stage: 'downloading', percent: 35 });
+      await new Promise((r) => setTimeout(r, 180));
+      onProgress?.({ stage: 'downloading', percent: 100 });
+      if (pinVersion) {
+        await this.setPinnedVersion(target);
+      }
+      onProgress?.({ stage: 'installing' });
+      await new Promise((r) => setTimeout(r, 140));
+      onProgress?.({ stage: 'restarting' });
+      await new Promise((r) => setTimeout(r, 140));
+      mockCurrentVersion = target;
+    },
   };
 }
 

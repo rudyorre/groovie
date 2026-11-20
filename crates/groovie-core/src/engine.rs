@@ -57,6 +57,8 @@ pub enum Error {
     SyncConflict { host_name: String },
     #[error("{device} is currently controlled by Screen Sync on {host_name}")]
     DeviceSyncedByPeer { device: String, host_name: String },
+    #[error("invalid pinned version: {0}")]
+    InvalidPinnedVersion(String),
 }
 
 fn map_store_err(err: io::Error, path: Option<&std::path::Path>) -> Error {
@@ -908,6 +910,30 @@ impl Groovie {
         Ok(info)
     }
 
+    /// Set or clear the optional `pinned_version` field in `groovie.json`.
+    pub async fn set_pinned_version(&self, version: Option<&str>) -> Result<ConfigInfo> {
+        let normalized = match version.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(
+                crate::store::validate_pinned_version(raw)
+                    .map_err(Error::InvalidPinnedVersion)?,
+            ),
+            None => None,
+        };
+        let (changed, info) = {
+            let mut store = self.inner.store.lock().await;
+            let changed = store.data.pinned_version != normalized;
+            if changed {
+                store.data.pinned_version = normalized;
+                store.save()?;
+            }
+            (changed, build_config_info(&store))
+        };
+        if changed {
+            self.inner.emit(Event::ConfigChanged);
+        }
+        Ok(info)
+    }
+
     /// Ensure `groovie.json` exists on disk and return its path.
     pub async fn ensure_config_saved(&self) -> Result<Option<PathBuf>> {
         let mut store = self.inner.store.lock().await;
@@ -938,6 +964,9 @@ fn build_config_info(store: &Store) -> ConfigInfo {
         symlink_target: store.symlink_target().map(|p| p.to_string_lossy().into_owned()),
         default_path: auto_default.map(|p| p.to_string_lossy().into_owned()),
         is_custom,
+        pinned_version: store.data.effective_pinned_version(),
+        pinned_version_error: store.data.pinned_version_error(),
+        min_pinnable_version: crate::store::MIN_PINNABLE_VERSION.to_string(),
         json: store.pretty_json(),
     }
 }
